@@ -364,6 +364,11 @@ SHAREEOF
         source ~/.microvm-env
         set +a
       fi
+      # A share that did not mount leaves an empty directory where the agent
+      # expects data; say so before it starts, not after it has been confused.
+      if systemctl --quiet is-failed microvm-extra-shares.service 2>/dev/null; then
+        echo "warning: some EXTRA_SHARES did not mount — see: journalctl -u microvm-extra-shares"
+      fi
       if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
         if [ -f ~/.microvm-devshell ] && [ -s ~/.microvm-devshell ]; then
           echo "loading dev environment..."
@@ -429,6 +434,49 @@ SHAREEOF
         mv "$COMBINED" "$SYSTEM_BUNDLE"
         chmod 0444 "$SYSTEM_BUNDLE"
         echo "microvm-ca-certs: injected $(echo "$CERTS" | wc -l) custom certificate file(s)"
+      '';
+    };
+
+    # Mount the host directories passed with EXTRA_SHARES. The launcher starts
+    # one virtiofsd per share, attaches it as tag xs<N>, and writes a manifest
+    # of tag, mount point and mode to the agent home. The guest-side `ro` is a
+    # courtesy that makes writes fail fast; the boundary is virtiofsd's
+    # --readonly on the host. Paths are checked again here even though the
+    # launcher already did: the manifest sits on a guest-writable share.
+    # Ordered before the console login so the mounts exist when the agent
+    # starts; a failure is surfaced at login rather than blocking boot.
+    systemd.services.microvm-extra-shares = {
+      description = "Mount extra host directories (EXTRA_SHARES)";
+      after = [ "home-agent.mount" "systemd-modules-load.service" ];
+      before = [ "getty@hvc0.service" ];
+      wantedBy = [ "multi-user.target" ];
+      path = [ pkgs.util-linux pkgs.coreutils ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        MANIFEST=/home/agent/.microvm-shares
+        [ -f "$MANIFEST" ] || exit 0
+        rc=0
+        while IFS=$'\t' read -r tag dir mode; do
+          if ! [[ "$tag" =~ ^xs[0-9]+$ ]] \
+             || ! [[ "$dir" =~ ^/(mnt|srv)(/[A-Za-z0-9._@+-]+)+$ ]] \
+             || [[ "$dir/" == */./* || "$dir/" == */../* ]] \
+             || ! [[ "$mode" =~ ^(ro|rw)$ ]]; then
+            echo "microvm-extra-shares: skipping malformed entry: $tag $dir $mode"
+            rc=1
+            continue
+          fi
+          mkdir -p "$dir"
+          if mount -t virtiofs -o "$mode" "$tag" "$dir"; then
+            echo "microvm-extra-shares: mounted $tag at $dir ($mode)"
+          else
+            echo "microvm-extra-shares: failed to mount $tag at $dir"
+            rc=1
+          fi
+        done < "$MANIFEST"
+        exit $rc
       '';
     };
 

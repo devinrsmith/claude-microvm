@@ -100,18 +100,23 @@
         AGENT_TEMP=""
         STORE_IMG=""
         STORE_STATE_DIR=""
+        _XS_UNITS=()
+        _XS_SOCKS=()
 
         # Installed before the first daemon starts, so a refusal anywhere below
-        # (a bad AGENT_SETTINGS, say) cannot leave a virtiofsd running and
-        # exporting a host directory with nothing to stop it. Everything it
-        # touches is initialised above for that reason.
+        # (a bad AGENT_SETTINGS or EXTRA_SHARES, say) cannot leave a virtiofsd
+        # running and exporting a host directory with nothing to stop it.
+        # Everything it touches is initialised above for that reason.
         # virtiofsd removes neither its socket nor its `<socket>.pid` when
         # stopped with SIGTERM, which is what `systemctl stop` sends — so both
         # are removed here, or every launch leaves them in $RUNTIME.
         cleanup() {
           ${pkgs.systemd}/bin/systemctl --user stop "$UNIT" 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --user stop "$AGENT_UNIT" 2>/dev/null || true
-          for _s in "$SOCK" "$AGENT_SOCK"; do
+          for _u in ''${_XS_UNITS+"''${_XS_UNITS[@]}"}; do
+            ${pkgs.systemd}/bin/systemctl --user stop "$_u" 2>/dev/null || true
+          done
+          for _s in "$SOCK" "$AGENT_SOCK" ''${_XS_SOCKS+"''${_XS_SOCKS[@]}"}; do
             rm -f "$_s" "$_s.pid"
           done
           rm -f "$STATE" "$AGENT_STATE"
@@ -225,6 +230,98 @@
           echo "warning: AGENT_SETTINGS is not supported for the ${agentName} flavor — ignored" >&2
         fi''}
 
+        # --- Extra shares ---
+        # EXTRA_SHARES exports further host directories into the guest, one
+        # rootless virtiofsd each, comma-separated:
+        #   EXTRA_SHARES="~/datasets,/srv/models:/srv/models,~/notes:/mnt/notes:rw"
+        # Each entry is HOST[:GUEST][:ro|rw]. GUEST defaults to /mnt/<basename>
+        # and must lie under /mnt or /srv. The mode defaults to ro, and ro is
+        # enforced by virtiofsd on the host: the agent can reach root in the
+        # guest (sudo systemctl), so a guest-side read-only mount alone would
+        # be a suggestion, not a boundary.
+        #
+        # Validation only — nothing here starts a daemon or touches the host.
+        # tests/extra-shares.nix extracts the region between these markers and
+        # drives it against fixtures; keep it self-contained on EXTRA_SHARES,
+        # AGENT_DIR and HOME.
+        # BEGIN extra-shares
+        _XS_HOST=()
+        _XS_GUEST=()
+        _XS_MODE=()
+        # $1 is $2, or lies beneath it.
+        _xs_within() { [ "$1" = "$2" ] || [[ "$1" == "$2"/* ]]; }
+        _xs_fail() { echo "error: EXTRA_SHARES: $*" >&2; exit 1; }
+        if [ -n "''${EXTRA_SHARES:-}" ]; then
+          IFS=',' read -r -a _XS_ENTRIES <<< "$EXTRA_SHARES"
+          for _entry in ''${_XS_ENTRIES+"''${_XS_ENTRIES[@]}"}; do
+            read -r _entry <<< "$_entry" || true
+            [ -z "$_entry" ] && continue
+            IFS=':' read -r -a _f <<< "$_entry"
+            _host="''${_f[0]}"
+            _guest=""
+            _mode="ro"
+            case "''${#_f[@]}" in
+              1) ;;
+              2) if [ "''${_f[1]}" = "ro" ] || [ "''${_f[1]}" = "rw" ]; then
+                   _mode="''${_f[1]}"
+                 else
+                   _guest="''${_f[1]}"
+                 fi ;;
+              3) _guest="''${_f[1]}"; _mode="''${_f[2]}" ;;
+              *) _xs_fail "'$_entry' has too many ':' fields (HOST[:GUEST][:ro|rw]; paths cannot contain ':' or ',')" ;;
+            esac
+            case "$_mode" in
+              ro|rw) ;;
+              *) _xs_fail "'$_entry': mode must be ro or rw, not '$_mode'" ;;
+            esac
+
+            # A ~ in the variable is not expanded by the shell that set it.
+            case "$_host" in
+              "~") _host="$HOME" ;;
+              "~/"*) _host="$HOME/''${_host#"~/"}" ;;
+            esac
+            [ -z "$_host" ] && _xs_fail "'$_entry' has no host path"
+            if ! _real="$(realpath -e -- "$_host" 2>/dev/null)" || [ ! -d "$_real" ]; then
+              _xs_fail "$_host is not a directory"
+            fi
+
+            # Never export the VM's own state. The agent home is already shared,
+            # and a second route into it would bypass nothing but confuse
+            # everything; the CRI and store images are deliberately kept out of
+            # every share so the guest cannot reach its own raw backing files.
+            # Containment either way: sharing a parent (say, $HOME) exports them
+            # just as surely as sharing the directory itself.
+            for _state in "$AGENT_DIR" "$AGENT_DIR-cri" "$AGENT_DIR-store"; do
+              if _xs_within "$_real" "$_state" || _xs_within "$_state" "$_real"; then
+                _xs_fail "$_host overlaps the VM's own state directory $_state, which is never shared"
+              fi
+            done
+
+            if [ -z "$_guest" ]; then
+              if [ "$_real" = "/" ]; then
+                _xs_fail "'$_entry': give a guest path to share /"
+              fi
+              _guest="/mnt/$(basename -- "$_real")"
+            fi
+            # Charset as well as location: the manifest the guest reads is
+            # tab-separated, and the mount point is created as root.
+            if ! [[ "$_guest" =~ ^/(mnt|srv)(/[A-Za-z0-9._@+-]+)+$ ]] \
+               || [[ "$_guest/" == */./* || "$_guest/" == */../* ]]; then
+              _xs_fail "guest path '$_guest' must be under /mnt or /srv, using only letters, digits and ._@+-"
+            fi
+            for _i in ''${_XS_GUEST+"''${!_XS_GUEST[@]}"}; do
+              if _xs_within "$_guest" "''${_XS_GUEST[$_i]}" || _xs_within "''${_XS_GUEST[$_i]}" "$_guest"; then
+                _xs_fail "guest paths $_guest and ''${_XS_GUEST[$_i]} overlap"
+              fi
+            done
+
+            _XS_HOST+=("$_real")
+            _XS_GUEST+=("$_guest")
+            _XS_MODE+=("$_mode")
+          done
+        fi
+        # END extra-shares
+
         # --- CRI storage volume (ext4 block image) ---
         # Container runtimes need a real block-backed fs that permits lchown to
         # arbitrary UIDs during image unpack — a virtiofs share cannot (rootless
@@ -319,6 +416,53 @@
           done
           [ -S "$AGENT_SOCK" ] || { echo "error: agent-home virtiofsd socket did not appear"; exit 1; }
         fi
+
+        # --- Extra shares (virtiofsd) ---
+        # Same daemon flags as the work share, plus --readonly for ro. Each
+        # pair is appended to the runner's runtime_args, which QEMU's command
+        # line expands unquoted — hence the strict charset on the socket path.
+        _XS_QEMU_ARGS=""
+        for _i in ''${_XS_HOST+"''${!_XS_HOST[@]}"}; do
+          if [ "$_i" -eq 0 ] && ! [[ "$RUNTIME" =~ ^[A-Za-z0-9/._-]+$ ]]; then
+            echo "error: EXTRA_SHARES needs XDG_RUNTIME_DIR ($RUNTIME) to contain only letters, digits and /._-" >&2
+            exit 1
+          fi
+          _xs_sock="$RUNTIME/$VM_ID-virtiofs-$ID-xs$_i.sock"
+          _xs_unit="$VM_ID-virtiofsd-$ID-xs$_i"
+          _xs_ro=()
+          [ "''${_XS_MODE[$_i]}" = "ro" ] && _xs_ro=(--readonly)
+          rm -f "$_xs_sock"
+          _XS_UNITS+=("$_xs_unit")
+          _XS_SOCKS+=("$_xs_sock")
+          ${pkgs.systemd}/bin/systemd-run --user --unit="$_xs_unit" --collect \
+            -- ${virtiofsd}/bin/virtiofsd \
+              --socket-path="$_xs_sock" \
+              --shared-dir="''${_XS_HOST[$_i]}" \
+              --sandbox=namespace \
+              --uid-map ":0:$(id -u):1:" \
+              --gid-map ":0:$(id -g):1:" \
+              --translate-uid "map:1000:0:1" \
+              --translate-gid "map:1000:0:1" \
+              --socket-group="$(id -gn)" \
+              --xattr \
+              ''${_xs_ro+"''${_xs_ro[@]}"}
+          for _t in $(seq 1 50); do
+            [ -S "$_xs_sock" ] && break
+            sleep 0.1
+          done
+          [ -S "$_xs_sock" ] || { echo "error: virtiofsd socket for ''${_XS_HOST[$_i]} did not appear" >&2; exit 1; }
+          _XS_QEMU_ARGS+=" -chardev socket,id=xsfs$_i,path=$_xs_sock -device vhost-user-fs-pci,chardev=xsfs$_i,tag=xs$_i"
+          echo "sharing ''${_XS_HOST[$_i]} at ''${_XS_GUEST[$_i]} (''${_XS_MODE[$_i]})"
+        done
+
+        # Tell the guest where to mount the extra shares (microvm-extra-shares
+        # in modules/base.nix). Rewritten every launch, so a share dropped from
+        # EXTRA_SHARES is not looked for on the next boot. Read by the guest
+        # only: the launcher never trusts what comes back in it.
+        rm -f "$AGENT_DIR/.microvm-shares"
+        for _i in ''${_XS_HOST+"''${!_XS_HOST[@]}"}; do
+          printf 'xs%s\t%s\t%s\n' "$_i" "''${_XS_GUEST[$_i]}" "''${_XS_MODE[$_i]}" >> "$AGENT_DIR/.microvm-shares"
+        done
 
         # Write host env vars for the VM
         echo "DIRENV_ALLOW=''${DIRENV_ALLOW:-0}" > "$AGENT_DIR/.microvm-env"
@@ -535,6 +679,19 @@
           )
         fi
 
+        # Extra share devices go in through the runner's own runtime_args hook
+        # rather than a rewrite of its command line, which would have to match
+        # microvm.nix's output. Appended after the line that initialises it, so
+        # anything microvm.nix puts there survives. Without the hook the shares
+        # would silently not exist in the guest — refuse instead.
+        if [ -n "$_XS_QEMU_ARGS" ]; then
+          if ! ${pkgs.gnugrep}/bin/grep -q '^runtime_args=' ${runner}/bin/microvm-run; then
+            echo "error: EXTRA_SHARES: the microvm runner has no runtime_args hook to attach shares to" >&2
+            exit 1
+          fi
+          _SED_ARGS+=(-e "/^runtime_args=/a runtime_args=\"\$runtime_args$_XS_QEMU_ARGS\"")
+        fi
+
         # Run QEMU with corrected paths
         bash <(${pkgs.gnused}/bin/sed "''${_SED_ARGS[@]}" ${runner}/bin/microvm-run)
       '';
@@ -638,6 +795,11 @@
         settings-seed = import ./tests/settings-seed.nix {
           inherit pkgs lib;
           runner = self.packages.${system}.claude;
+        };
+        extra-shares = import ./tests/extra-shares.nix {
+          inherit pkgs lib;
+          runner = self.packages.${system}.claude;
+          config = self.nixosConfigurations."claude-${system}".config;
         };
       });
     };

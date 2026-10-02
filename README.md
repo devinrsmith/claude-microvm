@@ -355,6 +355,61 @@ endpoint-specific is baked into the image.
 > Values are written to `.microvm-env` (mode `600`) in the agent home directory
 > and are readable by anything running in the guest, including the agent itself.
 
+### Extra shared directories
+
+`EXTRA_SHARES` exports further host directories into the guest, **read-only
+unless you say otherwise**. Entries are comma-separated, each
+`HOST[:GUEST][:ro|rw]`:
+
+```sh
+# Read-only at /mnt/datasets
+EXTRA_SHARES="~/datasets" make claude.run
+
+# Choose the mount point
+EXTRA_SHARES="~/datasets:/srv/data" make claude.run
+
+# Read-write, and several at once
+EXTRA_SHARES="~/datasets,~/notes:/mnt/notes:rw" make claude.run
+```
+
+`GUEST` defaults to `/mnt/<basename of HOST>` and must lie under `/mnt` or
+`/srv`, using only letters, digits and `._@+-`. A leading `~` in `HOST` is
+expanded. Paths cannot contain `:` or `,`. The launcher prints each share as it
+starts it, and refuses — before boot — a host path that is missing or not a
+directory, a guest path outside those prefixes, guest paths that coincide or
+nest, and any host path that overlaps the VM's own state: the agent home or the
+`-cri` / `-store` directories beside it. That last rule includes their parents,
+so sharing all of `$HOME` is refused while the agent home lives under it.
+
+Each share gets its own rootless `virtiofsd`, started and cleaned up like the
+`/work` one, with its own descriptor limit. In the guest, `microvm-extra-shares`
+mounts them before the agent starts; if any fail, the login prints a warning
+pointing at `journalctl -u microvm-extra-shares`.
+
+Things to know:
+
+- **Read-only is enforced on the host.** `ro` runs that share's `virtiofsd`
+  with `--readonly`. The guest mount is read-only too, but that is only a
+  convenience — the agent can become root in the guest (it has passwordless
+  `sudo systemctl`), and root can remount. Verified: guest root remounting an
+  `ro` share read-write still cannot write to it.
+- **`rw` means the guest can change those files**, with your host user's
+  permissions. Do not share anything the host executes or sources — a shell rc,
+  a git hooks directory, a `~/.config` that matters — read-write.
+- **Ownership is single-ID**, as for `/work`: your host user appears as the
+  guest's `agent` (uid 1000). Files owned by anyone else on the host have no
+  mapping in the guest (expect an overflow owner such as `nobody`), and writing
+  to them fails.
+- **The `/work` ENFILE caveat applies per share** — see
+  [docs/VIRTIOFS-GOTCHAS.md](docs/VIRTIOFS-GOTCHAS.md); `vm-share-relieve`
+  covers every share at once.
+- **The mount points are on the guest's RAM-backed root**, but what is written
+  inside an `rw` share lands on the host, not in RAM.
+
+The share list is written to `.microvm-shares` in the agent home on every
+launch, and the guest only mounts what is listed there and attached as a device,
+so dropping an entry from `EXTRA_SHARES` removes it on the next boot.
+
 ## Customization
 
 ### Exposing ports
@@ -401,6 +456,7 @@ Rebuild with `make claude`.
 | `OPENAI_API_KEY` | API key for Codex CLI (codex flavor) and Pi (pi flavor) | — |
 | `EXTRA_CA_CERTS` | Path to a PEM file or directory of PEM files containing custom CA certificates to trust inside the VM | (system CAs only) |
 | `EXTRA_ENV` | Extra environment variables to forward into the VM, comma-separated. `FOO=bar` assigns a literal value; a bare `FOO` forwards `$FOO` from the host environment (keeps secrets off the command line). | (none) |
+| `EXTRA_SHARES` | Extra host directories to mount in the VM, comma-separated `HOST[:GUEST][:ro\|rw]`; read-only by default, mounted under `/mnt/<basename>` unless `GUEST` (under `/mnt` or `/srv`) is given — see [Extra shared directories](#extra-shared-directories) | (none) |
 | `AGENTS_ARGS` | Extra arguments appended to the agent launch command. Use for one-shot prompts (e.g. `'-p "summarize this repo"'`) or to enable dangerous flags (e.g. `--dangerously-skip-permissions`). Re-parsed via `eval`, so quoting works. | (none) |
 
 ### Pre-seeding agent settings
@@ -518,6 +574,7 @@ and what you can do about each:
 | `$AGENT_HOME-cri/cri-storage.img` | persistent, ~133 MiB minimum, grows to the cap | not created unless `ENABLE_CRI` is set; `CRI_STORAGE_SIZE=0` also detaches an existing one |
 | `$AGENT_HOME-store/nix-store-overlay.img` | per-run, ~69 MiB, deleted on exit along with its directory | build-time only: `claude-vm.store.diskBacked = false` |
 | `$AGENT_HOME` (agent state, dev-shell cache, nix DB snapshot ~97 MiB) | persistent | point `AGENT_HOME` somewhere disposable |
+| virtiofsd sockets, `.pid` and state files in `$XDG_RUNTIME_DIR` (one set per share) | per-run, removed on exit — including a launch refused before boot | nothing to do |
 
 The CRI disk used to be created on every launch whether or not `ENABLE_CRI` was
 set, and it is never deleted. It is now only created for a run that asks for
