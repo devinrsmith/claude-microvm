@@ -97,6 +97,14 @@ CRIEOF
       "net.ipv4.ip_forward" = 1;
     };
 
+    # Let containers open connections to services running in the guest
+    # itself (e.g. a test server reached via host.docker.internal /
+    # host.containers.internal). The default NixOS firewall trusts only lo,
+    # so these are otherwise dropped. Covers containerd/CRI-O (cni0),
+    # podman's default and per-network bridges (podman0, podman1, ...) and
+    # docker's (docker0, br-<id>).
+    networking.firewall.trustedInterfaces = [ "cni0" "podman+" "docker+" "br-+" ];
+
     users.groups.docker = {};
     users.users.agent.extraGroups = [ "docker" ];
 
