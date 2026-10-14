@@ -576,12 +576,6 @@ EOF
             echo "NO_PROXY=${lib.head (lib.splitString ":" egressGuestAddr)},localhost,127.0.0.1" >> "$AGENT_DIR/.microvm-env"
             echo "no_proxy=${lib.head (lib.splitString ":" egressGuestAddr)},localhost,127.0.0.1" >> "$AGENT_DIR/.microvm-env"
             ${egressGuestEnv}
-            if [ -n "''${ENABLE_CRI:-}" ]; then
-              echo "warning: ENABLE_CRI with EGRESS_POLICY=$EGRESS_POLICY — container daemons do" >&2
-              echo "         not inherit the proxy environment, so image pulls will fail under" >&2
-              echo "         enforce and go unaudited under shadow. Daemon proxy wiring is on the" >&2
-              echo "         roadmap (attic/TODO.md Phase 9)." >&2
-            fi
             ;;
           *)
             ${apiKeyForwarding}

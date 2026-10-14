@@ -265,6 +265,9 @@ CRIEOF
       path = [ pkgs.runc pkgs.crun ];
       serviceConfig = {
         ExecStart = "${pkgs.containerd}/bin/containerd --config /etc/containerd/config.toml";
+        # Proxy env for registry pulls under a sealed netdev (shadow/enforce):
+        # cri-proxy-env writes this, empty/absent otherwise. See that service.
+        EnvironmentFile = "-/run/cri-proxy.env";
         Restart = "always";
         RestartSec = 5;
         Delegate = true;
@@ -287,6 +290,7 @@ CRIEOF
       path = [ pkgs.runc pkgs.crun ];
       serviceConfig = {
         ExecStart = "${pkgs.containerd}/bin/containerd --config /etc/containerd/config-crun.toml";
+        EnvironmentFile = "-/run/cri-proxy.env";
         Restart = "always";
         RestartSec = 5;
         Delegate = true;
@@ -299,9 +303,54 @@ CRIEOF
       };
     };
 
+    # Container daemons run as their own systemd services, so they inherit
+    # neither the agent shell's proxy env nor the guest's (there isn't one —
+    # the agent gets proxy vars from .microvm-env, not the whole system). Under
+    # a sealed netdev (EGRESS_POLICY=shadow|enforce) their only route out is
+    # the egress proxy, so without this a pull fails with no route under
+    # enforce and goes straight out unaudited under shadow. The daemons read
+    # the file this writes via `EnvironmentFile=-/run/cri-proxy.env`; it is
+    # created only in the sealed modes, so passthrough/observe behaviour is
+    # unchanged. Image pull in containerd/docker/crio/podman is all Go, which
+    # resolves the registry name at the proxy via CONNECT, so the guest's empty
+    # resolv.conf under enforce is not a problem.
+    systemd.services.cri-proxy-env = {
+      description = "Proxy env for container daemons under a sealed egress netdev";
+      after = [ "home-agent.mount" ];
+      before = [ "cri-activate.service" "containerd.service" "containerd-crun.service" "crio.service" "docker.service" "podman.service" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        ENV_FILE="/home/agent/.microvm-env"
+        [ -f "$ENV_FILE" ] && source "$ENV_FILE"
+        case "''${EGRESS_POLICY:-}" in shadow|enforce) ;; *) exit 0 ;; esac
+
+        addr="''${EGRESS_PROXY_ADDR:-}"
+        if [ -z "$addr" ]; then
+          echo "cri-proxy-env: EGRESS_POLICY is sealed but EGRESS_PROXY_ADDR is unset — not writing proxy env" >&2
+          exit 0
+        fi
+        # NO_PROXY keeps loopback and the CNI/slirp ranges off the proxy;
+        # registry names (docker.io, ghcr.io, …) are resolved at the proxy.
+        umask 022
+        cat > /run/cri-proxy.env <<EOF
+        HTTP_PROXY=http://$addr
+        HTTPS_PROXY=http://$addr
+        http_proxy=http://$addr
+        https_proxy=http://$addr
+        NO_PROXY=localhost,127.0.0.1,::1,10.0.2.0/24,10.88.0.0/16
+        no_proxy=localhost,127.0.0.1,::1,10.0.2.0/24,10.88.0.0/16
+        EOF
+        echo "cri-proxy-env: container daemons will pull via the egress proxy at $addr"
+      '';
+    };
+
     systemd.services.cri-activate = {
       description = "Activate CRI runtimes based on ENABLE_CRI";
-      after = [ "network.target" "home-agent.mount" "var-lib-containers.mount" ];
+      after = [ "network.target" "home-agent.mount" "var-lib-containers.mount" "cri-proxy-env.service" ];
       before = [ "getty@tty1.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
@@ -374,6 +423,7 @@ CRIEOF
       wantedBy = [ ];
       serviceConfig = {
         ExecStart = "${pkgs.cri-o}/bin/crio --config /etc/crio/crio.conf";
+        EnvironmentFile = "-/run/cri-proxy.env";
         Restart = "always";
         RestartSec = 5;
         Delegate = true;
@@ -393,6 +443,7 @@ CRIEOF
       wantedBy = [ ];
       serviceConfig = {
         ExecStart = "${pkgs.docker}/bin/dockerd --config-file /etc/docker/daemon.json";
+        EnvironmentFile = "-/run/cri-proxy.env";
         Restart = "always";
         RestartSec = 5;
         Delegate = true;
@@ -422,6 +473,7 @@ CRIEOF
       wantedBy = [ ];
       serviceConfig = {
         ExecStart = "${pkgs.podman}/bin/podman system service --time=0";
+        EnvironmentFile = "-/run/cri-proxy.env";
         Restart = "always";
         RestartSec = 5;
         Delegate = true;

@@ -435,11 +435,14 @@ only, `proxy/`). The guest gets `HTTP(S)_PROXY` pointing at it, and:
 Worth knowing: a denied `CONNECT` shows up in tools only as "403 from
 proxy" — the actionable reason is in the audit log. Tools that ignore
 `HTTPS_PROXY` fail with an instant connection-refused in both sealed modes
-(that discovery is what shadow is for). `ENABLE_CRI` container daemons do
-not inherit the proxy environment yet, so image pulls fail under enforce
-(the launcher warns). And ping to `10.0.2.2`/`10.0.2.3` is still answered
-locally by slirp even when sealed — "ping works" is not evidence the host
-is reachable. A corporate upstream proxy chains automatically via the
+(that discovery is what shadow is for). `ENABLE_CRI` container daemons are
+pointed at the proxy too, so image pulls work in the sealed modes — the
+registry hosts in the default allowlist (`docker.io`, `ghcr.io`, `quay.io`,
+`registry.k8s.io`) decide what resolves, and a pull from elsewhere is a
+`deny` in the audit log, not a hang. And ping to `10.0.2.2`/`10.0.2.3` is
+still answered locally by slirp even when sealed — "ping works" is not
+evidence the host is reachable. A corporate upstream proxy chains
+automatically via the
 host's own proxy environment. Claude Code's WebSearch and WebFetch tools
 execute server-side on Anthropic's infrastructure, so they appear here only as
 traffic to `api.anthropic.com`.
