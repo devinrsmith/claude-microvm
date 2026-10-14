@@ -1,32 +1,19 @@
 # Guest half of the restricted egress modes (EGRESS_POLICY=shadow|enforce).
 # The host half — restrict=on, the guestfwd hole, the proxy itself — lives in
-# flake.nix and proxy/; this module only makes the guest behave well inside a
-# sealed netdev. Everything here is inert under open/monitor/alert: the mode
-# is read from /home/agent/.microvm-env at boot.
+# the launcher and proxy/; this module only makes the guest behave well inside
+# a sealed netdev. Everything here is inert under open/monitor/alert: the mode
+# is read from the policy state file at boot.
+#
+# Part of the microvm-policy layer — see modules/policy.nix for the options
+# that decouple it from any one microVM's layout.
 { config, lib, pkgs, ... }:
 
 let
-  # ssh for every host goes through this wrapper, which connects directly in
-  # the open modes and speaks HTTP CONNECT to the egress proxy in the sealed
-  # ones. System-wide ssh_config keeps the persistent agent home untouched —
-  # the same home may serve sealed and open sessions on different days.
-  sshProxy = pkgs.writeShellScript "claude-vm-ssh-proxy" ''
-    policy=""
-    if [ -f /home/agent/.microvm-env ]; then
-      policy=$(${pkgs.gnused}/bin/sed -n 's/^EGRESS_POLICY=//p' /home/agent/.microvm-env | tail -n1)
-    fi
-    case "$policy" in
-      shadow|enforce)
-        addr=$(${pkgs.gnused}/bin/sed -n 's/^EGRESS_PROXY_ADDR=//p' /home/agent/.microvm-env | tail -n1)
-        exec ${pkgs.socat}/bin/socat STDIO "PROXY:''${addr%%:*}:$1:$2,proxyport=''${addr##*:}"
-        ;;
-      *)
-        exec ${pkgs.socat}/bin/socat STDIO "TCP:$1:$2"
-        ;;
-    esac
-  '';
+  cfg = config.microvmPolicy;
 in
 {
+  imports = [ ./policy.nix ];
+
   config = {
     environment.systemPackages = [ pkgs.socat ];
 
@@ -37,9 +24,27 @@ in
     networking.dhcpcd.extraConfig = "nohook resolv.conf";
     networking.nameservers = [ "10.0.2.3" ];
 
+    # ssh for every host goes through this wrapper, which connects directly in
+    # the open modes and speaks HTTP CONNECT to the egress proxy in the sealed
+    # ones. System-wide ssh_config keeps the persistent agent home untouched —
+    # the same home may serve sealed and open sessions on different days.
     programs.ssh.extraConfig = ''
       Host *
-        ProxyCommand ${sshProxy} %h %p
+        ProxyCommand ${pkgs.writeShellScript "microvm-policy-ssh-proxy" ''
+          policy=""
+          if [ -f ${cfg.stateFile} ]; then
+            policy=$(${pkgs.gnused}/bin/sed -n 's/^EGRESS_POLICY=//p' ${cfg.stateFile} | tail -n1)
+          fi
+          case "$policy" in
+            shadow|enforce)
+              addr=$(${pkgs.gnused}/bin/sed -n 's/^EGRESS_PROXY_ADDR=//p' ${cfg.stateFile} | tail -n1)
+              exec ${pkgs.socat}/bin/socat STDIO "PROXY:''${addr%%:*}:$1:$2,proxyport=''${addr##*:}"
+              ;;
+            *)
+              exec ${pkgs.socat}/bin/socat STDIO "TCP:$1:$2"
+              ;;
+          esac
+        ''} %h %p
     '';
 
     # A fresh agent home has no known_hosts and no terminal to answer the
@@ -63,8 +68,8 @@ in
       };
       script = ''
         policy=""
-        if [ -f /home/agent/.microvm-env ]; then
-          policy=$(${pkgs.gnused}/bin/sed -n 's/^EGRESS_POLICY=//p' /home/agent/.microvm-env | tail -n1)
+        if [ -f ${cfg.stateFile} ]; then
+          policy=$(${pkgs.gnused}/bin/sed -n 's/^EGRESS_POLICY=//p' ${cfg.stateFile} | tail -n1)
         fi
         case "$policy" in shadow|enforce) ;; *) exit 0 ;; esac
 

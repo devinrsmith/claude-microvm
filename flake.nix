@@ -976,6 +976,20 @@ EOF
       '';
     in
     {
+      # The microvm-policy layer, exposed for extraction to its own repo and
+      # for other microvm.nix consumers. `default` pulls the whole layer;
+      # the individual modules are there for finer control. The proxy and
+      # report binaries are under `packages` (egress-proxy, egress-report).
+      # Decoupled from this repo's layout via the microvmPolicy.* options
+      # (modules/policy.nix) — defaults match claude-microvm, so importing
+      # the layer here changes nothing.
+      nixosModules = {
+        policy = ./modules/policy.nix;
+        egress = ./modules/egress.nix;
+        workspace = ./modules/workspace.nix;
+        default = { imports = [ ./modules/egress.nix ./modules/workspace.nix ]; };
+      };
+
       nixosConfigurations = builtins.listToAttrs (lib.flatten (map (system:
         lib.mapAttrsToList (name: flavor: {
           name = "${name}${flavor.suffix}-${system}";
