@@ -7,6 +7,8 @@ The agent starts automatically on boot. Exiting the agent shuts down the VM.
 ## Features
 
 - **A VM boundary, not a container.** Separate kernel and process tree; the host is reachable only through what you explicitly share, and the network is user-mode NAT that cannot bind host ports.
+- **An egress policy ladder you can climb one rung at a time.** `EGRESS_POLICY` goes from `open` through `monitor`/`alert` (host-side capture, observe only) to `shadow`/`enforce`: a sealed network whose only way out is an allowlisting proxy on the host, which also keeps API keys out of the guest. Every decision is audited, and shadow shows what enforce would block before it blocks anything — see [Egress policy](#egress-policy).
+- **Workspace policies for untrusted code.** `WORKSPACE_MODE=ephemeral` keeps the agent's writes in a guest-side overlay that is discarded at poweroff (`vm-work-diff` shows what changed); `WORKSPACE_GUARD=1` makes host-executed config such as `.git/hooks` and `.mcp.json` read-only inside the guest — see [Ephemeral workspace](#ephemeral-workspace) and [Hardening notes](#hardening-notes).
 - **Your project at `/work`, read-write.** Shared over virtiofs by an unprivileged daemon — no root or sudo, and files the guest creates are owned by your host user.
 - **Start it and forget it.** The agent launches on boot; when it exits the VM powers off and its virtiofs daemons are cleaned up.
 - **Per-project state that persists.** Sessions, credentials and settings live in a host directory that survives relaunches. Each agent gets its own; several VMs can run against the same project, or different ones in parallel.
