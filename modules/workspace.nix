@@ -13,10 +13,50 @@
 # there yet read-only, so a repo without .mcp.json is not protected against
 # one being created. Defence in depth, not a boundary — the session contract
 # says which state a run has.
+#
+# The same module carries WORKSPACE_MODE=ephemeral (Phase 11): /work becomes
+# a guest-side overlay whose writes never reach the host — the complement of
+# the guard. Passthrough stays the default: instant host-visible edits are
+# the current contract and most of the point of virtiofs.
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.claude-vm.workspaceGuard;
+
+  # Shows what an ephemeral session changed: the overlay's upper layer holds
+  # exactly the delta. Whiteouts (0:0 char devices) are deletions.
+  vmWorkDiff = pkgs.writeShellScriptBin "vm-work-diff" ''
+    # vm-work-diff [--patch] — list (or diff) this ephemeral session's changes
+    # to /work. Copy anything worth keeping to /home/agent before poweroff.
+    up=/run/work-rw/upper
+    lower=/run/work-lower
+    if [ ! -d "$up" ]; then
+      echo "vm-work-diff: not an ephemeral session (launch with WORKSPACE_MODE=ephemeral)" >&2
+      exit 1
+    fi
+    patch=0
+    [ "''${1:-}" = "--patch" ] && patch=1
+    cd "$up"
+    find . -mindepth 1 | sed 's|^\./||' | while IFS= read -r rel; do
+      if [ -c "$up/$rel" ] && [ "$(stat -c %t:%T "$up/$rel")" = "0:0" ]; then
+        echo "deleted:  $rel"
+      elif [ -d "$up/$rel" ]; then
+        continue
+      elif [ -e "$lower/$rel" ]; then
+        if [ "$patch" = 1 ]; then
+          ${pkgs.diffutils}/bin/diff -u "$lower/$rel" "/work/$rel" || true
+        else
+          echo "modified: $rel"
+        fi
+      else
+        if [ "$patch" = 1 ]; then
+          ${pkgs.diffutils}/bin/diff -u /dev/null "/work/$rel" || true
+        else
+          echo "created:  $rel"
+        fi
+      fi
+    done
+  '';
 in
 {
   options.claude-vm.workspaceGuard = {
@@ -39,9 +79,47 @@ in
   };
 
   config = {
+    environment.systemPackages = [ vmWorkDiff ];
+
+    systemd.services.work-ephemeral = {
+      description = "Guest-side overlay over /work: writes never reach the host";
+      after = [ "work.mount" "home-agent.mount" ];
+      before = [ "workspace-guard.service" "getty@hvc0.service" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        mode=""
+        if [ -f /home/agent/.microvm-env ]; then
+          mode=$(${pkgs.gnused}/bin/sed -n 's/^WORKSPACE_MODE=//p' /home/agent/.microvm-env | tail -n1)
+        fi
+        [ "$mode" = "ephemeral" ] || exit 0
+
+        # Keep the pristine host view reachable (for vm-work-diff and the
+        # overlay's lowerdir) without disturbing systemd's work.mount: a bind,
+        # not a move.
+        mkdir -p /run/work-lower /run/work-rw
+        mount --bind /work /run/work-lower
+
+        # The upper layer is RAM (its own tmpfs, so a runaway write fills
+        # this mount, not /run): session writes cost memory and vanish at
+        # poweroff — that is the feature. Overlay root attributes come from
+        # the upper dir, so it must be the agent's.
+        mount -t tmpfs -o mode=0755 tmpfs /run/work-rw
+        install -d -o agent -g agent /run/work-rw/upper
+        mkdir -p /run/work-rw/work
+        mount -t overlay overlay \
+          -o lowerdir=/run/work-lower,upperdir=/run/work-rw/upper,workdir=/run/work-rw/work \
+          /work
+        echo "work-ephemeral: /work is an overlay — writes stay in the VM (vm-work-diff lists them)"
+      '';
+    };
+
     systemd.services.workspace-guard = {
       description = "Read-only binds over workspace paths that execute on the host";
-      after = [ "work.mount" "home-agent.mount" ];
+      after = [ "work.mount" "home-agent.mount" "work-ephemeral.service" ];
       before = [ "getty@hvc0.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {

@@ -152,6 +152,13 @@
           echo "error: EGRESS_PCAP_MAXLEN must be an integer (captured bytes per packet)" >&2
           exit 1
         fi
+        WORKSPACE_MODE="''${WORKSPACE_MODE:-passthrough}"
+        case "$WORKSPACE_MODE" in
+          passthrough|ephemeral) ;;
+          *)
+            echo "error: WORKSPACE_MODE must be passthrough or ephemeral (got '$WORKSPACE_MODE')" >&2
+            exit 1 ;;
+        esac
         EGRESS_DIR=""
         EGRESS_PCAP=""
         EGRESS_UNIT=""
@@ -551,8 +558,10 @@ EOF
         # (modules/egress.nix); it is informational in the open modes.
         echo "EGRESS_POLICY=$EGRESS_POLICY" >> "$AGENT_DIR/.microvm-env"
         # Read by modules/workspace.nix: read-only binds over workspace paths
-        # whose contents execute on the host later.
+        # whose contents execute on the host later, and the ephemeral /work
+        # overlay.
         echo "WORKSPACE_GUARD=''${WORKSPACE_GUARD:-}" >> "$AGENT_DIR/.microvm-env"
+        echo "WORKSPACE_MODE=$WORKSPACE_MODE" >> "$AGENT_DIR/.microvm-env"
         case "$EGRESS_POLICY" in
           shadow|enforce)
             # The key never enters the guest: the agent talks plaintext HTTP
@@ -850,7 +859,12 @@ EOF
         _CONTRACT_KEYS=""
         ${contractKeyChecks}
         echo "── session contract ──────────────────────────────────────────────"
-        echo "  project:     $WORK → /work (read-write; edits appear on the host instantly)"
+        if [ "$WORKSPACE_MODE" = "ephemeral" ]; then
+          echo "  project:     $WORK → /work (EPHEMERAL — writes stay in the VM and vanish at"
+          echo "               poweroff; vm-work-diff lists them, copy keepers to /home/agent)"
+        else
+          echo "  project:     $WORK → /work (read-write; edits appear on the host instantly)"
+        fi
         echo "  agent home:  $AGENT_DIR → /home/agent (persists across sessions)"
         if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
           echo "  dev shell:   loaded from the project — its Nix code is evaluated on the HOST"

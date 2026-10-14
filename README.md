@@ -449,6 +449,25 @@ the org allowlist from the reports (they live in `<agent-home>-egress/`), then
 switch the default to `alert` — each step changes observability, never
 behavior.
 
+### Ephemeral workspace
+
+```sh
+WORKSPACE_MODE=ephemeral make claude.run
+```
+
+Mounts a guest-side overlay over `/work`: the agent sees a writable project,
+but nothing it writes reaches the host — the session's delta lives in RAM and
+vanishes at poweroff. This inverts the default contract (passthrough, where
+edits appear on the host instantly), so it stays opt-in; use it for code you
+don't trust, or for experiments you want to inspect before accepting.
+
+Inside the VM, `vm-work-diff` lists what the session changed (`--patch` for
+a unified diff), and anything worth keeping is copied to `/home/agent`, which
+remains a persistent host share. Two things to know: writes to `/work` cost
+VM memory in this mode (the upper layer is a tmpfs), and the host-side
+tooling that reads the project before boot (`DIRENV_ALLOW` caching, settings
+seeding) sees the pristine host state, as before.
+
 ### Extra environment variables
 
 `EXTRA_ENV` forwards arbitrary environment variables into the guest, where they
@@ -522,6 +541,7 @@ Rebuild with `make claude`.
 | `DIRENV_ALLOW` | Set to `1` to load the project's dev shell (flake.nix or devenv) into the agent's environment | `0` |
 | `DIRENV_REEVAL` | Set to `1` to re-evaluate changed project Nix files on the host without the interactive prompt (see [Hardening notes](#hardening-notes)) | (prompt) |
 | `WORKSPACE_GUARD` | Set to `1` to make host-executed workspace config paths (`.git/hooks`, `.mcp.json`, `.claude/commands`, …) read-only inside the guest | (off) |
+| `WORKSPACE_MODE` | `passthrough` (edits appear on the host instantly) or `ephemeral` (guest-side overlay: writes stay in the VM, `vm-work-diff` lists them, all is discarded at poweroff) — see [Ephemeral workspace](#ephemeral-workspace) | `passthrough` |
 | `ENABLE_CRI` | Comma-separated list of container runtimes to activate: `containerd`, `crun`, `crio`, `docker`, `podman` | (disabled) |
 | `CRI_STORAGE_SIZE` | Cap on the CRI storage disk in MiB, applied when the image is first created. Sparse, so it is a ceiling rather than an allocation. `0` runs without the disk entirely. The disk is only *created* when `ENABLE_CRI` is set — see [Container runtime support](#container-runtime-support) | `30720` (30 GiB) |
 | `VM_STORE_SIZE` | Cap on the writable Nix store disk in MiB. Sparse, and recreated on every launch, so it applies to every run. Minimum 1024; `0` is rejected — see [Leaving nothing on the host](#leaving-nothing-on-the-host) | `10240` (10 GiB) |
