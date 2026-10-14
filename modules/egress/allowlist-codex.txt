@@ -1,0 +1,5 @@
+# Codex CLI endpoints. Not yet verified against an official vendor list —
+# alert mode makes gaps visible without breaking anything; adjust as observed
+# and please upstream what you find.
+openai.com               # api., auth.
+chatgpt.com              # subscription login

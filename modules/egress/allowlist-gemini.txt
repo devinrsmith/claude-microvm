@@ -1,0 +1,6 @@
+# Gemini CLI endpoints. Not yet verified against an official vendor list —
+# alert mode makes gaps visible without breaking anything; adjust as observed
+# and please upstream what you find.
+googleapis.com           # generativelanguage., oauth2., cloudcode-pa.
+google.com               # accounts. (OAuth)
+gstatic.com

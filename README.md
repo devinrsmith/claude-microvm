@@ -250,7 +250,7 @@ The VM provides strong isolation from the host:
 - **Filesystem** — only `/work` and the home directory are shared read-write; everything else is VM-local and ephemeral
 - **Nix store** — the host's `/nix/store` is shared as the lowerdir of the guest's store overlay, exported `readonly=on` so the guest cannot write through it
 - **Processes** — completely isolated (separate kernel)
-- **Network** — QEMU user-mode NAT; the VM can reach the internet but can't bind host ports
+- **Network** — QEMU user-mode NAT; the VM can reach the internet but can't bind host ports. `EGRESS_POLICY=monitor|alert` records everything the guest talks to, from the host side — see [Egress policy](#egress-policy)
 
 #### Hardening notes
 
@@ -321,6 +321,57 @@ EXTRA_CA_CERTS=/path/to/certs/ make claude.run
 ```
 
 The custom certificates are appended to the system CA bundle at boot, before the agent starts. All tools (curl, git, Nix, etc.) will trust servers signed by the custom CA.
+
+### Egress policy
+
+By default the VM has unrestricted outbound access (`EGRESS_POLICY=open`). Two
+observe-only modes record what the guest talks to, without blocking anything:
+
+```sh
+# Observe all guest traffic; per-domain summary printed at session end
+EGRESS_POLICY=monitor make claude.run
+
+# Same, plus live alerts for destinations outside the allowlist
+EGRESS_POLICY=alert make claude.run
+```
+
+Both attach a packet capture to the VM's network device **on the host side** —
+rootless, and the guest cannot see, avoid, or tamper with it. Each packet is
+truncated (`EGRESS_PCAP_MAXLEN`, default 4096 bytes): enough for headers, DNS
+and a complete TLS ClientHello — post-quantum hybrid key exchange pushes those
+to ~1.8 KiB, and SNI extraction needs the whole thing — while bulk transfers
+(TSO super-frames of up to 64 KiB) still truncate to 4 KiB each. When the session ends, a summary is printed and saved under
+`<agent-home>-egress/` (a host-only directory, never shared into the guest),
+and the raw capture is deleted — set `EGRESS_KEEP_PCAP=1` to keep it.
+
+`alert` additionally matches every observed hostname (DNS queries and TLS SNI)
+against an allowlist, live: watch with `tail -f` on the alerts file named at
+launch. The effective allowlist is the sum of
+
+- the baked-in default — the agent's own endpoints plus common development
+  infrastructure (registries, caches, container registries); see
+  `modules/egress/`. Deliberately generous: the point is surfacing
+  *unexpected* destinations, not cataloguing npm installs;
+- an optional org/project file, `EGRESS_ALLOWLIST=/path/to/file`;
+- per-session additions, `EGRESS_ALLOW=foo.example.com,bar.example.net`.
+
+An entry matches itself and every subdomain. Alerts never block — a flagged
+domain is a line in a log and in the session-end report, nothing more.
+
+Two caveats worth knowing. Attribution is DNS- and SNI-based, so traffic to a
+hardcoded IP (or with an encrypted ClientHello) appears as `ip:port` under "no
+observed hostname" rather than by name. And this is observation, not
+enforcement: default-deny egress with credentials held outside the guest is
+the planned `enforce` mode (a host-side proxy; see the roadmap in
+`attic/TODO.md`, Phase 9), and the reserved mode names `shadow` and `enforce`
+refuse to launch until it exists. Claude Code's WebSearch and WebFetch tools
+execute server-side on Anthropic's infrastructure, so they appear here only as
+traffic to `api.anthropic.com`.
+
+A practical rollout for a team: run `monitor` over real workloads first, build
+the org allowlist from the reports (they live in `<agent-home>-egress/`), then
+switch the default to `alert` — each step changes observability, never
+behavior.
 
 ### Extra environment variables
 
@@ -400,6 +451,11 @@ Rebuild with `make claude`.
 | `GEMINI_API_KEY` | API key for Gemini CLI (gemini flavor) | — |
 | `OPENAI_API_KEY` | API key for Codex CLI (codex flavor) and Pi (pi flavor) | — |
 | `EXTRA_CA_CERTS` | Path to a PEM file or directory of PEM files containing custom CA certificates to trust inside the VM | (system CAs only) |
+| `EGRESS_POLICY` | `open` (unrestricted), `monitor` (record all guest traffic, summary at session end) or `alert` (monitor plus live alerts for destinations off the allowlist). Observe-only — nothing is blocked. See [Egress policy](#egress-policy) | `open` |
+| `EGRESS_ALLOW` | Extra allowlist domains for `alert`, comma-separated. An entry matches itself and every subdomain | (none) |
+| `EGRESS_ALLOWLIST` | Path to an additional allowlist file (org or project policy), appended to the baked-in default for `alert` | (none) |
+| `EGRESS_KEEP_PCAP` | Set to keep the raw capture after the summary is written; by default it is deleted and only the report persists | (unset) |
+| `EGRESS_PCAP_MAXLEN` | Captured bytes per packet in `monitor`/`alert` | `4096` |
 | `EXTRA_ENV` | Extra environment variables to forward into the VM, comma-separated. `FOO=bar` assigns a literal value; a bare `FOO` forwards `$FOO` from the host environment (keeps secrets off the command line). | (none) |
 | `AGENTS_ARGS` | Extra arguments appended to the agent launch command. Use for one-shot prompts (e.g. `'-p "summarize this repo"'`) or to enable dangerous flags (e.g. `--dangerously-skip-permissions`). Re-parsed via `eval`, so quoting works. | (none) |
 

@@ -35,13 +35,22 @@
       forSystems = lib.genAttrs linuxSystems;
 
       vmFlavors = {
-        claude = { suffix = "";        agentModule = ./modules/agents/claude.nix; dataDirName = "claude-microvm"; apiKeyVars = [ "ANTHROPIC_API_KEY" ]; settingsFile = ".claude/settings.json"; };
-        gemini = { suffix = "-gemini"; agentModule = ./modules/agents/gemini.nix; dataDirName = "gemini-microvm"; apiKeyVars = [ "GEMINI_API_KEY" ]; settingsFile = ".gemini/settings.json"; };
-        codex  = { suffix = "-codex";  agentModule = ./modules/agents/codex.nix;  dataDirName = "codex-microvm";  apiKeyVars = [ "OPENAI_API_KEY" ]; settingsFile = ".codex/config.toml"; };
-        pi     = { suffix = "-pi";    agentModule = ./modules/agents/pi.nix;    dataDirName = "pi-microvm";    apiKeyVars = [ "ANTHROPIC_API_KEY" "OPENAI_API_KEY" "GEMINI_API_KEY" ]; settingsFile = null; };
+        claude = { suffix = "";        agentModule = ./modules/agents/claude.nix; dataDirName = "claude-microvm"; apiKeyVars = [ "ANTHROPIC_API_KEY" ]; settingsFile = ".claude/settings.json"; egressAllowlists = [ ./modules/egress/allowlist-claude.txt ]; };
+        gemini = { suffix = "-gemini"; agentModule = ./modules/agents/gemini.nix; dataDirName = "gemini-microvm"; apiKeyVars = [ "GEMINI_API_KEY" ]; settingsFile = ".gemini/settings.json"; egressAllowlists = [ ./modules/egress/allowlist-gemini.txt ]; };
+        codex  = { suffix = "-codex";  agentModule = ./modules/agents/codex.nix;  dataDirName = "codex-microvm";  apiKeyVars = [ "OPENAI_API_KEY" ]; settingsFile = ".codex/config.toml"; egressAllowlists = [ ./modules/egress/allowlist-codex.txt ]; };
+        pi     = { suffix = "-pi";    agentModule = ./modules/agents/pi.nix;    dataDirName = "pi-microvm";    apiKeyVars = [ "ANTHROPIC_API_KEY" "OPENAI_API_KEY" "GEMINI_API_KEY" ]; settingsFile = null; egressAllowlists = [ ./modules/egress/allowlist-claude.txt ./modules/egress/allowlist-gemini.txt ./modules/egress/allowlist-codex.txt ]; };
       };
 
-      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize }:
+      # Host-side pcap summarizer / live allowlist matcher for the egress
+      # monitor and alert modes. Packaged once per system; the same binary
+      # serves every flavor and the egress-report flake check.
+      mkEgressReport = pkgs: pkgs.writeShellApplication {
+        name = "egress-report";
+        runtimeInputs = [ pkgs.tshark pkgs.gawk pkgs.coreutils ];
+        text = builtins.readFile ./scripts/egress-report.sh;
+      };
+
+      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlist }:
         let
           virtiofsd = pkgs.virtiofsd;
           hostname = "${agentName}-vm";
@@ -57,6 +66,37 @@
         ${lib.optionalString storeDiskBacked ''VM_STORE_SIZE="''${VM_STORE_SIZE:-${toString defaultStoreSize}}"''}
         RUNTIME="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
         ID="$(cat /proc/sys/kernel/random/uuid)"
+
+        # --- Egress policy (monitor / alert) ---
+        # Passive observation of the guest's traffic via a QEMU filter-dump
+        # object on the slirp netdev. Neither mode blocks anything; the
+        # enforcing modes (shadow, enforce) arrive with the egress proxy —
+        # see README "Egress policy". Validated up front so a typo cannot
+        # launch an unobserved session the user believes is being watched.
+        EGRESS_POLICY="''${EGRESS_POLICY:-open}"
+        case "$EGRESS_POLICY" in
+          open|monitor|alert) ;;
+          shadow|enforce)
+            echo "error: EGRESS_POLICY=$EGRESS_POLICY is not implemented yet — these are the" >&2
+            echo "       proxy-backed modes on the roadmap. Available today: open (default)," >&2
+            echo "       monitor, alert." >&2
+            exit 1 ;;
+          *)
+            echo "error: EGRESS_POLICY must be open, monitor or alert (got '$EGRESS_POLICY')" >&2
+            exit 1 ;;
+        esac
+        if [ "$EGRESS_POLICY" != "alert" ] && { [ -n "''${EGRESS_ALLOW:-}" ] || [ -n "''${EGRESS_ALLOWLIST:-}" ]; }; then
+          echo "warning: EGRESS_ALLOW / EGRESS_ALLOWLIST are only read by EGRESS_POLICY=alert — ignored" >&2
+        fi
+        if ! [[ "''${EGRESS_PCAP_MAXLEN:-4096}" =~ ^[0-9]+$ ]]; then
+          echo "error: EGRESS_PCAP_MAXLEN must be an integer (captured bytes per packet)" >&2
+          exit 1
+        fi
+        EGRESS_DIR=""
+        EGRESS_PCAP=""
+        EGRESS_UNIT=""
+        EGRESS_ALERTS=""
+        _EGRESS_ALLOWLIST_FILE=""
 
         # Volume size knobs are integers in MiB. Validate before QEMU sees them:
         # a bad value otherwise surfaces as a mkfs failure or, worse, a store
@@ -111,6 +151,14 @@
         cleanup() {
           ${pkgs.systemd}/bin/systemctl --user stop "$UNIT" 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --user stop "$AGENT_UNIT" 2>/dev/null || true
+          if [ -n "$EGRESS_UNIT" ]; then
+            ${pkgs.systemd}/bin/systemctl --user stop "$EGRESS_UNIT" 2>/dev/null || true
+          fi
+          # The summary report is the artifact that persists; the raw capture
+          # goes unless the user asked to keep it.
+          if [ -n "$EGRESS_PCAP" ] && [ -z "''${EGRESS_KEEP_PCAP:-}" ]; then
+            rm -f "$EGRESS_PCAP"
+          fi
           for _s in "$SOCK" "$AGENT_SOCK"; do
             rm -f "$_s" "$_s.pid"
           done
@@ -174,6 +222,56 @@
         AGENT_DIR="$(realpath "$AGENT_HOME" 2>/dev/null || echo "$AGENT_HOME")"
         if [ ! -d "$AGENT_DIR" ]; then
           mkdir -p "$AGENT_DIR"
+        fi
+
+        # --- Egress capture setup (EGRESS_POLICY=monitor|alert) ---
+        if [ "$EGRESS_POLICY" != "open" ]; then
+          # Host-only sibling of the agent dir, like the CRI image: $AGENT_DIR
+          # itself is exported into the guest, and the guest must not be able
+          # to rewrite the record of its own traffic. Traffic metadata is
+          # sensitive, so the directory is owner-only.
+          EGRESS_DIR="$AGENT_DIR-egress"
+          mkdir -p "$EGRESS_DIR"
+          chmod 700 "$EGRESS_DIR"
+          _EGRESS_STAMP="$(date +%Y%m%d-%H%M%S)-''${ID%%-*}"
+          EGRESS_PCAP="$EGRESS_DIR/session-$_EGRESS_STAMP.pcap"
+          # Pre-create the capture so the alert follower's tail -F starts at
+          # byte 0 deterministically; QEMU's O_TRUNC open of the empty file is
+          # a no-op.
+          : > "$EGRESS_PCAP"
+
+          # The capture hook rewrites the QEMU command line, so its anchor
+          # must exist. If microvm.nix ever changes the emitted netdev text,
+          # fail loudly rather than silently launching uncaptured — an
+          # unnoticed policy failure is exactly the failure mode this feature
+          # exists to remove.
+          if ! grep -qF -- "-netdev 'user,id=usernet'" ${runner}/bin/microvm-run; then
+            echo "error: EGRESS_POLICY=$EGRESS_POLICY could not hook the QEMU command line:" >&2
+            echo "       the generated runner no longer contains \"-netdev 'user,id=usernet'\"." >&2
+            echo "       Launch with EGRESS_POLICY=open, and report this as a bug." >&2
+            exit 1
+          fi
+          _EGRESS_PCAP_ESC=$(printf '%s' "$EGRESS_PCAP" | ${pkgs.gnused}/bin/sed -e 's/[\\&|]/\\&/g')
+
+          if [ "$EGRESS_POLICY" = "alert" ]; then
+            # Effective allowlist = baked-in default (common + flavor), plus
+            # an optional org/project file, plus per-session additions —
+            # assembled into one file so the live matcher and the final
+            # report cannot disagree.
+            _EGRESS_ALLOWLIST_FILE="$EGRESS_DIR/session-$_EGRESS_STAMP.allowlist"
+            cat ${egressAllowlist} > "$_EGRESS_ALLOWLIST_FILE"
+            if [ -n "''${EGRESS_ALLOWLIST:-}" ]; then
+              if [ ! -f "$EGRESS_ALLOWLIST" ]; then
+                echo "error: EGRESS_ALLOWLIST=$EGRESS_ALLOWLIST is not a file" >&2
+                exit 1
+              fi
+              cat "$EGRESS_ALLOWLIST" >> "$_EGRESS_ALLOWLIST_FILE"
+            fi
+            if [ -n "''${EGRESS_ALLOW:-}" ]; then
+              printf '%s\n' "''${EGRESS_ALLOW//,/ }" | tr ' ' '\n' >> "$_EGRESS_ALLOWLIST_FILE"
+            fi
+            EGRESS_ALERTS="$EGRESS_DIR/session-$_EGRESS_STAMP.alerts.log"
+          fi
         fi
 
         # --- Agent settings seed ---
@@ -535,8 +633,63 @@
           )
         fi
 
+        if [ "$EGRESS_POLICY" != "open" ]; then
+          _SED_ARGS+=(
+            # Attach a capture object to the netdev. filter-dump sees every
+            # frame the guest sends or receives; maxlen truncates each packet
+            # so the capture records headers, DNS and TLS ClientHello (SNI)
+            # without retaining whole payloads. 4096 because a post-quantum
+            # hybrid-kex ClientHello runs ~1.8 KiB and SNI extraction needs it
+            # complete — while TSO super-frames (up to 64 KiB of bulk data per
+            # frame on virtio-net) still truncate to 4 KiB, which is where the
+            # capture-size saving actually comes from. The anchor was verified
+            # above.
+            -e "s|-netdev 'user,id=usernet'|-netdev 'user,id=usernet' -object 'filter-dump,id=egress-dump,netdev=usernet,file=$_EGRESS_PCAP_ESC,maxlen=''${EGRESS_PCAP_MAXLEN:-4096}'|"
+          )
+          case "$EGRESS_POLICY" in
+            monitor)
+              echo "egress policy: monitor — observing all guest traffic, blocking nothing; summary at session end"
+              ;;
+            alert)
+              echo "egress policy: alert — observing all guest traffic, blocking nothing."
+              echo "  live alerts: tail -f '$EGRESS_ALERTS'"
+              EGRESS_UNIT="$VM_ID-egress-$ID"
+              ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect \
+                -- ${egressReport}/bin/egress-report follow "$EGRESS_PCAP" \
+                   --allowlist "$_EGRESS_ALLOWLIST_FILE" --alerts "$EGRESS_ALERTS"
+              ;;
+          esac
+        fi
+
         # Run QEMU with corrected paths
-        bash <(${pkgs.gnused}/bin/sed "''${_SED_ARGS[@]}" ${runner}/bin/microvm-run)
+        _VM_RC=0
+        bash <(${pkgs.gnused}/bin/sed "''${_SED_ARGS[@]}" ${runner}/bin/microvm-run) || _VM_RC=$?
+
+        if [ "$EGRESS_POLICY" != "open" ]; then
+          if [ -n "$EGRESS_UNIT" ]; then
+            ${pkgs.systemd}/bin/systemctl --user stop "$EGRESS_UNIT" 2>/dev/null || true
+            EGRESS_UNIT=""
+          fi
+          _EGRESS_REPORT="$EGRESS_DIR/session-$_EGRESS_STAMP.report.txt"
+          _EGRESS_RC=0
+          ${egressReport}/bin/egress-report summarize "$EGRESS_PCAP" \
+            ''${_EGRESS_ALLOWLIST_FILE:+--allowlist} ''${_EGRESS_ALLOWLIST_FILE:+"$_EGRESS_ALLOWLIST_FILE"} \
+            > "$_EGRESS_REPORT" 2>&1 || _EGRESS_RC=$?
+          echo
+          cat "$_EGRESS_REPORT"
+          echo "egress report saved: $_EGRESS_REPORT"
+          if [ "$_EGRESS_RC" -eq 2 ]; then
+            echo "egress alert: destinations outside the allowlist — see the violations section above"
+          elif [ "$_EGRESS_RC" -ne 0 ]; then
+            echo "warning: egress report failed (exit $_EGRESS_RC) — see $_EGRESS_REPORT" >&2
+          fi
+          if [ -n "''${EGRESS_KEEP_PCAP:-}" ]; then
+            echo "egress capture kept: $EGRESS_PCAP"
+          fi
+          # cleanup() removes the capture (unless EGRESS_KEEP_PCAP is set):
+          # the summary is the artifact that persists, not the raw traffic.
+        fi
+        exit "$_VM_RC"
       '';
     in
     {
@@ -595,13 +748,18 @@
       };
       });
 
-      packages = forSystems (system: let pkgs = nixpkgs.legacyPackages.${system}; in
-        { default = self.packages.${system}.claude; } //
+      packages = forSystems (system: let
+        pkgs = nixpkgs.legacyPackages.${system};
+        egressReport = mkEgressReport pkgs;
+      in
+        { default = self.packages.${system}.claude;
+          egress-report = egressReport;
+        } //
         builtins.mapAttrs (name: flavor: let
           nixosCfg = self.nixosConfigurations."${name}${flavor.suffix}-${system}".config;
           runner = nixosCfg.microvm.runner.qemu;
         in mkRunnerScript {
-          inherit pkgs runner;
+          inherit pkgs runner egressReport;
           inherit (flavor) dataDirName apiKeyVars settingsFile;
           agentName = name;
           defaultMem = nixosCfg.claude-vm.agent.mem;
@@ -609,6 +767,9 @@
           defaultCriSize = nixosCfg.claude-vm.cri.storageSize;
           storeDiskBacked = nixosCfg.claude-vm.store.diskBacked;
           defaultStoreSize = nixosCfg.claude-vm.store.size;
+          egressAllowlist = pkgs.writeText "egress-allowlist-${name}"
+            (lib.concatMapStringsSep "\n" builtins.readFile
+              ([ ./modules/egress/allowlist-common.txt ] ++ flavor.egressAllowlists));
         }) vmFlavors
       );
 
@@ -638,6 +799,10 @@
         settings-seed = import ./tests/settings-seed.nix {
           inherit pkgs lib;
           runner = self.packages.${system}.claude;
+        };
+        egress-report = import ./tests/egress-report.nix {
+          inherit pkgs lib;
+          egressReport = self.packages.${system}.egress-report;
         };
       });
     };

@@ -1,0 +1,18 @@
+# Claude Code call-home endpoints, from the official network requirements:
+# https://code.claude.com/docs/en/network-config.md (checked 2026-10-14).
+# WebSearch and WebFetch execute server-side on Anthropic infrastructure, so
+# they need nothing here beyond api.anthropic.com.
+anthropic.com            # api. (API, feature flags, telemetry), mcp-proxy.
+claude.ai                # account auth; downloads. (installer, plugins, update checks)
+claude.com               # sign-in redirect; platform. (OAuth/Console); code. (docs lookups)
+claudeusercontent.com    # bridge. (Chrome extension), *.frame. (artifact reads)
+storage.googleapis.com   # plugin install counts and metadata
+registry.npmjs.org       # plugin installs (also in the common list)
+
+# Optional operational telemetry. Prefer removing these two lines and setting
+# EXTRA_ENV="DISABLE_TELEMETRY=1,DISABLE_ERROR_REPORTING=1" if your policy is
+# to not send it, rather than letting it show up as alert noise.
+http-intake.logs.us5.datadoghq.com
+browser-intake-us5-datadoghq.com
+
+formulae.brew.sh         # update version checks on Homebrew installs
