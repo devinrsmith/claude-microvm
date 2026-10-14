@@ -403,7 +403,8 @@ EGRESS_POLICY=enforce make claude.run   # sealed netdev; the allowlist is enforc
 
 Both seal the VM's network (`restrict=on`): every flow is refused except one
 hole that leads to a proxy on the host (`packages.egress-proxy` — Go stdlib
-only, `proxy/`). The guest gets `HTTP(S)_PROXY` pointing at it, and:
+only, from [microvm-policy](https://github.com/systemstart/microvm-policy)).
+The guest gets `HTTP(S)_PROXY` pointing at it, and:
 
 - **API keys never enter the guest.** The agent's `*_BASE_URL` points at the
   proxy, which originates genuine TLS to the real API, validates its real

@@ -26,34 +26,21 @@
       url = "github:microvm-nix/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    # Toolchain for proxy/ — go-overlay tracks go.dev directly instead of
-    # waiting on nixpkgs' packaging schedule (same pattern as nix-oci).
-    go-overlay = {
-      url = "github:purpleclay/go-overlay";
+    # The egress/workspace policy layer: guest modules (sealed egress,
+    # workspace write-guard, ephemeral mode), the host-side egress proxy and
+    # egress-report, and the generic allowlist. This flake keeps only the
+    # consumer glue — the launcher and the agent-specific allowlists.
+    microvm-policy = {
+      url = "github:systemstart/microvm-policy";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, microvm, go-overlay }:
+  outputs = { self, nixpkgs, microvm, microvm-policy }:
     let
       lib = nixpkgs.lib;
       linuxSystems = [ "x86_64-linux" "aarch64-linux" ];
       forSystems = lib.genAttrs linuxSystems;
-
-      # The exact Go release the egress proxy builds with. Renovate proposes
-      # bumps via the regex manager in renovate.json; if evaluation fails with
-      # `attribute '"X.Y.Z"' missing`, the locked go-overlay predates the pin —
-      # run `nix flake update go-overlay` on the same branch.
-      # renovate: datasource=golang-version depName=go
-      goVersion = "1.27.2";
-
-      # Scoped deliberately: the overlay is applied to a throwaway nixpkgs
-      # instance used only to pull the toolchain out, so nothing else in this
-      # flake evaluates against a modified package set.
-      goToolchain = system: (import nixpkgs {
-        inherit system;
-        overlays = [ go-overlay.overlays.default ];
-      }).go-bin.versions.${goVersion};
 
       vmFlavors = {
         claude = { suffix = "";        agentModule = ./modules/agents/claude.nix; dataDirName = "claude-microvm"; apiKeyVars = [ "ANTHROPIC_API_KEY" ]; settingsFile = ".claude/settings.json"; egressAllowlists = [ ./modules/egress/allowlist-claude.txt ]; };
@@ -78,18 +65,10 @@
 
       # Where the guest reaches the proxy: a slirp-internal address that
       # guestfwd maps onto the host-side listener. Chosen to dodge 10.0.2.2
-      # (host), 10.0.2.3 (DNS) and 10.0.2.15 (guest). modules/egress.nix's
-      # ssh wrapper learns it from EGRESS_PROXY_ADDR in .microvm-env.
+      # (host), 10.0.2.3 (DNS) and 10.0.2.15 (guest). microvm-policy's
+      # egress module ssh wrapper learns it from EGRESS_PROXY_ADDR in
+      # .microvm-env.
       egressGuestAddr = "10.0.2.100:3128";
-
-      # Host-side pcap summarizer / live allowlist matcher for the egress
-      # monitor and alert modes. Packaged once per system; the same binary
-      # serves every flavor and the egress-report flake check.
-      mkEgressReport = pkgs: pkgs.writeShellApplication {
-        name = "egress-report";
-        runtimeInputs = [ pkgs.tshark pkgs.gawk pkgs.coreutils ];
-        text = builtins.readFile ./scripts/egress-report.sh;
-      };
 
       mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlist, egressProxy, flavorEndpoints }:
         let
@@ -976,20 +955,6 @@ EOF
       '';
     in
     {
-      # The microvm-policy layer, exposed for extraction to its own repo and
-      # for other microvm.nix consumers. `default` pulls the whole layer;
-      # the individual modules are there for finer control. The proxy and
-      # report binaries are under `packages` (egress-proxy, egress-report).
-      # Decoupled from this repo's layout via the microvmPolicy.* options
-      # (modules/policy.nix) — defaults match claude-microvm, so importing
-      # the layer here changes nothing.
-      nixosModules = {
-        policy = ./modules/policy.nix;
-        egress = ./modules/egress.nix;
-        workspace = ./modules/workspace.nix;
-        default = { imports = [ ./modules/egress.nix ./modules/workspace.nix ]; };
-      };
-
       nixosConfigurations = builtins.listToAttrs (lib.flatten (map (system:
         lib.mapAttrsToList (name: flavor: {
           name = "${name}${flavor.suffix}-${system}";
@@ -999,8 +964,8 @@ EOF
               microvm.nixosModules.microvm
               ./modules/base.nix
               ./modules/cri.nix
-              ./modules/egress.nix
-              ./modules/workspace.nix
+              # microvmPolicy.* defaults match this repo's layout.
+              microvm-policy.nixosModules.default
               { claude-vm.cri.enable = true; }
               flavor.agentModule
             ];
@@ -1049,34 +1014,20 @@ EOF
 
       packages = forSystems (system: let
         pkgs = nixpkgs.legacyPackages.${system};
-        egressReport = mkEgressReport pkgs;
+        policyPkgs = microvm-policy.packages.${system};
       in
         { default = self.packages.${system}.claude;
-          egress-report = egressReport;
-
-          # The enforcement half of EGRESS_POLICY (shadow/enforce). Stdlib
-          # only — vendorHash = null means there is no module graph at all.
-          # Built but not yet wired into the launcher; see attic/TODO.md
-          # Phase 9 for the restrict=on + guestfwd wiring that consumes it.
-          egress-proxy = (pkgs.buildGoModule.override {
-            go = goToolchain system;
-          }) {
-            pname = "egress-proxy";
-            version = "0.1.0";
-            src = ./proxy;
-            vendorHash = null;
-            meta = {
-              description = "Egress proxy for claude-microvm: CONNECT allowlist, credential-injecting LLM reverse proxy, JSONL audit log";
-              mainProgram = "egress-proxy";
-            };
-          };
+          # Re-exported from microvm-policy so `nix run .#egress-report`
+          # keeps working against this flake.
+          inherit (policyPkgs) egress-report egress-proxy;
         } //
         builtins.mapAttrs (name: flavor: let
           nixosCfg = self.nixosConfigurations."${name}${flavor.suffix}-${system}".config;
           runner = nixosCfg.microvm.runner.qemu;
         in mkRunnerScript {
-          inherit pkgs runner egressReport;
-          egressProxy = self.packages.${system}.egress-proxy;
+          inherit pkgs runner;
+          egressReport = policyPkgs.egress-report;
+          egressProxy = policyPkgs.egress-proxy;
           flavorEndpoints = egressEndpoints.${name};
           inherit (flavor) dataDirName apiKeyVars settingsFile;
           agentName = name;
@@ -1087,7 +1038,7 @@ EOF
           defaultStoreSize = nixosCfg.claude-vm.store.size;
           egressAllowlist = pkgs.writeText "egress-allowlist-${name}"
             (lib.concatMapStringsSep "\n" builtins.readFile
-              ([ ./modules/egress/allowlist-common.txt ] ++ flavor.egressAllowlists));
+              ([ "${microvm-policy}/allowlists/common.txt" ] ++ flavor.egressAllowlists));
         }) vmFlavors
       );
 
@@ -1118,20 +1069,12 @@ EOF
           inherit pkgs lib;
           runner = self.packages.${system}.claude;
         };
-        egress-report = import ./tests/egress-report.nix {
-          inherit pkgs lib;
-          egressReport = self.packages.${system}.egress-report;
-        };
-        # buildGoModule runs `go test ./...` in its check phase, so building
-        # the package is the unit-test run.
-        egress-proxy = self.packages.${system}.egress-proxy;
+        # The proxy's own tests (Go units, egress-report, egress-integration)
+        # run in microvm-policy's CI. This one stays: it tests the launcher's
+        # config generation against the proxy it actually ships with.
         egress-config = import ./tests/egress-config.nix {
           inherit pkgs lib;
           runner = self.packages.${system}.claude;
-          egressProxy = self.packages.${system}.egress-proxy;
-        };
-        egress-integration = import ./tests/egress-integration.nix {
-          inherit pkgs lib;
           egressProxy = self.packages.${system}.egress-proxy;
         };
       });

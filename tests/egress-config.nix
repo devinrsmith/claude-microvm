@@ -1,7 +1,7 @@
 # The shadow/enforce proxy config is assembled by generated shell in the
 # launcher, and its one hard requirement is invisible to eval-level checks:
-# the JSON it emits must be exactly what proxy/ parses — both sides of the
-# contract reject unknown or malformed fields. Extract the region from the
+# the JSON it emits must be exactly what microvm-policy's proxy parses — both
+# sides of the contract reject unknown or malformed fields. Extract the region from the
 # *built* claude runner (so Nix-to-shell escaping is covered, like
 # settings-seed) and feed its output to the real egress-proxy binary, in both
 # key modes: host key present (injection) and absent (OAuth passthrough).
