@@ -107,6 +107,10 @@
             _EGRESS_EPS="$_EGRESS_EPS,{\"prefix\":\"${ep.prefix}\",\"upstream\":\"${ep.upstream}\",\"keyEnv\":\"$_EGRESS_EP_KEYENV\",\"header\":\"${ep.header}\",\"allowedPaths\":${lib.replaceStrings [ "\"" ] [ "\\\"" ] (builtins.toJSON ep.allowedPaths)}}"'') flavorEndpoints;
           egressProxySetenv = lib.concatMapStringsSep "\n" (ep: ''
             if [ -n "''${${ep.keyVar}:-}" ]; then _EGRESS_SETENV+=("--setenv=${ep.keyVar}"); fi'') flavorEndpoints;
+          # Session-contract fragment: which credential vars the host holds,
+          # names only — values never appear anywhere near a terminal.
+          contractKeyChecks = lib.concatStringsSep "\n" (map (var: ''
+            if [ -n "''${${var}:-}" ]; then _CONTRACT_KEYS="$_CONTRACT_KEYS ${var}"; fi'') apiKeyVars);
           egressGuestEnv = lib.concatMapStringsSep "\n" (ep: ''
             echo "${ep.baseUrlVar}=http://${egressGuestAddr}${ep.prefix}" >> "$AGENT_DIR/.microvm-env"
             if [ -n "''${${ep.keyVar}:-}" ]; then
@@ -156,6 +160,7 @@
         _EGRESS_ALLOWLIST_FILE=""
         _EGRESS_PORTFILE=""
         _EGRESS_PROXY_CFG=""
+        _CONTRACT_EXTRA=""
 
         # Volume size knobs are integers in MiB. Validate before QEMU sees them:
         # a bad value otherwise surfaces as a mkfs failure or, worse, a store
@@ -607,6 +612,7 @@ EOF
             # %q again: the guest sources this file, so an unescaped value
             # would be executable code, not data.
             printf '%s=%q\n' "$_name" "$_value" >> "$AGENT_DIR/.microvm-env"
+            _CONTRACT_EXTRA="$_CONTRACT_EXTRA $_name"
           done
         fi
 
@@ -789,12 +795,7 @@ EOF
               # above.
               -e "s|-netdev 'user,id=usernet'|-netdev 'user,id=usernet' -object 'filter-dump,id=egress-dump,netdev=usernet,file=$_EGRESS_PCAP_ESC,maxlen=''${EGRESS_PCAP_MAXLEN:-4096}'|"
             )
-            if [ "$EGRESS_POLICY" = "monitor" ]; then
-              echo "egress policy: monitor — observing all guest traffic, blocking nothing; summary at session end"
-              echo "  reports land in: $EGRESS_DIR"
-            else
-              echo "egress policy: alert — observing all guest traffic, blocking nothing."
-              echo "  live alerts: tail -f '$EGRESS_DIR/latest.alerts.log'"
+            if [ "$EGRESS_POLICY" = "alert" ]; then
               EGRESS_UNIT="$VM_ID-egress-$ID"
               ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect \
                 -- ${egressReport}/bin/egress-report follow "$EGRESS_PCAP" \
@@ -811,12 +812,62 @@ EOF
               # the guest-to-host 10.0.2.2 path as a side effect.
               -e "s|-netdev 'user,id=usernet'|-netdev 'user,id=usernet,restrict=on,guestfwd=tcp:${egressGuestAddr}-cmd:${pkgs.socat}/bin/socat STDIO TCP:127.0.0.1:$_EGRESS_PORT'|"
             )
-            echo "egress policy: $EGRESS_POLICY — netdev sealed; all traffic via the proxy$([ "$EGRESS_POLICY" = shadow ] && echo ' (log-only: nothing is blocked yet)')"
-            echo "  audit log: tail -f '$EGRESS_DIR/latest.audit.jsonl'"
-            echo "  note: a denied CONNECT shows up in tools only as '403 from proxy' — the"
-            echo "        actionable reason (which domain, how to allow it) is in the audit log."
             ;;
         esac
+
+        # --- Session contract (Phase 11): what this run can reach, printed
+        # before boot so a surprise is visible while it is still cheap. Names
+        # only for credentials — values never appear here.
+        _CONTRACT_KEYS=""
+        ${contractKeyChecks}
+        echo "── session contract ──────────────────────────────────────────────"
+        echo "  project:     $WORK → /work (read-write; edits appear on the host instantly)"
+        echo "  agent home:  $AGENT_DIR → /home/agent (persists across sessions)"
+        if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
+          echo "  dev shell:   loaded from the project — its Nix code is evaluated on the HOST"
+        else
+          echo "  dev shell:   not loaded (DIRENV_ALLOW=1 to enable)"
+        fi
+        case "$EGRESS_POLICY" in
+          open)
+            echo "  egress:      open — unrestricted (EGRESS_POLICY=monitor to observe)" ;;
+          monitor)
+            echo "  egress:      monitor — observing all traffic, blocking nothing"
+            echo "               summary at session end; reports in $EGRESS_DIR" ;;
+          alert)
+            echo "  egress:      alert — observing all traffic, blocking nothing"
+            echo "               live alerts: tail -f '$EGRESS_DIR/latest.alerts.log'" ;;
+          shadow)
+            echo "  egress:      shadow — netdev sealed; the proxy audits and denies nothing yet"
+            echo "               audit: tail -f '$EGRESS_DIR/latest.audit.jsonl'" ;;
+          enforce)
+            echo "  egress:      enforce — netdev sealed; allowlist enforced"
+            echo "               audit: tail -f '$EGRESS_DIR/latest.audit.jsonl' (denials land"
+            echo "               there; tools see only '403 from proxy' on CONNECT)" ;;
+        esac
+        case "$EGRESS_POLICY" in alert|shadow|enforce)
+          _CONTRACT_ALLOW="baked default"
+          if [ -n "''${EGRESS_ALLOWLIST:-}" ]; then _CONTRACT_ALLOW="$_CONTRACT_ALLOW + $EGRESS_ALLOWLIST"; fi
+          if [ -n "''${EGRESS_ALLOW:-}" ]; then _CONTRACT_ALLOW="$_CONTRACT_ALLOW + EGRESS_ALLOW ($EGRESS_ALLOW)"; fi
+          echo "               allowlist: $_CONTRACT_ALLOW"
+        ;; esac
+        case "$EGRESS_POLICY" in
+          shadow|enforce)
+            echo "  env → guest: keys:''${_CONTRACT_KEYS:- (none)} — placeholders only, real keys stay with the proxy''${_CONTRACT_EXTRA:+; EXTRA_ENV:$_CONTRACT_EXTRA}" ;;
+          *)
+            echo "  env → guest: keys:''${_CONTRACT_KEYS:- (none)}''${_CONTRACT_EXTRA:+; EXTRA_ENV:$_CONTRACT_EXTRA}" ;;
+        esac
+        if [ "$CRI_ATTACH" -eq 1 ]; then
+          if [ -n "''${ENABLE_CRI:-}" ]; then
+            echo "  containers:  ENABLE_CRI=$ENABLE_CRI — storage disk attached (''${CRI_STORAGE_SIZE} MiB cap at creation)"
+          else
+            echo "  containers:  runtimes off; existing storage disk stays attached"
+          fi
+        else
+          echo "  containers:  off"
+        fi
+        echo "  resources:   ''${VM_MEM} MiB RAM, $VM_VCPU vCPUs${lib.optionalString storeDiskBacked "; writable store \${VM_STORE_SIZE} MiB (fresh each boot)"}"
+        echo "──────────────────────────────────────────────────────────────────"
 
         # Run QEMU with corrected paths
         _VM_RC=0

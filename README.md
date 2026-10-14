@@ -252,6 +252,12 @@ The VM provides strong isolation from the host:
 - **Processes** — completely isolated (separate kernel)
 - **Network** — QEMU user-mode NAT; the VM can reach the internet but can't bind host ports. `EGRESS_POLICY=monitor|alert` records everything the guest talks to from the host side; `EGRESS_POLICY=shadow|enforce` seals the netdev behind a host-side proxy that holds the API keys — see [Egress policy](#egress-policy)
 
+Every launch prints a **session contract** before boot: project path and mount
+mode, whether the dev shell evaluated the project's Nix code on the host,
+egress mode and allowlist sources, which env vars reach the guest (names
+only, never values), container state, and resources — so what a run can reach
+is visible while it is still cheap to stop.
+
 #### Hardening notes
 
 Three things worth knowing before pointing this at code you don't trust:
