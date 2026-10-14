@@ -918,6 +918,13 @@ EOF
         fi
         echo "  resources:   ''${VM_MEM} MiB RAM, $VM_VCPU vCPUs${lib.optionalString storeDiskBacked "; writable store \${VM_STORE_SIZE} MiB (fresh each boot)"}"
         echo "──────────────────────────────────────────────────────────────────"
+        # The contract is the last thing before the kernel's boot log scrolls
+        # it away, so pause on it — but only with a terminal to read it and a
+        # human to press the key. A one-shot run (AGENTS_ARGS with -p), a pipe,
+        # or NO_PAUSE=1 skips straight to boot.
+        if [ -t 0 ] && [ "''${NO_PAUSE:-0}" != "1" ]; then
+          read -r -p "press Enter to boot (NO_PAUSE=1 to skip this) … " _ || true
+        fi
 
         # Run QEMU with corrected paths
         _VM_RC=0

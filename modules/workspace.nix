@@ -102,9 +102,14 @@ in
 
         # Keep the pristine host view reachable (for vm-work-diff and the
         # overlay's lowerdir) without disturbing systemd's work.mount: a bind,
-        # not a move.
+        # not a move. systemd makes / shared, so the overlay we mount on /work
+        # below would propagate into this bind and the "lower" would show the
+        # upper's writes (vm-work-diff then calling every new file "modified").
+        # --make-private detaches the bind from that peer group so it stays
+        # pristine.
         mkdir -p /run/work-lower /run/work-rw
         mount --bind /work /run/work-lower
+        mount --make-private /run/work-lower
 
         # The upper layer is RAM (its own tmpfs, so a runaway write fills
         # this mount, not /run): session writes cost memory and vanish at
