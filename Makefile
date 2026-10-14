@@ -37,6 +37,10 @@ pi.run: pi
 #   make release-tag EDIT=1                 same, but review it in $EDITOR first
 #   make release-tag NOTES=notes.md         takes the body from a file
 #   make release-tag MESSAGE="..."          takes the body from the command line
+#
+# The tag is signed with -s. tag.forcesignannotated does NOT achieve this: git
+# gives an explicit --annotate/-a precedence over that config, so `git tag -a`
+# produced unsigned tags (v0.13.0 to v0.15.0) however the config was set.
 release-tag:
 	@set -e; \
 	VERSION="$(VERSION)"; \
@@ -57,5 +61,5 @@ release-tag:
 	  echo "error: release notes are empty — tag not created" >&2; exit 1; \
 	fi; \
 	{ echo "Release v$$VERSION"; echo; cat "$$BODY"; } \
-	  | git tag -a "v$$VERSION" --cleanup=verbatim -F -; \
+	  | git tag -s "v$$VERSION" --cleanup=verbatim -F -; \
 	git push origin "v$$VERSION"
