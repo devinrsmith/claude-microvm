@@ -376,6 +376,18 @@ SHAREEOF
           [ -f ~/.microvm-devshell.err ] && cat ~/.microvm-devshell.err
         fi
       fi
+      # An ephemeral session whose overlay did not mount would write straight
+      # through to the host while the user believes otherwise — the same
+      # silent-downgrade class as a failed egress seal, refused the same way.
+      if [ "''${WORKSPACE_MODE:-passthrough}" = "ephemeral" ] \
+         && ! grep -qE '^[^ ]+ /work overlay ' /proc/mounts \
+         && [ "''${EPHEMERAL_IGNORE:-0}" != "1" ]; then
+        echo "refusing to start ${cfg.name}: WORKSPACE_MODE=ephemeral, but /work is NOT an"
+        echo "overlay — writes would reach the host. See: systemctl status work-ephemeral"
+        echo "Launch with WORKSPACE_MODE=passthrough to share the workspace on purpose, or"
+        echo "EXTRA_ENV=EPHEMERAL_IGNORE=1 to override, and report this as a bug."
+        sudo poweroff
+      fi
       # A sealed session whose seal did not hold must not quietly run open —
       # that silent downgrade is exactly what the boot-time self-test exists
       # to catch (modules/egress.nix). Refusing here keeps the message on the

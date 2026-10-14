@@ -86,6 +86,9 @@ in
       after = [ "work.mount" "home-agent.mount" ];
       before = [ "workspace-guard.service" "getty@hvc0.service" ];
       wantedBy = [ "multi-user.target" ];
+      # NixOS unit scripts default to coreutils/sed/grep on PATH — mount is
+      # not among them. Found by the first real boot.
+      path = [ pkgs.util-linux ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -122,6 +125,7 @@ in
       after = [ "work.mount" "home-agent.mount" "work-ephemeral.service" ];
       before = [ "getty@hvc0.service" ];
       wantedBy = [ "multi-user.target" ];
+      path = [ pkgs.util-linux ]; # mount — see work-ephemeral
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
