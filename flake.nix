@@ -1116,6 +1116,10 @@ EOF
           runner = self.packages.${system}.claude;
           egressProxy = self.packages.${system}.egress-proxy;
         };
+        egress-integration = import ./tests/egress-integration.nix {
+          inherit pkgs lib;
+          egressProxy = self.packages.${system}.egress-proxy;
+        };
       });
     };
 }
