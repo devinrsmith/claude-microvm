@@ -374,9 +374,14 @@ Two caveats worth knowing. Attribution is DNS- and SNI-based, so traffic to a
 hardcoded IP (or with an encrypted ClientHello) appears as `ip:port` under "no
 observed hostname" rather than by name. And this is observation, not
 enforcement: default-deny egress with credentials held outside the guest is
-the planned `enforce` mode (a host-side proxy; see the roadmap in
-`attic/TODO.md`, Phase 9), and the reserved mode names `shadow` and `enforce`
-refuse to launch until it exists. Claude Code's WebSearch and WebFetch tools
+the planned `enforce` mode, and the reserved mode names `shadow` and `enforce`
+refuse to launch until the wiring exists. The proxy that will back them
+already builds and tests as `packages.egress-proxy` (`proxy/`, Go stdlib
+only): an opaque-`CONNECT` forward proxy with a host:port allowlist, a
+reverse-proxy leg for the LLM endpoints that strips client-supplied
+credentials and injects the key held on the host, and a JSONL audit log — see
+the roadmap in `attic/TODO.md`, Phase 9, for the `restrict=on` + `guestfwd`
+wiring that connects it to the VM. Claude Code's WebSearch and WebFetch tools
 execute server-side on Anthropic's infrastructure, so they appear here only as
 traffic to `api.anthropic.com`.
 

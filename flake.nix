@@ -26,13 +26,34 @@
       url = "github:microvm-nix/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Toolchain for proxy/ — go-overlay tracks go.dev directly instead of
+    # waiting on nixpkgs' packaging schedule (same pattern as nix-oci).
+    go-overlay = {
+      url = "github:purpleclay/go-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, microvm }:
+  outputs = { self, nixpkgs, microvm, go-overlay }:
     let
       lib = nixpkgs.lib;
       linuxSystems = [ "x86_64-linux" "aarch64-linux" ];
       forSystems = lib.genAttrs linuxSystems;
+
+      # The exact Go release the egress proxy builds with. Renovate proposes
+      # bumps via the regex manager in renovate.json; if evaluation fails with
+      # `attribute '"X.Y.Z"' missing`, the locked go-overlay predates the pin —
+      # run `nix flake update go-overlay` on the same branch.
+      # renovate: datasource=golang-version depName=go
+      goVersion = "1.27.2";
+
+      # Scoped deliberately: the overlay is applied to a throwaway nixpkgs
+      # instance used only to pull the toolchain out, so nothing else in this
+      # flake evaluates against a modified package set.
+      goToolchain = system: (import nixpkgs {
+        inherit system;
+        overlays = [ go-overlay.overlays.default ];
+      }).go-bin.versions.${goVersion};
 
       vmFlavors = {
         claude = { suffix = "";        agentModule = ./modules/agents/claude.nix; dataDirName = "claude-microvm"; apiKeyVars = [ "ANTHROPIC_API_KEY" ]; settingsFile = ".claude/settings.json"; egressAllowlists = [ ./modules/egress/allowlist-claude.txt ]; };
@@ -760,6 +781,23 @@
       in
         { default = self.packages.${system}.claude;
           egress-report = egressReport;
+
+          # The enforcement half of EGRESS_POLICY (shadow/enforce). Stdlib
+          # only — vendorHash = null means there is no module graph at all.
+          # Built but not yet wired into the launcher; see attic/TODO.md
+          # Phase 9 for the restrict=on + guestfwd wiring that consumes it.
+          egress-proxy = (pkgs.buildGoModule.override {
+            go = goToolchain system;
+          }) {
+            pname = "egress-proxy";
+            version = "0.1.0";
+            src = ./proxy;
+            vendorHash = null;
+            meta = {
+              description = "Egress proxy for claude-microvm: CONNECT allowlist, credential-injecting LLM reverse proxy, JSONL audit log";
+              mainProgram = "egress-proxy";
+            };
+          };
         } //
         builtins.mapAttrs (name: flavor: let
           nixosCfg = self.nixosConfigurations."${name}${flavor.suffix}-${system}".config;
@@ -810,6 +848,9 @@
           inherit pkgs lib;
           egressReport = self.packages.${system}.egress-report;
         };
+        # buildGoModule runs `go test ./...` in its check phase, so building
+        # the package is the unit-test run.
+        egress-proxy = self.packages.${system}.egress-proxy;
       });
     };
 }
