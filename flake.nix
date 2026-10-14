@@ -550,6 +550,9 @@ EOF
         # The guest reads the policy for the seal service and the ssh wrapper
         # (modules/egress.nix); it is informational in the open modes.
         echo "EGRESS_POLICY=$EGRESS_POLICY" >> "$AGENT_DIR/.microvm-env"
+        # Read by modules/workspace.nix: read-only binds over workspace paths
+        # whose contents execute on the host later.
+        echo "WORKSPACE_GUARD=''${WORKSPACE_GUARD:-}" >> "$AGENT_DIR/.microvm-env"
         case "$EGRESS_POLICY" in
           shadow|enforce)
             # The key never enters the guest: the agent talks plaintext HTTP
@@ -671,7 +674,33 @@ EOF
             _CURRENT_HASH="$( (cat "$WORK/flake.nix" "$WORK/flake.lock" "$WORK/.devenv.flake.nix" "$WORK/devenv.nix" "$WORK/devenv.yaml" "$WORK/devenv.lock" 2>/dev/null || true) | sha256sum | cut -c1-16)"
             _CACHED_HASH=""
             [ -f "$_DEVSHELL_CACHE.hash" ] && _CACHED_HASH="$(cat "$_DEVSHELL_CACHE.hash")"
-            if [ "$_CURRENT_HASH" != "$_CACHED_HASH" ] || [ ! -s "$_DEVSHELL_CACHE" ]; then
+            # The guest can write /work, so Nix files changed since the last
+            # evaluation may have been edited by the agent — and this cache
+            # step evaluates them ON THE HOST. A first-time eval is the user's
+            # own fresh DIRENV_ALLOW=1; a *changed* input is exactly the
+            # guest-to-host path the README warns about, so it needs a human
+            # (or an explicit DIRENV_REEVAL=1) to proceed.
+            if [ -n "$_CACHED_HASH" ] && [ "$_CURRENT_HASH" != "$_CACHED_HASH" ] \
+               && [ -z "''${DIRENV_REEVAL:-}" ]; then
+              echo "warning: the project's Nix files (flake.nix/devenv.*) changed since the dev"
+              echo "         shell was last evaluated — possibly edited inside the VM. Evaluating"
+              echo "         them runs their Nix code on the HOST."
+              _DIRENV_ANSWER=""
+              if [ -t 0 ]; then
+                read -r -p "re-evaluate on the host? [y/N] " _DIRENV_ANSWER
+              fi
+              case "$_DIRENV_ANSWER" in
+                y|Y|yes) ;;
+                *)
+                  echo "not evaluating. The previous dev shell cache (if any) is used as-is;"
+                  echo "review the changes and relaunch, or set DIRENV_REEVAL=1 to re-evaluate"
+                  echo "without this prompt."
+                  _DEVSHELL_SKIP_EVAL=1
+                  ;;
+              esac
+            fi
+            if [ -z "''${_DEVSHELL_SKIP_EVAL:-}" ] \
+               && { [ "$_CURRENT_HASH" != "$_CACHED_HASH" ] || [ ! -s "$_DEVSHELL_CACHE" ]; }; then
               echo "caching dev shell environment..."
               case "$_CACHE_CMD" in
                 devenv\ *)
@@ -828,6 +857,13 @@ EOF
         else
           echo "  dev shell:   not loaded (DIRENV_ALLOW=1 to enable)"
         fi
+        if [ "''${WORKSPACE_GUARD:-}" = "1" ]; then
+          echo "  workspace:   guard on — host-executed config paths read-only in the guest"
+          echo "               (.git/hooks, .git/config, .mcp.json, .claude/{commands,agents}, .envrc)"
+        else
+          echo "  workspace:   guard off — the guest may write host-executed config paths"
+          echo "               (WORKSPACE_GUARD=1 to make them read-only)"
+        fi
         case "$EGRESS_POLICY" in
           open)
             echo "  egress:      open — unrestricted (EGRESS_POLICY=monitor to observe)" ;;
@@ -933,6 +969,7 @@ EOF
               ./modules/base.nix
               ./modules/cri.nix
               ./modules/egress.nix
+              ./modules/workspace.nix
               { claude-vm.cri.enable = true; }
               flavor.agentModule
             ];

@@ -265,10 +265,24 @@ Three things worth knowing before pointing this at code you don't trust:
 - **`DIRENV_ALLOW=1` evaluates the work directory's Nix code on the host.** The dev
   shell cache runs `nix print-dev-env` (or `devenv print-dev-env`) against
   `$WORK_DIR` *outside* the VM, before boot. Since the guest can write `/work`,
-  a `flake.nix` or `devenv.nix` modified during a session is evaluated on the
-  host on the next launch — a guest-to-host path that needs no kernel bug. Don't
-  combine `DIRENV_ALLOW=1` with a `WORK_DIR` whose contents you wouldn't run on
-  the host yourself.
+  a `flake.nix` or `devenv.nix` modified during a session would be evaluated on
+  the host on the next launch — a guest-to-host path that needs no kernel bug.
+  The launcher therefore fences it: when the Nix files changed since the last
+  evaluation, it prompts before evaluating (and refuses in non-interactive
+  runs); `DIRENV_REEVAL=1` skips the prompt deliberately. A first-time
+  evaluation — your own fresh `DIRENV_ALLOW=1` — proceeds without one. Still:
+  don't combine `DIRENV_ALLOW=1` with a `WORK_DIR` whose contents you wouldn't
+  run on the host yourself.
+- **The guest can write workspace paths whose contents execute on the host
+  later** — `.git/hooks`, `.git/config`, `.mcp.json`, `.claude/commands`,
+  `.claude/agents`, `.envrc`. A compromised session that writes those persists
+  code past the VM teardown: it runs in the next host-side `git` invocation or
+  unsandboxed agent session. `WORKSPACE_GUARD=1` makes the ones that exist at
+  boot read-only inside the guest (kernel-enforced bind mounts the agent user
+  cannot undo). Opt-in for now because denial breaks a workflow this project
+  itself uses — asking the agent to write a project skill or register an MCP
+  server. It cannot protect a file that does not exist yet; the session
+  contract states the guard's state either way.
 - **Unprivileged user namespaces are enabled in the guest** (the NixOS default).
   That gives an unprivileged guest user namespaced `CAP_NET_ADMIN` and reach into
   subsystems such as `net/sched`, the entry point for a recurring class of local
@@ -506,6 +520,8 @@ Rebuild with `make claude`.
 | `VM_MEM` | VM memory in MB | `8192` |
 | `VM_VCPU` | VM vCPU count | `4` |
 | `DIRENV_ALLOW` | Set to `1` to load the project's dev shell (flake.nix or devenv) into the agent's environment | `0` |
+| `DIRENV_REEVAL` | Set to `1` to re-evaluate changed project Nix files on the host without the interactive prompt (see [Hardening notes](#hardening-notes)) | (prompt) |
+| `WORKSPACE_GUARD` | Set to `1` to make host-executed workspace config paths (`.git/hooks`, `.mcp.json`, `.claude/commands`, …) read-only inside the guest | (off) |
 | `ENABLE_CRI` | Comma-separated list of container runtimes to activate: `containerd`, `crun`, `crio`, `docker`, `podman` | (disabled) |
 | `CRI_STORAGE_SIZE` | Cap on the CRI storage disk in MiB, applied when the image is first created. Sparse, so it is a ceiling rather than an allocation. `0` runs without the disk entirely. The disk is only *created* when `ENABLE_CRI` is set — see [Container runtime support](#container-runtime-support) | `30720` (30 GiB) |
 | `VM_STORE_SIZE` | Cap on the writable Nix store disk in MiB. Sparse, and recreated on every launch, so it applies to every run. Minimum 1024; `0` is rejected — see [Leaving nothing on the host](#leaving-nothing-on-the-host) | `10240` (10 GiB) |
