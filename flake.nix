@@ -685,9 +685,11 @@ EOF
             # (or an explicit DIRENV_REEVAL=1) to proceed.
             if [ -n "$_CACHED_HASH" ] && [ "$_CURRENT_HASH" != "$_CACHED_HASH" ] \
                && [ -z "''${DIRENV_REEVAL:-}" ]; then
-              echo "warning: the project's Nix files (flake.nix/devenv.*) changed since the dev"
-              echo "         shell was last evaluated — possibly edited inside the VM. Evaluating"
-              echo "         them runs their Nix code on the HOST."
+              echo "note: the project's Nix files (flake.nix/devenv.*) changed since the dev"
+              echo "      shell was last cached — by your own host edits, or by a previous VM"
+              echo "      session writing /work. Re-evaluating runs their Nix code on the HOST,"
+              echo "      so it is gated when the source is not already trusted."
+              echo "      (DIRENV_REEVAL=1 skips this prompt; DIRENV_ALLOW=0 skips the dev shell.)"
               _DIRENV_ANSWER=""
               if [ -t 0 ]; then
                 read -r -p "re-evaluate on the host? [y/N] " _DIRENV_ANSWER
