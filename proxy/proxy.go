@@ -199,16 +199,22 @@ func (p *Proxy) serveEndpoint(ep *Endpoint, w http.ResponseWriter, r *http.Reque
 	for _, h := range hopHeaders {
 		out.Header.Del(h)
 	}
-	for _, h := range credentialHeaders {
-		out.Header.Del(h)
-	}
+	// Proxy-directed auth never travels upstream in either mode.
+	out.Header.Del("Proxy-Authorization")
 	if ep.key != "" {
+		for _, h := range credentialHeaders {
+			out.Header.Del(h)
+		}
 		if ep.Header == "authorization" {
 			out.Header.Set("Authorization", "Bearer "+ep.key)
 		} else {
-			out.Header.Set("X-Api-Key", ep.key)
+			out.Header.Set(http.CanonicalHeaderKey(ep.Header), ep.key)
 		}
 	}
+	// With no key held (OAuth mode) the client's own token passes through:
+	// the path allowlist still applies, but a planted credential cannot be
+	// stripped when the legitimate one travels in the same header. API-key
+	// mode gets the full guarantee; say so rather than imply otherwise.
 	p.roundTrip(w, out)
 }
 

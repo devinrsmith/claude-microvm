@@ -62,6 +62,26 @@
         pi     = { suffix = "-pi";    agentModule = ./modules/agents/pi.nix;    dataDirName = "pi-microvm";    apiKeyVars = [ "ANTHROPIC_API_KEY" "OPENAI_API_KEY" "GEMINI_API_KEY" ]; settingsFile = null; egressAllowlists = [ ./modules/egress/allowlist-claude.txt ./modules/egress/allowlist-gemini.txt ./modules/egress/allowlist-codex.txt ]; };
       };
 
+      # Reverse-proxied LLM endpoints per flavor, consumed by the
+      # shadow/enforce wiring below: the guest's <baseUrlVar> points at
+      # <prefix> on the proxy, which strips client-supplied credentials and
+      # injects $<keyVar> as <header> upstream — or passes the client's own
+      # token through when the var is unset on the host (OAuth mode).
+      # allowedPaths is a per-host capability grant; shadow mode's audit log
+      # is how it gets extended when a client needs more.
+      egressEndpoints = rec {
+        claude = [ { prefix = "/anthropic"; upstream = "https://api.anthropic.com"; keyVar = "ANTHROPIC_API_KEY"; header = "x-api-key"; baseUrlVar = "ANTHROPIC_BASE_URL"; allowedPaths = [ "/v1/messages" ]; } ];
+        gemini = [ { prefix = "/gemini"; upstream = "https://generativelanguage.googleapis.com"; keyVar = "GEMINI_API_KEY"; header = "x-goog-api-key"; baseUrlVar = "GOOGLE_GEMINI_BASE_URL"; allowedPaths = [ "/v1beta/models" "/v1/models" ]; } ];
+        codex  = [ { prefix = "/openai"; upstream = "https://api.openai.com"; keyVar = "OPENAI_API_KEY"; header = "authorization"; baseUrlVar = "OPENAI_BASE_URL"; allowedPaths = [ "/v1/responses" "/v1/chat/completions" "/v1/models" ]; } ];
+        pi = claude ++ gemini ++ codex;
+      };
+
+      # Where the guest reaches the proxy: a slirp-internal address that
+      # guestfwd maps onto the host-side listener. Chosen to dodge 10.0.2.2
+      # (host), 10.0.2.3 (DNS) and 10.0.2.15 (guest). modules/egress.nix's
+      # ssh wrapper learns it from EGRESS_PROXY_ADDR in .microvm-env.
+      egressGuestAddr = "10.0.2.100:3128";
+
       # Host-side pcap summarizer / live allowlist matcher for the egress
       # monitor and alert modes. Packaged once per system; the same binary
       # serves every flavor and the egress-report flake check.
@@ -71,13 +91,30 @@
         text = builtins.readFile ./scripts/egress-report.sh;
       };
 
-      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlist }:
+      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlist, egressProxy, flavorEndpoints }:
         let
           virtiofsd = pkgs.virtiofsd;
           hostname = "${agentName}-vm";
           apiKeyForwarding = lib.concatStringsSep "\n" (map (var:
             ''[ -n "''${${var}:-}" ] && echo "${var}=''${${var}}" >> "$AGENT_DIR/.microvm-env"''
           ) apiKeyVars);
+          # Bash fragments for the shadow/enforce wiring, one per endpoint.
+          # keyEnv is decided at launch: the var's presence on the host picks
+          # between injection and OAuth passthrough.
+          egressEndpointJson = lib.concatMapStringsSep "\n" (ep: ''
+            _EGRESS_EP_KEYENV=""
+            if [ -n "''${${ep.keyVar}:-}" ]; then _EGRESS_EP_KEYENV="${ep.keyVar}"; fi
+            _EGRESS_EPS="$_EGRESS_EPS,{\"prefix\":\"${ep.prefix}\",\"upstream\":\"${ep.upstream}\",\"keyEnv\":\"$_EGRESS_EP_KEYENV\",\"header\":\"${ep.header}\",\"allowedPaths\":${lib.replaceStrings [ "\"" ] [ "\\\"" ] (builtins.toJSON ep.allowedPaths)}}"'') flavorEndpoints;
+          egressProxySetenv = lib.concatMapStringsSep "\n" (ep: ''
+            if [ -n "''${${ep.keyVar}:-}" ]; then _EGRESS_SETENV+=("--setenv=${ep.keyVar}"); fi'') flavorEndpoints;
+          egressGuestEnv = lib.concatMapStringsSep "\n" (ep: ''
+            echo "${ep.baseUrlVar}=http://${egressGuestAddr}${ep.prefix}" >> "$AGENT_DIR/.microvm-env"
+            if [ -n "''${${ep.keyVar}:-}" ]; then
+              # Clients insist on a key being present; the proxy strips and
+              # replaces whatever travels, so a placeholder satisfies them
+              # and the real key never enters the guest.
+              echo "${ep.keyVar}=egress-proxy-placeholder" >> "$AGENT_DIR/.microvm-env"
+            fi'') flavorEndpoints;
         in pkgs.writeShellScriptBin "microvm-run" ''
         set -euo pipefail
         WORK="$(realpath "''${WORK_DIR:-$(pwd)}")"
@@ -96,19 +133,17 @@
         # launch an unobserved session the user believes is being watched.
         EGRESS_POLICY="''${EGRESS_POLICY:-open}"
         case "$EGRESS_POLICY" in
-          open|monitor|alert) ;;
-          shadow|enforce)
-            echo "error: EGRESS_POLICY=$EGRESS_POLICY is not implemented yet — these are the" >&2
-            echo "       proxy-backed modes on the roadmap. Available today: open (default)," >&2
-            echo "       monitor, alert." >&2
-            exit 1 ;;
+          open|monitor|alert|shadow|enforce) ;;
           *)
-            echo "error: EGRESS_POLICY must be open, monitor or alert (got '$EGRESS_POLICY')" >&2
+            echo "error: EGRESS_POLICY must be open, monitor, alert, shadow or enforce (got '$EGRESS_POLICY')" >&2
             exit 1 ;;
         esac
-        if [ "$EGRESS_POLICY" != "alert" ] && { [ -n "''${EGRESS_ALLOW:-}" ] || [ -n "''${EGRESS_ALLOWLIST:-}" ]; }; then
-          echo "warning: EGRESS_ALLOW / EGRESS_ALLOWLIST are only read by EGRESS_POLICY=alert — ignored" >&2
-        fi
+        case "$EGRESS_POLICY" in
+          open|monitor)
+            if [ -n "''${EGRESS_ALLOW:-}" ] || [ -n "''${EGRESS_ALLOWLIST:-}" ]; then
+              echo "warning: EGRESS_ALLOW / EGRESS_ALLOWLIST are only read by EGRESS_POLICY=alert|shadow|enforce — ignored" >&2
+            fi ;;
+        esac
         if ! [[ "''${EGRESS_PCAP_MAXLEN:-4096}" =~ ^[0-9]+$ ]]; then
           echo "error: EGRESS_PCAP_MAXLEN must be an integer (captured bytes per packet)" >&2
           exit 1
@@ -117,7 +152,10 @@
         EGRESS_PCAP=""
         EGRESS_UNIT=""
         EGRESS_ALERTS=""
+        EGRESS_AUDIT=""
         _EGRESS_ALLOWLIST_FILE=""
+        _EGRESS_PORTFILE=""
+        _EGRESS_PROXY_CFG=""
 
         # Volume size knobs are integers in MiB. Validate before QEMU sees them:
         # a bad value otherwise surfaces as a mkfs failure or, worse, a store
@@ -179,6 +217,9 @@
           # goes unless the user asked to keep it.
           if [ -n "$EGRESS_PCAP" ] && [ -z "''${EGRESS_KEEP_PCAP:-}" ]; then
             rm -f "$EGRESS_PCAP"
+          fi
+          if [ -n "$_EGRESS_PORTFILE" ]; then
+            rm -f "$_EGRESS_PORTFILE" "$_EGRESS_PROXY_CFG"
           fi
           for _s in "$SOCK" "$AGENT_SOCK"; do
             rm -f "$_s" "$_s.pid"
@@ -245,7 +286,7 @@
           mkdir -p "$AGENT_DIR"
         fi
 
-        # --- Egress capture setup (EGRESS_POLICY=monitor|alert) ---
+        # --- Egress setup (EGRESS_POLICY != open) ---
         if [ "$EGRESS_POLICY" != "open" ]; then
           # Host-only sibling of the agent dir, like the CRI image: $AGENT_DIR
           # itself is exported into the guest, and the guest must not be able
@@ -255,30 +296,33 @@
           mkdir -p "$EGRESS_DIR"
           chmod 700 "$EGRESS_DIR"
           _EGRESS_STAMP="$(date +%Y%m%d-%H%M%S)-''${ID%%-*}"
-          EGRESS_PCAP="$EGRESS_DIR/session-$_EGRESS_STAMP.pcap"
-          # Pre-create the capture so the alert follower's tail -F starts at
-          # byte 0 deterministically; QEMU's O_TRUNC open of the empty file is
-          # a no-op.
-          : > "$EGRESS_PCAP"
 
-          # The capture hook rewrites the QEMU command line, so its anchor
+          # Every non-open mode rewrites the QEMU command line, so the anchor
           # must exist. If microvm.nix ever changes the emitted netdev text,
-          # fail loudly rather than silently launching uncaptured — an
-          # unnoticed policy failure is exactly the failure mode this feature
-          # exists to remove.
+          # fail loudly rather than silently launching unobserved or (worse)
+          # unsealed — an unnoticed policy failure is exactly the failure
+          # mode this feature exists to remove.
           if ! grep -qF -- "-netdev 'user,id=usernet'" ${runner}/bin/microvm-run; then
             echo "error: EGRESS_POLICY=$EGRESS_POLICY could not hook the QEMU command line:" >&2
             echo "       the generated runner no longer contains \"-netdev 'user,id=usernet'\"." >&2
             echo "       Launch with EGRESS_POLICY=open, and report this as a bug." >&2
             exit 1
           fi
-          _EGRESS_PCAP_ESC=$(printf '%s' "$EGRESS_PCAP" | ${pkgs.gnused}/bin/sed -e 's/[\\&|]/\\&/g')
 
-          if [ "$EGRESS_POLICY" = "alert" ]; then
+          case "$EGRESS_POLICY" in monitor|alert)
+            EGRESS_PCAP="$EGRESS_DIR/session-$_EGRESS_STAMP.pcap"
+            # Pre-create the capture so the alert follower's tail -F starts
+            # at byte 0 deterministically; QEMU's O_TRUNC open of the empty
+            # file is a no-op.
+            : > "$EGRESS_PCAP"
+            _EGRESS_PCAP_ESC=$(printf '%s' "$EGRESS_PCAP" | ${pkgs.gnused}/bin/sed -e 's/[\\&|]/\\&/g')
+          ;; esac
+
+          case "$EGRESS_POLICY" in alert|shadow|enforce)
             # Effective allowlist = baked-in default (common + flavor), plus
             # an optional org/project file, plus per-session additions —
-            # assembled into one file so the live matcher and the final
-            # report cannot disagree.
+            # assembled into one file so every consumer (the live matcher,
+            # the final report, the proxy) sees the same list.
             _EGRESS_ALLOWLIST_FILE="$EGRESS_DIR/session-$_EGRESS_STAMP.allowlist"
             cat ${egressAllowlist} > "$_EGRESS_ALLOWLIST_FILE"
             if [ -n "''${EGRESS_ALLOWLIST:-}" ]; then
@@ -291,12 +335,58 @@
             if [ -n "''${EGRESS_ALLOW:-}" ]; then
               printf '%s\n' "''${EGRESS_ALLOW//,/ }" | tr ' ' '\n' >> "$_EGRESS_ALLOWLIST_FILE"
             fi
+          ;; esac
+
+          if [ "$EGRESS_POLICY" = "alert" ]; then
             EGRESS_ALERTS="$EGRESS_DIR/session-$_EGRESS_STAMP.alerts.log"
             : > "$EGRESS_ALERTS"
             # Stable name, because the session-stamped path printed at launch
             # scrolls away once the agent takes over the console.
             ln -sfn "$(basename "$EGRESS_ALERTS")" "$EGRESS_DIR/latest.alerts.log"
           fi
+
+          case "$EGRESS_POLICY" in shadow|enforce)
+            # The proxy is the only hole in the sealed netdev. It runs on the
+            # host under the user's systemd, holds the API keys (passed by
+            # name via --setenv, never on a command line), and writes one
+            # JSONL line per decision.
+            EGRESS_AUDIT="$EGRESS_DIR/session-$_EGRESS_STAMP.audit.jsonl"
+            : > "$EGRESS_AUDIT"
+            ln -sfn "$(basename "$EGRESS_AUDIT")" "$EGRESS_DIR/latest.audit.jsonl"
+            _EGRESS_PORTFILE="$RUNTIME/$VM_ID-egress-$ID.port"
+            _EGRESS_PROXY_CFG="$RUNTIME/$VM_ID-egress-$ID.json"
+            _EGRESS_PROXY_MODE="enforce"
+            [ "$EGRESS_POLICY" = "shadow" ] && _EGRESS_PROXY_MODE="log"
+            # tests/egress-config.nix extracts the region between these
+            # markers and feeds the result to the real egress-proxy binary,
+            # so keep it self-contained on the _EGRESS_* variables above and
+            # the per-endpoint lines generated at eval time.
+            # BEGIN egress-proxy-config
+            _EGRESS_EPS=""
+            ${egressEndpointJson}
+            cat > "$_EGRESS_PROXY_CFG" <<EOF
+{"listen":"127.0.0.1:0","mode":"$_EGRESS_PROXY_MODE","allowlistFile":"$_EGRESS_ALLOWLIST_FILE","auditLog":"$EGRESS_AUDIT","portFile":"$_EGRESS_PORTFILE","endpoints":[''${_EGRESS_EPS#,}]}
+EOF
+            chmod 600 "$_EGRESS_PROXY_CFG"
+            # END egress-proxy-config
+            EGRESS_UNIT="$VM_ID-egress-$ID"
+            _EGRESS_SETENV=()
+            ${egressProxySetenv}
+            ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect \
+              ''${_EGRESS_SETENV[@]+"''${_EGRESS_SETENV[@]}"} \
+              -- ${egressProxy}/bin/egress-proxy -config "$_EGRESS_PROXY_CFG"
+            for i in $(seq 1 50); do
+              [ -s "$_EGRESS_PORTFILE" ] && break
+              sleep 0.1
+            done
+            if [ ! -s "$_EGRESS_PORTFILE" ]; then
+              echo "error: the egress proxy did not come up — see:" >&2
+              echo "       journalctl --user -u $EGRESS_UNIT" >&2
+              exit 1
+            fi
+            _EGRESS_PORT="$(cat "$_EGRESS_PORTFILE")"
+            _EGRESS_PORT="''${_EGRESS_PORT##*:}"
+          ;; esac
         fi
 
         # --- Agent settings seed ---
@@ -452,7 +542,34 @@
         # %q produces a single-quoted/escaped form that survives `source`
         # so values like AGENTS_ARGS='-p "hi there"' round-trip intact.
         printf 'AGENTS_ARGS=%q\n' "''${AGENTS_ARGS:-}" >> "$AGENT_DIR/.microvm-env"
-        ${apiKeyForwarding}
+        # The guest reads the policy for the seal service and the ssh wrapper
+        # (modules/egress.nix); it is informational in the open modes.
+        echo "EGRESS_POLICY=$EGRESS_POLICY" >> "$AGENT_DIR/.microvm-env"
+        case "$EGRESS_POLICY" in
+          shadow|enforce)
+            # The key never enters the guest: the agent talks plaintext HTTP
+            # to the proxy over the guestfwd hop (which never leaves the
+            # host), and the proxy originates genuine TLS upstream. NO_PROXY
+            # keeps the BASE_URL requests origin-form instead of routing
+            # them through the CONNECT handler.
+            echo "EGRESS_PROXY_ADDR=${egressGuestAddr}" >> "$AGENT_DIR/.microvm-env"
+            for _v in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+              echo "$_v=http://${egressGuestAddr}" >> "$AGENT_DIR/.microvm-env"
+            done
+            echo "NO_PROXY=${lib.head (lib.splitString ":" egressGuestAddr)},localhost,127.0.0.1" >> "$AGENT_DIR/.microvm-env"
+            echo "no_proxy=${lib.head (lib.splitString ":" egressGuestAddr)},localhost,127.0.0.1" >> "$AGENT_DIR/.microvm-env"
+            ${egressGuestEnv}
+            if [ -n "''${ENABLE_CRI:-}" ]; then
+              echo "warning: ENABLE_CRI with EGRESS_POLICY=$EGRESS_POLICY — container daemons do" >&2
+              echo "         not inherit the proxy environment, so image pulls will fail under" >&2
+              echo "         enforce and go unaudited under shadow. Daemon proxy wiring is on the" >&2
+              echo "         roadmap (attic/TODO.md Phase 9)." >&2
+            fi
+            ;;
+          *)
+            ${apiKeyForwarding}
+            ;;
+        esac
 
         # Forward arbitrary host env vars into the guest, comma-separated:
         #   EXTRA_ENV="FOO=bar,HTTPS_PROXY"
@@ -658,64 +775,99 @@
           )
         fi
 
-        if [ "$EGRESS_POLICY" != "open" ]; then
-          _SED_ARGS+=(
-            # Attach a capture object to the netdev. filter-dump sees every
-            # frame the guest sends or receives; maxlen truncates each packet
-            # so the capture records headers, DNS and TLS ClientHello (SNI)
-            # without retaining whole payloads. 4096 because a post-quantum
-            # hybrid-kex ClientHello runs ~1.8 KiB and SNI extraction needs it
-            # complete — while TSO super-frames (up to 64 KiB of bulk data per
-            # frame on virtio-net) still truncate to 4 KiB, which is where the
-            # capture-size saving actually comes from. The anchor was verified
-            # above.
-            -e "s|-netdev 'user,id=usernet'|-netdev 'user,id=usernet' -object 'filter-dump,id=egress-dump,netdev=usernet,file=$_EGRESS_PCAP_ESC,maxlen=''${EGRESS_PCAP_MAXLEN:-4096}'|"
-          )
-          case "$EGRESS_POLICY" in
-            monitor)
+        case "$EGRESS_POLICY" in
+          monitor|alert)
+            _SED_ARGS+=(
+              # Attach a capture object to the netdev. filter-dump sees every
+              # frame the guest sends or receives; maxlen truncates each packet
+              # so the capture records headers, DNS and TLS ClientHello (SNI)
+              # without retaining whole payloads. 4096 because a post-quantum
+              # hybrid-kex ClientHello runs ~1.8 KiB and SNI extraction needs it
+              # complete — while TSO super-frames (up to 64 KiB of bulk data per
+              # frame on virtio-net) still truncate to 4 KiB, which is where the
+              # capture-size saving actually comes from. The anchor was verified
+              # above.
+              -e "s|-netdev 'user,id=usernet'|-netdev 'user,id=usernet' -object 'filter-dump,id=egress-dump,netdev=usernet,file=$_EGRESS_PCAP_ESC,maxlen=''${EGRESS_PCAP_MAXLEN:-4096}'|"
+            )
+            if [ "$EGRESS_POLICY" = "monitor" ]; then
               echo "egress policy: monitor — observing all guest traffic, blocking nothing; summary at session end"
               echo "  reports land in: $EGRESS_DIR"
-              ;;
-            alert)
+            else
               echo "egress policy: alert — observing all guest traffic, blocking nothing."
               echo "  live alerts: tail -f '$EGRESS_DIR/latest.alerts.log'"
               EGRESS_UNIT="$VM_ID-egress-$ID"
               ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect \
                 -- ${egressReport}/bin/egress-report follow "$EGRESS_PCAP" \
                    --allowlist "$_EGRESS_ALLOWLIST_FILE" --alerts "$EGRESS_ALERTS"
-              ;;
-          esac
-        fi
+            fi
+            ;;
+          shadow|enforce)
+            _SED_ARGS+=(
+              # Seal the netdev: restrict=on drops every flow except the one
+              # guestfwd hole, which hands each guest connection to a socat
+              # bridging into the host-side proxy ("cmd:" spawns one per
+              # connection — a chardev target would multiplex them all over a
+              # single stream and break concurrent requests). This also closes
+              # the guest-to-host 10.0.2.2 path as a side effect.
+              -e "s|-netdev 'user,id=usernet'|-netdev 'user,id=usernet,restrict=on,guestfwd=tcp:${egressGuestAddr}-cmd:${pkgs.socat}/bin/socat STDIO TCP:127.0.0.1:$_EGRESS_PORT'|"
+            )
+            echo "egress policy: $EGRESS_POLICY — netdev sealed; all traffic via the proxy$([ "$EGRESS_POLICY" = shadow ] && echo ' (log-only: nothing is blocked yet)')"
+            echo "  audit log: tail -f '$EGRESS_DIR/latest.audit.jsonl'"
+            echo "  note: a denied CONNECT shows up in tools only as '403 from proxy' — the"
+            echo "        actionable reason (which domain, how to allow it) is in the audit log."
+            ;;
+        esac
 
         # Run QEMU with corrected paths
         _VM_RC=0
         bash <(${pkgs.gnused}/bin/sed "''${_SED_ARGS[@]}" ${runner}/bin/microvm-run) || _VM_RC=$?
 
-        if [ "$EGRESS_POLICY" != "open" ]; then
-          if [ -n "$EGRESS_UNIT" ]; then
-            ${pkgs.systemd}/bin/systemctl --user stop "$EGRESS_UNIT" 2>/dev/null || true
-            EGRESS_UNIT=""
-          fi
-          _EGRESS_REPORT="$EGRESS_DIR/session-$_EGRESS_STAMP.report.txt"
-          _EGRESS_RC=0
-          ${egressReport}/bin/egress-report summarize "$EGRESS_PCAP" \
-            ''${_EGRESS_ALLOWLIST_FILE:+--allowlist} ''${_EGRESS_ALLOWLIST_FILE:+"$_EGRESS_ALLOWLIST_FILE"} \
-            > "$_EGRESS_REPORT" 2>&1 || _EGRESS_RC=$?
-          ln -sfn "$(basename "$_EGRESS_REPORT")" "$EGRESS_DIR/latest.report.txt"
-          echo
-          cat "$_EGRESS_REPORT"
-          echo "egress report saved: $_EGRESS_REPORT"
-          if [ "$_EGRESS_RC" -eq 2 ]; then
-            echo "egress alert: destinations outside the allowlist — see the violations section above"
-          elif [ "$_EGRESS_RC" -ne 0 ]; then
-            echo "warning: egress report failed (exit $_EGRESS_RC) — see $_EGRESS_REPORT" >&2
-          fi
-          if [ -n "''${EGRESS_KEEP_PCAP:-}" ]; then
-            echo "egress capture kept: $EGRESS_PCAP"
-          fi
-          # cleanup() removes the capture (unless EGRESS_KEEP_PCAP is set):
-          # the summary is the artifact that persists, not the raw traffic.
-        fi
+        case "$EGRESS_POLICY" in
+          monitor|alert)
+            if [ -n "$EGRESS_UNIT" ]; then
+              ${pkgs.systemd}/bin/systemctl --user stop "$EGRESS_UNIT" 2>/dev/null || true
+              EGRESS_UNIT=""
+            fi
+            _EGRESS_REPORT="$EGRESS_DIR/session-$_EGRESS_STAMP.report.txt"
+            _EGRESS_RC=0
+            ${egressReport}/bin/egress-report summarize "$EGRESS_PCAP" \
+              ''${_EGRESS_ALLOWLIST_FILE:+--allowlist} ''${_EGRESS_ALLOWLIST_FILE:+"$_EGRESS_ALLOWLIST_FILE"} \
+              > "$_EGRESS_REPORT" 2>&1 || _EGRESS_RC=$?
+            ln -sfn "$(basename "$_EGRESS_REPORT")" "$EGRESS_DIR/latest.report.txt"
+            echo
+            cat "$_EGRESS_REPORT"
+            echo "egress report saved: $_EGRESS_REPORT"
+            if [ "$_EGRESS_RC" -eq 2 ]; then
+              echo "egress alert: destinations outside the allowlist — see the violations section above"
+            elif [ "$_EGRESS_RC" -ne 0 ]; then
+              echo "warning: egress report failed (exit $_EGRESS_RC) — see $_EGRESS_REPORT" >&2
+            fi
+            if [ -n "''${EGRESS_KEEP_PCAP:-}" ]; then
+              echo "egress capture kept: $EGRESS_PCAP"
+            fi
+            # cleanup() removes the capture (unless EGRESS_KEEP_PCAP is set):
+            # the summary is the artifact that persists, not the raw traffic.
+            ;;
+          shadow|enforce)
+            if [ -n "$EGRESS_UNIT" ]; then
+              ${pkgs.systemd}/bin/systemctl --user stop "$EGRESS_UNIT" 2>/dev/null || true
+              EGRESS_UNIT=""
+            fi
+            _allow=$(grep -c '"decision":"allow"' "$EGRESS_AUDIT" 2>/dev/null) || _allow=0
+            _deny=$(grep -c '"decision":"deny"' "$EGRESS_AUDIT" 2>/dev/null) || _deny=0
+            _would=$(grep -c '"decision":"would_deny"' "$EGRESS_AUDIT" 2>/dev/null) || _would=0
+            echo
+            echo "egress ($EGRESS_POLICY): $_allow allowed, $_deny denied, $_would would-deny"
+            if [ "$_would" -gt 0 ]; then
+              echo "  shadow found traffic enforce would block — the hosts are in the audit log:"
+              echo "  grep would_deny '$EGRESS_AUDIT'"
+            fi
+            if [ "$_deny" -gt 0 ]; then
+              echo "  denied hosts and the way to allow them: grep '\"decision\":\"deny\"' '$EGRESS_AUDIT'"
+            fi
+            echo "egress audit log saved: $EGRESS_AUDIT"
+            ;;
+        esac
         exit "$_VM_RC"
       '';
     in
@@ -729,6 +881,7 @@
               microvm.nixosModules.microvm
               ./modules/base.nix
               ./modules/cri.nix
+              ./modules/egress.nix
               { claude-vm.cri.enable = true; }
               flavor.agentModule
             ];
@@ -804,6 +957,8 @@
           runner = nixosCfg.microvm.runner.qemu;
         in mkRunnerScript {
           inherit pkgs runner egressReport;
+          egressProxy = self.packages.${system}.egress-proxy;
+          flavorEndpoints = egressEndpoints.${name};
           inherit (flavor) dataDirName apiKeyVars settingsFile;
           agentName = name;
           defaultMem = nixosCfg.claude-vm.agent.mem;
@@ -851,6 +1006,11 @@
         # buildGoModule runs `go test ./...` in its check phase, so building
         # the package is the unit-test run.
         egress-proxy = self.packages.${system}.egress-proxy;
+        egress-config = import ./tests/egress-config.nix {
+          inherit pkgs lib;
+          runner = self.packages.${system}.claude;
+          egressProxy = self.packages.${system}.egress-proxy;
+        };
       });
     };
 }

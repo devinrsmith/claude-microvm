@@ -376,6 +376,17 @@ SHAREEOF
           [ -f ~/.microvm-devshell.err ] && cat ~/.microvm-devshell.err
         fi
       fi
+      # A sealed session whose seal did not hold must not quietly run open —
+      # that silent downgrade is exactly what the boot-time self-test exists
+      # to catch (modules/egress.nix). Refusing here keeps the message on the
+      # console instead of burying it in a failed boot.
+      if [ -f /run/egress-seal-failed ] && [ "''${EGRESS_SEAL_IGNORE:-0}" != "1" ]; then
+        cat /run/egress-seal-failed
+        echo "refusing to start ${cfg.name}. Launch with EGRESS_POLICY=open to run"
+        echo "unrestricted on purpose, or EXTRA_ENV=EGRESS_SEAL_IGNORE=1 to override,"
+        echo "and report this as a bug."
+        sudo poweroff
+      fi
       echo "starting ${cfg.name} ..."
       eval "${cfg.launchCommand} ''${AGENTS_ARGS:-}"
       sudo poweroff

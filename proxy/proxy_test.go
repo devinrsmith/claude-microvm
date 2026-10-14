@@ -291,6 +291,53 @@ func TestForwardHTTP(t *testing.T) {
 	}
 }
 
+func TestEndpointCustomHeader(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Goog-Api-Key"); got != "gemini-key" {
+			t.Errorf("X-Goog-Api-Key = %q, want the injected key", got)
+		}
+	}))
+	defer backend.Close()
+	ep := anthropicEndpoint(t, backend.URL)
+	ep.Header = "x-goog-api-key"
+	ep.key = "gemini-key"
+	ts, _ := newTestProxy(t, "enforce", "", []*Endpoint{ep})
+	resp, err := http.Get(ts.URL + "/anthropic/v1/messages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestEndpointOAuthPassthrough(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer client-oauth-token" {
+			t.Errorf("Authorization = %q, want the client token passed through", got)
+		}
+		if got := r.Header.Get("Proxy-Authorization"); got != "" {
+			t.Errorf("Proxy-Authorization = %q, want it stripped even in passthrough", got)
+		}
+	}))
+	defer backend.Close()
+	ep := anthropicEndpoint(t, backend.URL)
+	ep.key = "" // OAuth mode: the client holds its own token
+	ts, _ := newTestProxy(t, "enforce", "", []*Endpoint{ep})
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/anthropic/v1/messages", nil)
+	req.Header.Set("Authorization", "Bearer client-oauth-token")
+	req.Header.Set("Proxy-Authorization", "Basic proxy-cred")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestLoad(t *testing.T) {
 	dir := t.TempDir()
 	allowlist := filepath.Join(dir, "allow.txt")
@@ -302,6 +349,7 @@ func TestLoad(t *testing.T) {
   "listen": "127.0.0.1:0",
   "mode": %q,
   "allowlistFile": %q,
+  "portFile": "",
   "endpoints": [{
     "prefix": "/anthropic",
     "upstream": "https://api.anthropic.com",

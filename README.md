@@ -250,7 +250,7 @@ The VM provides strong isolation from the host:
 - **Filesystem** — only `/work` and the home directory are shared read-write; everything else is VM-local and ephemeral
 - **Nix store** — the host's `/nix/store` is shared as the lowerdir of the guest's store overlay, exported `readonly=on` so the guest cannot write through it
 - **Processes** — completely isolated (separate kernel)
-- **Network** — QEMU user-mode NAT; the VM can reach the internet but can't bind host ports. `EGRESS_POLICY=monitor|alert` records everything the guest talks to, from the host side — see [Egress policy](#egress-policy)
+- **Network** — QEMU user-mode NAT; the VM can reach the internet but can't bind host ports. `EGRESS_POLICY=monitor|alert` records everything the guest talks to from the host side; `EGRESS_POLICY=shadow|enforce` seals the netdev behind a host-side proxy that holds the API keys — see [Egress policy](#egress-policy)
 
 #### Hardening notes
 
@@ -370,18 +370,57 @@ alerts log. The effective allowlist is the sum of
 An entry matches itself and every subdomain. Alerts never block — a flagged
 domain is a line in a log and in the session-end report, nothing more.
 
-Two caveats worth knowing. Attribution is DNS- and SNI-based, so traffic to a
-hardcoded IP (or with an encrypted ClientHello) appears as `ip:port` under "no
-observed hostname" rather than by name. And this is observation, not
-enforcement: default-deny egress with credentials held outside the guest is
-the planned `enforce` mode, and the reserved mode names `shadow` and `enforce`
-refuse to launch until the wiring exists. The proxy that will back them
-already builds and tests as `packages.egress-proxy` (`proxy/`, Go stdlib
-only): an opaque-`CONNECT` forward proxy with a host:port allowlist, a
-reverse-proxy leg for the LLM endpoints that strips client-supplied
-credentials and injects the key held on the host, and a JSONL audit log — see
-the roadmap in `attic/TODO.md`, Phase 9, for the `restrict=on` + `guestfwd`
-wiring that connects it to the VM. Claude Code's WebSearch and WebFetch tools
+One caveat on the observe modes: attribution is DNS- and SNI-based, so
+traffic to a hardcoded IP (or with an encrypted ClientHello) appears as
+`ip:port` under "no observed hostname" rather than by name.
+
+#### Sealed modes: shadow and enforce
+
+```sh
+EGRESS_POLICY=shadow  make claude.run   # sealed netdev; the proxy allows all and audits
+EGRESS_POLICY=enforce make claude.run   # sealed netdev; the allowlist is enforced
+```
+
+Both seal the VM's network (`restrict=on`): every flow is refused except one
+hole that leads to a proxy on the host (`packages.egress-proxy` — Go stdlib
+only, `proxy/`). The guest gets `HTTP(S)_PROXY` pointing at it, and:
+
+- **API keys never enter the guest.** The agent's `*_BASE_URL` points at the
+  proxy, which originates genuine TLS to the real API, validates its real
+  certificate (no interception, no CA in the guest trust store), strips any
+  client-supplied credential, and injects the key held on the host. The
+  guest sees only a placeholder. Under subscription/OAuth login the client
+  mints its own token, which the proxy passes through — that mode keeps a
+  token in the guest, and the full credential guarantee applies to API-key
+  mode only.
+- **The API path allowlist is a capability grant**: only the inference
+  endpoints are reachable by default (even with a valid key,
+  `api.anthropic.com` is an exfiltration channel via its upload endpoints).
+- **Everything else is an opaque `CONNECT` tunnel**, never decrypted,
+  checked against the same tiered allowlist as `alert` — with one addition:
+  an entry may grant a port, e.g. `github.com:22` for git over SSH (ssh is
+  wired through the proxy automatically; a bare entry grants 443 only).
+- **DNS exists only at the proxy.** The guest boots with an empty
+  `resolv.conf` in these modes, so a blocked lookup fails instantly instead
+  of hanging; UDP (and so QUIC) is gone entirely, and clients fall back to
+  TCP.
+- **The seal is verified at boot**: the guest attempts direct egress and
+  refuses to start the agent if it succeeds (override with
+  `EXTRA_ENV=EGRESS_SEAL_IGNORE=1`).
+- Decisions land in `latest.audit.jsonl` (same directory as the reports),
+  one JSONL line each: `allow`, `deny`, or — in shadow mode — `would_deny`,
+  which is how you find what enforce would break before switching. A session
+  summary prints at exit.
+
+Worth knowing: a denied `CONNECT` shows up in tools only as "403 from
+proxy" — the actionable reason is in the audit log. Tools that ignore
+`HTTPS_PROXY` fail with an instant connection-refused in both sealed modes
+(that discovery is what shadow is for). `ENABLE_CRI` container daemons do
+not inherit the proxy environment yet, so image pulls fail under enforce
+(the launcher warns). And ping to `10.0.2.2`/`10.0.2.3` is still answered
+locally by slirp even when sealed — "ping works" is not evidence the host
+is reachable. A corporate upstream proxy chains automatically via the
+host's own proxy environment. Claude Code's WebSearch and WebFetch tools
 execute server-side on Anthropic's infrastructure, so they appear here only as
 traffic to `api.anthropic.com`.
 
@@ -468,9 +507,9 @@ Rebuild with `make claude`.
 | `GEMINI_API_KEY` | API key for Gemini CLI (gemini flavor) | — |
 | `OPENAI_API_KEY` | API key for Codex CLI (codex flavor) and Pi (pi flavor) | — |
 | `EXTRA_CA_CERTS` | Path to a PEM file or directory of PEM files containing custom CA certificates to trust inside the VM | (system CAs only) |
-| `EGRESS_POLICY` | `open` (unrestricted), `monitor` (record all guest traffic, summary at session end) or `alert` (monitor plus live alerts for destinations off the allowlist). Observe-only — nothing is blocked. See [Egress policy](#egress-policy) | `open` |
-| `EGRESS_ALLOW` | Extra allowlist domains for `alert`, comma-separated. An entry matches itself and every subdomain | (none) |
-| `EGRESS_ALLOWLIST` | Path to an additional allowlist file (org or project policy), appended to the baked-in default for `alert` | (none) |
+| `EGRESS_POLICY` | `open` (unrestricted), `monitor` / `alert` (observe-only: record all guest traffic, `alert` adds live off-allowlist alerts), `shadow` / `enforce` (sealed netdev, all traffic through the host-side proxy; `shadow` audits what `enforce` would deny, `enforce` denies it and keeps API keys out of the guest). See [Egress policy](#egress-policy) | `open` |
+| `EGRESS_ALLOW` | Extra allowlist domains for `alert`/`shadow`/`enforce`, comma-separated. An entry matches itself and every subdomain; `host:port` grants a non-443 port | (none) |
+| `EGRESS_ALLOWLIST` | Path to an additional allowlist file (org or project policy), appended to the baked-in default for `alert`/`shadow`/`enforce` | (none) |
 | `EGRESS_KEEP_PCAP` | Set to keep the raw capture after the summary is written; by default it is deleted and only the report persists | (unset) |
 | `EGRESS_PCAP_MAXLEN` | Captured bytes per packet in `monitor`/`alert` | `4096` |
 | `EXTRA_ENV` | Extra environment variables to forward into the VM, comma-separated. `FOO=bar` assigns a literal value; a bare `FOO` forwards `$FOO` from the host environment (keeps secrets off the command line). | (none) |

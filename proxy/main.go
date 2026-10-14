@@ -27,6 +27,10 @@ type Config struct {
 	AllowlistFile string `json:"allowlistFile"`
 	// AuditLog is the JSONL decision log path; empty logs to stderr.
 	AuditLog string `json:"auditLog"`
+	// PortFile, when set, receives the bound listen address once the proxy
+	// is serving — the launcher binds us to port 0 and reads this instead of
+	// parsing logs.
+	PortFile string `json:"portFile"`
 	// Endpoints are the reverse-proxied LLM APIs.
 	Endpoints []Endpoint `json:"endpoints"`
 }
@@ -40,11 +44,12 @@ type Endpoint struct {
 	Prefix string `json:"prefix"`
 	// Upstream is the real origin, e.g. "https://api.anthropic.com".
 	Upstream string `json:"upstream"`
-	// KeyEnv names the env var holding the credential to inject. Empty
-	// injects nothing (OAuth mode, where the client holds its own token).
+	// KeyEnv names the env var holding the credential to inject. Empty is
+	// passthrough (OAuth mode): the client's own token crosses untouched,
+	// because the proxy cannot hold a credential the client mints itself.
 	KeyEnv string `json:"keyEnv"`
-	// Header is how the credential is sent: "x-api-key", or
-	// "authorization" for a Bearer token.
+	// Header names the credential header: "x-api-key",
+	// "x-goog-api-key", … — or "authorization", sent as a Bearer token.
 	Header string `json:"header"`
 	// AllowedPaths are the upstream path prefixes permitted once Prefix is
 	// stripped. Everything else is denied: every endpoint is an attack
@@ -77,6 +82,12 @@ func main() {
 	// The launcher parses this line to learn the bound port, so keep it
 	// stable: "egress-proxy listening on <addr> (mode=<mode>)".
 	fmt.Printf("egress-proxy listening on %s (mode=%s)\n", ln.Addr(), cfg.Mode)
+	if cfg.PortFile != "" {
+		if err := os.WriteFile(cfg.PortFile, []byte(ln.Addr().String()+"\n"), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "egress-proxy:", err)
+			os.Exit(1)
+		}
+	}
 	srv := &http.Server{Handler: p, ReadHeaderTimeout: 30 * time.Second}
 	if err := srv.Serve(ln); err != nil {
 		fmt.Fprintln(os.Stderr, "egress-proxy:", err)
@@ -148,10 +159,8 @@ func (ep *Endpoint) init() error {
 		return fmt.Errorf("upstream must be an origin like https://api.example.com, got %q", ep.Upstream)
 	}
 	ep.upstreamURL = u
-	switch ep.Header {
-	case "x-api-key", "authorization":
-	default:
-		return fmt.Errorf("header must be \"x-api-key\" or \"authorization\", got %q", ep.Header)
+	if ep.Header == "" || strings.ContainsAny(ep.Header, " :") || ep.Header != strings.ToLower(ep.Header) {
+		return fmt.Errorf("header must be a lowercase header name like \"x-api-key\" or \"authorization\", got %q", ep.Header)
 	}
 	if len(ep.AllowedPaths) == 0 {
 		return fmt.Errorf("allowedPaths must not be empty — an endpoint with no reachable path is a config error, not a default")

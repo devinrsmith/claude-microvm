@@ -12,6 +12,9 @@
 
 # --- source hosting ---
 github.com
+github.com:22            # git over SSH — the sealed modes' CONNECT port grant,
+                         # used by the guest's ssh wrapper (bare entries grant
+                         # 443 only; the observe modes ignore the port)
 githubusercontent.com    # raw., objects., codeload. CDNs
 gitlab.com
 sr.ht
