@@ -271,6 +271,10 @@
               printf '%s\n' "''${EGRESS_ALLOW//,/ }" | tr ' ' '\n' >> "$_EGRESS_ALLOWLIST_FILE"
             fi
             EGRESS_ALERTS="$EGRESS_DIR/session-$_EGRESS_STAMP.alerts.log"
+            : > "$EGRESS_ALERTS"
+            # Stable name, because the session-stamped path printed at launch
+            # scrolls away once the agent takes over the console.
+            ln -sfn "$(basename "$EGRESS_ALERTS")" "$EGRESS_DIR/latest.alerts.log"
           fi
         fi
 
@@ -649,10 +653,11 @@
           case "$EGRESS_POLICY" in
             monitor)
               echo "egress policy: monitor — observing all guest traffic, blocking nothing; summary at session end"
+              echo "  reports land in: $EGRESS_DIR"
               ;;
             alert)
               echo "egress policy: alert — observing all guest traffic, blocking nothing."
-              echo "  live alerts: tail -f '$EGRESS_ALERTS'"
+              echo "  live alerts: tail -f '$EGRESS_DIR/latest.alerts.log'"
               EGRESS_UNIT="$VM_ID-egress-$ID"
               ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect \
                 -- ${egressReport}/bin/egress-report follow "$EGRESS_PCAP" \
@@ -675,6 +680,7 @@
           ${egressReport}/bin/egress-report summarize "$EGRESS_PCAP" \
             ''${_EGRESS_ALLOWLIST_FILE:+--allowlist} ''${_EGRESS_ALLOWLIST_FILE:+"$_EGRESS_ALLOWLIST_FILE"} \
             > "$_EGRESS_REPORT" 2>&1 || _EGRESS_RC=$?
+          ln -sfn "$(basename "$_EGRESS_REPORT")" "$EGRESS_DIR/latest.report.txt"
           echo
           cat "$_EGRESS_REPORT"
           echo "egress report saved: $_EGRESS_REPORT"

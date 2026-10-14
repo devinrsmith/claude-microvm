@@ -344,9 +344,21 @@ to ~1.8 KiB, and SNI extraction needs the whole thing — while bulk transfers
 `<agent-home>-egress/` (a host-only directory, never shared into the guest),
 and the raw capture is deleted — set `EGRESS_KEEP_PCAP=1` to keep it.
 
+All egress files live in a host-only sibling of the agent home,
+`~/.local/share/<agent>-microvm/<project>-<hash>-egress/`, one set per
+session (`session-<timestamp>-<id>.{report.txt,alerts.log,allowlist}`). The
+launch banner names the exact paths, but since that scrolls away once the
+agent takes the console, the directory also keeps stable symlinks to the
+current session — so from anywhere on the host:
+
+```sh
+tail -f ~/.local/share/claude-microvm/*-egress/latest.alerts.log
+cat     ~/.local/share/claude-microvm/*-egress/latest.report.txt
+```
+
 `alert` additionally matches every observed hostname (DNS queries and TLS SNI)
-against an allowlist, live: watch with `tail -f` on the alerts file named at
-launch. The effective allowlist is the sum of
+against an allowlist, live, one line per newly seen off-list domain in the
+alerts log. The effective allowlist is the sum of
 
 - the baked-in default — the agent's own endpoints plus common development
   infrastructure (registries, caches, container registries); see
