@@ -38,6 +38,7 @@
       "inputs": {
         "flake-compat": "flake-compat",
         "nixpkgs": [
+          "microvm-policy",
           "go-overlay",
           "nixpkgs"
         ]
@@ -61,6 +62,7 @@
         "flake-utils": "flake-utils",
         "git-hooks": "git-hooks",
         "nixpkgs": [
+          "microvm-policy",
           "nixpkgs"
         ]
       },
@@ -99,6 +101,28 @@
         "type": "github"
       }
     },
+    "microvm-policy": {
+      "inputs": {
+        "go-overlay": "go-overlay",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792007627,
+        "narHash": "sha256-QMSAtboxSsjc0NG1AE3Z4dp7borXzrPzqXmDOd9ib6Q=",
+        "owner": "systemstart",
+        "repo": "microvm-policy",
+        "rev": "fc35242c6b54b5ce54820237357111facd9030a7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "systemstart",
+        "ref": "v0.1.0",
+        "repo": "microvm-policy",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1791456040,
@@ -117,8 +141,8 @@
     },
     "root": {
       "inputs": {
-        "go-overlay": "go-overlay",
         "microvm": "microvm",
+        "microvm-policy": "microvm-policy",
         "nixpkgs": "nixpkgs"
       }
     },
