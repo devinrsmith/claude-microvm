@@ -48,6 +48,17 @@ All flavors include container runtime support (Docker, containerd, CRI-O, Podman
 > install answering the prompt is not enough on its own — see
 > [Binary caches](#binary-caches).
 
+> [!WARNING]
+> **Since v0.16.0 every launch stops at the session contract and waits for
+> Enter before booting.** It prints what the run can reach (workspace, egress
+> rules, credentials) while stopping is still cheap. The pause applies only
+> when stdin is a terminal, so pipes and cron jobs are unaffected, but
+> automation that gives the launcher a terminal (tmux `send-keys`, `expect`,
+> `script`, an IDE task runner, a systemd unit with `StandardInput=tty`) will
+> hang waiting for input, and so does a one-shot `AGENTS_ARGS=-p …` run typed
+> at a terminal. Set **`NO_PAUSE=1`** in those setups. The contract
+> still prints; only the wait is skipped.
+
 ```sh
 # Build and run Claude Code (default) with current directory mounted at /work
 make claude.run
@@ -289,9 +300,18 @@ The VM provides strong isolation from the host:
 
 Every launch prints a **session contract** before boot: project path and mount
 mode, whether the dev shell evaluated the project's Nix code on the host,
-egress mode and allowlist sources, which env vars reach the guest (names
-only, never values), container state, and resources — so what a run can reach
-is visible while it is still cheap to stop.
+workspace guard, egress mode, which env vars reach the guest (names only,
+never values), container state, and resources — so what a run can reach is
+visible while it is still cheap to stop. Each row carries a status dot (green:
+contained, yellow: worth knowing, red: the host is exposed) and a hint at the
+knob that changes it; colour is off without a terminal or with `NO_COLOR` set.
+
+In `alert`/`shadow`/`enforce` it also lists every egress rule, highest
+precedence first: `EGRESS_DENY`, then each allow source (`EGRESS_ALLOW`,
+`EGRESS_ALLOWLIST`, the built-in lists) with all of its entries, then what
+happens to everything else. Entries an `EGRESS_DENY` removed are marked `✗`
+in their source; a broader entry that keeps a denied domain reachable is
+marked `⚠`.
 
 #### Hardening notes
 
@@ -422,6 +442,13 @@ alerts log. The effective allowlist is the sum of
 - an optional org/project file, `EGRESS_ALLOWLIST=/path/to/file`;
 - per-session additions, `EGRESS_ALLOW=foo.example.com,bar.example.net`.
 
+Per-session removals, `EGRESS_DENY=datadoghq.com,browser-intake-us5-datadoghq.com`,
+drop every entry (from any of the three) that is a listed domain or one of its
+subdomains — e.g. to keep Claude Code's optional telemetry from leaving the
+VM in shadow/enforce. The format has no deny rule, so a domain still covered by
+a broader entry (`api.anthropic.com` under `anthropic.com`) cannot be removed;
+the launcher warns instead of claiming it is blocked.
+
 An entry matches itself and every subdomain. Alerts never block — a flagged
 domain is a line in a log and in the session-end report, nothing more.
 
@@ -460,9 +487,11 @@ The guest gets `HTTP(S)_PROXY` pointing at it, and:
   `resolv.conf` in these modes, so a blocked lookup fails instantly instead
   of hanging; UDP (and so QUIC) is gone entirely, and clients fall back to
   TCP.
-- **The seal is verified at boot**: the guest attempts direct egress and
-  refuses to start the agent if it succeeds (override with
-  `EXTRA_ENV=EGRESS_SEAL_IGNORE=1`).
+- **The seal is verified at boot**: the guest checks that the proxy answers,
+  then tries a direct connection to the proxy's host listener (`10.0.2.2`),
+  which only the seal can block. It refuses to start the agent if that
+  connection succeeds, or if the proxy doesn't answer and so the result
+  proves nothing (override with `EXTRA_ENV=EGRESS_SEAL_IGNORE=1`).
 - Decisions land in `latest.audit.jsonl` (same directory as the reports),
   one JSONL line each: `allow`, `deny`, or — in shadow mode — `would_deny`,
   which is how you find what enforce would break before switching. A session
@@ -582,7 +611,7 @@ Rebuild with `make claude`.
 | `DIRENV_REEVAL` | Set to `1` to re-evaluate changed project Nix files on the host without the interactive prompt (see [Hardening notes](#hardening-notes)) | (prompt) |
 | `WORKSPACE_GUARD` | Set to `1` to make host-executed workspace config paths (`.git/hooks`, `.mcp.json`, `.claude/commands`, …) read-only inside the guest | (off) |
 | `WORKSPACE_MODE` | `passthrough` (edits appear on the host instantly) or `ephemeral` (guest-side overlay: writes stay in the VM, `vm-work-diff` lists them, all is discarded at poweroff) — see [Ephemeral workspace](#ephemeral-workspace) | `passthrough` |
-| `NO_PAUSE` | Set to `1` to boot immediately instead of pausing on the session contract. Already skipped when stdin is not a terminal (one-shot or piped runs) | (pause) |
+| `NO_PAUSE` | Set to `1` to boot immediately instead of waiting for Enter on the session contract (the contract still prints). **The wait is the default since v0.16.0**: set this for any automation that runs the launcher on a terminal (tmux, `expect`, `script`, IDE tasks). Already skipped when stdin is not a terminal (pipes, cron); a one-shot `AGENTS_ARGS=-p …` run from a terminal still waits | (pause) |
 | `ENABLE_CRI` | Comma-separated list of container runtimes to activate: `containerd`, `crun`, `crio`, `docker`, `podman` | (disabled) |
 | `CRI_STORAGE_SIZE` | Cap on the CRI storage disk in MiB, applied when the image is first created. Sparse, so it is a ceiling rather than an allocation. `0` runs without the disk entirely. The disk is only *created* when `ENABLE_CRI` is set — see [Container runtime support](#container-runtime-support) | `30720` (30 GiB) |
 | `VM_STORE_SIZE` | Cap on the writable Nix store disk in MiB. Sparse, and recreated on every launch, so it applies to every run. Minimum 1024; `0` is rejected — see [Leaving nothing on the host](#leaving-nothing-on-the-host) | `10240` (10 GiB) |
@@ -593,6 +622,7 @@ Rebuild with `make claude`.
 | `EGRESS_POLICY` | `open` (unrestricted), `monitor` / `alert` (observe-only: record all guest traffic, `alert` adds live off-allowlist alerts), `shadow` / `enforce` (sealed netdev, all traffic through the host-side proxy; `shadow` audits what `enforce` would deny, `enforce` denies it and keeps API keys out of the guest). See [Egress policy](#egress-policy) | `open` |
 | `EGRESS_ALLOW` | Extra allowlist domains for `alert`/`shadow`/`enforce`, comma-separated. An entry matches itself and every subdomain; `host:port` grants a non-443 port | (none) |
 | `EGRESS_ALLOWLIST` | Path to an additional allowlist file (org or project policy), appended to the baked-in default for `alert`/`shadow`/`enforce` | (none) |
+| `EGRESS_DENY` | Allowlist domains to remove for `alert`/`shadow`/`enforce`, comma-separated: drops each entry that is a listed domain or below one, after all additions. Cannot narrow a broader entry (warns instead) | (none) |
 | `EGRESS_KEEP_PCAP` | Set to keep the raw capture after the summary is written; by default it is deleted and only the report persists | (unset) |
 | `EGRESS_PCAP_MAXLEN` | Captured bytes per packet in `monitor`/`alert` | `4096` |
 | `EXTRA_ENV` | Extra environment variables to forward into the VM, comma-separated. `FOO=bar` assigns a literal value; a bare `FOO` forwards `$FOO` from the host environment (keeps secrets off the command line). | (none) |
