@@ -247,7 +247,7 @@ matters when something outside the VM — the host, or another VM on the same
 | `never` | Not cached; every read and write goes to the host | Not cached |
 | `auto` (default) | Re-read when a file is opened (close-to-open, as on NFS) | Cached for 1 second |
 | `metadata` | Not cached | Cached for up to 24 hours |
-| `always` | Kept across opens | Cached for up to 24 hours |
+| `always` | Kept across opens, with no time limit | Cached for up to 24 hours |
 
 Under `never` and `metadata`, shared (`MAP_SHARED`) mappings of files on
 `/work` fail — SQLite in WAL mode, for one. Private mappings, as git uses, work.
@@ -264,8 +264,9 @@ Two cases call for something other than the default:
 - **One VM that owns `WORK_DIR` exclusively: `always`,** for the fastest
   repeated reads and lookups, such as builds over large trees. Nothing else is
   expected to change `WORK_DIR` while the VM runs, the host included: if
-  something does, the guest can keep serving old contents and metadata for up
-  to a day.
+  something does, the guest can keep serving old metadata for up to a day, and
+  old file contents for as long as they stay in its cache — reopening the file
+  does not refresh them.
 
 ### Home directory persistence
 
