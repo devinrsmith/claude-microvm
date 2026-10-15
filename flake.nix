@@ -559,6 +559,11 @@ EOF
             # keeps the BASE_URL requests origin-form instead of routing
             # them through the CONNECT handler.
             echo "EGRESS_PROXY_ADDR=${egressGuestAddr}" >> "$AGENT_DIR/.microvm-env"
+            # Negative control for the guest's seal self-test (microvm-policy
+            # v0.3.0+): slirp maps 10.0.2.2 to the host's loopback, so without
+            # restrict=on this reaches the proxy's host listener. Sealed, it
+            # must be refused; with no probe the self-test fails inconclusive.
+            echo "EGRESS_SEAL_PROBE=10.0.2.2:$_EGRESS_PORT" >> "$AGENT_DIR/.microvm-env"
             for _v in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
               echo "$_v=http://${egressGuestAddr}" >> "$AGENT_DIR/.microvm-env"
             done

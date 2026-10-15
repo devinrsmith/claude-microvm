@@ -460,9 +460,11 @@ The guest gets `HTTP(S)_PROXY` pointing at it, and:
   `resolv.conf` in these modes, so a blocked lookup fails instantly instead
   of hanging; UDP (and so QUIC) is gone entirely, and clients fall back to
   TCP.
-- **The seal is verified at boot**: the guest attempts direct egress and
-  refuses to start the agent if it succeeds (override with
-  `EXTRA_ENV=EGRESS_SEAL_IGNORE=1`).
+- **The seal is verified at boot**: the guest checks that the proxy answers,
+  then tries a direct connection to the proxy's host listener (`10.0.2.2`),
+  which only the seal can block. It refuses to start the agent if that
+  connection succeeds, or if the proxy doesn't answer and so the result
+  proves nothing (override with `EXTRA_ENV=EGRESS_SEAL_IGNORE=1`).
 - Decisions land in `latest.audit.jsonl` (same directory as the reports),
   one JSONL line each: `allow`, `deny`, or — in shadow mode — `would_deny`,
   which is how you find what enforce would break before switching. A session
