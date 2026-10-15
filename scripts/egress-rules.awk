@@ -14,13 +14,13 @@
 # domain cannot be narrowed, so it is marked and warned about instead.
 
 function host(e) {
-  sub(/#.*/, "", e); gsub(/^[ \t]+|[ \t]+$/, "", e)
+  sub(/#.*/, "", e); gsub(/^[ \t\r]+|[ \t\r]+$/, "", e)
   sub(/:[0-9]+$/, "", e); sub(/^\*\./, "", e); sub(/\.$/, "", e)
   return tolower(e)
 }
 # The entry as the contract shows it: normalized host, plus a non-443 port.
 function shown(e,   p) {
-  sub(/#.*/, "", e); gsub(/^[ \t]+|[ \t]+$/, "", e)
+  sub(/#.*/, "", e); gsub(/^[ \t\r]+|[ \t\r]+$/, "", e)
   p = (match(e, /:[0-9]+$/) && substr(e, RSTART + 1) != "443") ? substr(e, RSTART) : ""
   return host(e) p
 }
@@ -37,7 +37,7 @@ function wrap(s, indent,   n, w, i, line, out) {
 
 BEGIN {
   FS = "\t"
-  nd = split(deny, raw, /[, ]+/)
+  nd = split(deny, raw, /[,[:space:]]+/)
   for (i = 1; i <= nd; i++) if ((d = host(raw[i])) != "" && !(d in ds)) { ds[d] = 1; dorder[++ndeny] = d }
   printf "" > allowout
 }
