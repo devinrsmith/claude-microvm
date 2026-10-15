@@ -48,6 +48,17 @@ All flavors include container runtime support (Docker, containerd, CRI-O, Podman
 > install answering the prompt is not enough on its own — see
 > [Binary caches](#binary-caches).
 
+> [!WARNING]
+> **Since v0.16.0 every launch stops at the session contract and waits for
+> Enter before booting.** It prints what the run can reach (workspace, egress
+> rules, credentials) while stopping is still cheap. The pause applies only
+> when stdin is a terminal, so pipes and cron jobs are unaffected, but
+> automation that gives the launcher a terminal (tmux `send-keys`, `expect`,
+> `script`, an IDE task runner, a systemd unit with `StandardInput=tty`) will
+> hang waiting for input, and so does a one-shot `AGENTS_ARGS=-p …` run typed
+> at a terminal. Set **`NO_PAUSE=1`** in those setups. The contract
+> still prints; only the wait is skipped.
+
 ```sh
 # Build and run Claude Code (default) with current directory mounted at /work
 make claude.run
@@ -600,7 +611,7 @@ Rebuild with `make claude`.
 | `DIRENV_REEVAL` | Set to `1` to re-evaluate changed project Nix files on the host without the interactive prompt (see [Hardening notes](#hardening-notes)) | (prompt) |
 | `WORKSPACE_GUARD` | Set to `1` to make host-executed workspace config paths (`.git/hooks`, `.mcp.json`, `.claude/commands`, …) read-only inside the guest | (off) |
 | `WORKSPACE_MODE` | `passthrough` (edits appear on the host instantly) or `ephemeral` (guest-side overlay: writes stay in the VM, `vm-work-diff` lists them, all is discarded at poweroff) — see [Ephemeral workspace](#ephemeral-workspace) | `passthrough` |
-| `NO_PAUSE` | Set to `1` to boot immediately instead of pausing on the session contract. Already skipped when stdin is not a terminal (one-shot or piped runs) | (pause) |
+| `NO_PAUSE` | Set to `1` to boot immediately instead of waiting for Enter on the session contract (the contract still prints). **The wait is the default since v0.16.0**: set this for any automation that runs the launcher on a terminal (tmux, `expect`, `script`, IDE tasks). Already skipped when stdin is not a terminal (pipes, cron); a one-shot `AGENTS_ARGS=-p …` run from a terminal still waits | (pause) |
 | `ENABLE_CRI` | Comma-separated list of container runtimes to activate: `containerd`, `crun`, `crio`, `docker`, `podman` | (disabled) |
 | `CRI_STORAGE_SIZE` | Cap on the CRI storage disk in MiB, applied when the image is first created. Sparse, so it is a ceiling rather than an allocation. `0` runs without the disk entirely. The disk is only *created* when `ENABLE_CRI` is set — see [Container runtime support](#container-runtime-support) | `30720` (30 GiB) |
 | `VM_STORE_SIZE` | Cap on the writable Nix store disk in MiB. Sparse, and recreated on every launch, so it applies to every run. Minimum 1024; `0` is rejected — see [Leaving nothing on the host](#leaving-nothing-on-the-host) | `10240` (10 GiB) |
