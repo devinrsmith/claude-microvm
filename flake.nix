@@ -205,10 +205,8 @@
         # --- Work share (virtiofsd) ---
         SOCK="$RUNTIME/$VM_ID-virtiofs-$ID.sock"
         UNIT="$VM_ID-virtiofsd-$ID"
-        STATE="$RUNTIME/$VM_ID-virtiofsd-$ID.workdir"
         AGENT_SOCK="$RUNTIME/$VM_ID-virtiofs-$ID-agent-home.sock"
         AGENT_UNIT="$VM_ID-virtiofsd-$ID-agent-home"
-        AGENT_STATE="$RUNTIME/$VM_ID-virtiofsd-$ID-agent-home.dir"
         AGENT_TEMP=""
         STORE_IMG=""
         STORE_STATE_DIR=""
@@ -237,7 +235,6 @@
           for _s in "$SOCK" "$AGENT_SOCK"; do
             rm -f "$_s" "$_s.pid"
           done
-          rm -f "$STATE" "$AGENT_STATE"
           if [ -n "$STORE_IMG" ]; then
             rm -f "$STORE_IMG"
             # Leave nothing behind on the host: the dir is ours and the image is
@@ -250,44 +247,32 @@
         }
         trap cleanup EXIT
 
-        # (Re)start virtiofsd if not running or WORK_DIR changed
-        NEED_START=1
-        if ${pkgs.systemd}/bin/systemctl --user is-active "$UNIT" &>/dev/null; then
-          if [ -f "$STATE" ] && [ "$(cat "$STATE")" = "$WORK" ] && [ -S "$SOCK" ]; then
-            NEED_START=0
-          else
-            ${pkgs.systemd}/bin/systemctl --user stop "$UNIT" 2>/dev/null || true
-          fi
-        fi
+        # Every launch starts its own daemons: the unit and socket names carry
+        # this launch's random $ID, so there is never one to reuse, and the
+        # cleanup trap stops them on exit.
+        #
+        # virtiofsd runs unprivileged in a user namespace (--sandbox=namespace).
+        # --uid-map / --gid-map: map host user to namespace root (single-entry, no /etc/subuid needed)
+        # --translate-uid / --translate-gid: map guest uid/gid 1000 to namespace uid/gid 0 (= host user)
+        ${pkgs.systemd}/bin/systemd-run --user --unit="$UNIT" --collect \
+          -- ${virtiofsd}/bin/virtiofsd \
+            --socket-path="$SOCK" \
+            --shared-dir="$WORK" \
+            --sandbox=namespace \
+            --uid-map ":0:$(id -u):1:" \
+            --gid-map ":0:$(id -g):1:" \
+            --translate-uid "map:1000:0:1" \
+            --translate-gid "map:1000:0:1" \
+            --socket-group="$(id -gn)" \
+            --xattr \
+            --cache="$WORK_CACHE"
 
-        if [ "$NEED_START" = "1" ]; then
-          rm -f "$SOCK"
-
-          # virtiofsd runs unprivileged in a user namespace (--sandbox=namespace).
-          # --uid-map / --gid-map: map host user to namespace root (single-entry, no /etc/subuid needed)
-          # --translate-uid / --translate-gid: map guest uid/gid 1000 to namespace uid/gid 0 (= host user)
-          ${pkgs.systemd}/bin/systemd-run --user --unit="$UNIT" --collect \
-            -- ${virtiofsd}/bin/virtiofsd \
-              --socket-path="$SOCK" \
-              --shared-dir="$WORK" \
-              --sandbox=namespace \
-              --uid-map ":0:$(id -u):1:" \
-              --gid-map ":0:$(id -g):1:" \
-              --translate-uid "map:1000:0:1" \
-              --translate-gid "map:1000:0:1" \
-              --socket-group="$(id -gn)" \
-              --xattr \
-              --cache="$WORK_CACHE"
-
-          echo "$WORK" > "$STATE"
-
-          # Wait for socket
-          for i in $(seq 1 50); do
-            [ -S "$SOCK" ] && break
-            sleep 0.1
-          done
-          [ -S "$SOCK" ] || { echo "error: virtiofsd socket did not appear"; exit 1; }
-        fi
+        # Wait for socket
+        for i in $(seq 1 50); do
+          [ -S "$SOCK" ] && break
+          sleep 0.1
+        done
+        [ -S "$SOCK" ] || { echo "error: virtiofsd socket did not appear"; exit 1; }
 
         # --- Agent home share (virtiofsd) ---
         if [ -z "''${AGENT_HOME:-}" ]; then
@@ -527,38 +512,23 @@ EOF
         rm -f "$STORE_IMG"
         ''}
 
-        AGENT_NEED_START=1
-        if ${pkgs.systemd}/bin/systemctl --user is-active "$AGENT_UNIT" &>/dev/null; then
-          if [ -f "$AGENT_STATE" ] && [ "$(cat "$AGENT_STATE")" = "$AGENT_DIR" ] && [ -S "$AGENT_SOCK" ]; then
-            AGENT_NEED_START=0
-          else
-            ${pkgs.systemd}/bin/systemctl --user stop "$AGENT_UNIT" 2>/dev/null || true
-          fi
-        fi
+        ${pkgs.systemd}/bin/systemd-run --user --unit="$AGENT_UNIT" --collect \
+          -- ${virtiofsd}/bin/virtiofsd \
+            --socket-path="$AGENT_SOCK" \
+            --shared-dir="$AGENT_DIR" \
+            --sandbox=namespace \
+            --uid-map ":0:$(id -u):1:" \
+            --gid-map ":0:$(id -g):1:" \
+            --translate-uid "map:1000:0:1" \
+            --translate-gid "map:1000:0:1" \
+            --socket-group="$(id -gn)" \
+            --xattr
 
-        if [ "$AGENT_NEED_START" = "1" ]; then
-          rm -f "$AGENT_SOCK"
-
-          ${pkgs.systemd}/bin/systemd-run --user --unit="$AGENT_UNIT" --collect \
-            -- ${virtiofsd}/bin/virtiofsd \
-              --socket-path="$AGENT_SOCK" \
-              --shared-dir="$AGENT_DIR" \
-              --sandbox=namespace \
-              --uid-map ":0:$(id -u):1:" \
-              --gid-map ":0:$(id -g):1:" \
-              --translate-uid "map:1000:0:1" \
-              --translate-gid "map:1000:0:1" \
-              --socket-group="$(id -gn)" \
-              --xattr
-
-          echo "$AGENT_DIR" > "$AGENT_STATE"
-
-          for i in $(seq 1 50); do
-            [ -S "$AGENT_SOCK" ] && break
-            sleep 0.1
-          done
-          [ -S "$AGENT_SOCK" ] || { echo "error: agent-home virtiofsd socket did not appear"; exit 1; }
-        fi
+        for i in $(seq 1 50); do
+          [ -S "$AGENT_SOCK" ] && break
+          sleep 0.1
+        done
+        [ -S "$AGENT_SOCK" ] || { echo "error: agent-home virtiofsd socket did not appear"; exit 1; }
 
         # Write host env vars for the VM
         echo "DIRENV_ALLOW=''${DIRENV_ALLOW:-0}" > "$AGENT_DIR/.microvm-env"
