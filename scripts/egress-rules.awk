@@ -25,6 +25,11 @@ function shown(e,   p) {
   return host(e) p
 }
 function under(h, d) { return h == d || substr(h, length(h) - length(d)) == "." d }
+# The broader EGRESS_DENY entry that already covers deny d, if any.
+function cover(d,   i) {
+  for (i = 1; i <= ndeny; i++) if (dorder[i] != d && under(d, dorder[i])) return dorder[i]
+  return ""
+}
 # Word-wraps the space-separated items in s under a fixed indent.
 function wrap(s, indent,   n, w, i, line, out) {
   n = split(s, w, " "); line = ""; out = ""
@@ -49,10 +54,14 @@ BEGIN {
   if (h == "") { print line > allowout; next }
   e = shown(line)
   mark = ""
-  for (d in ds) {
-    if (under(h, d)) { mark = "✗"; removed[d] = removed[d] " " e " (" label ")"; nremoved++; break }
-    if (under(d, h)) { mark = "⚠"; wide[d] = wide[d] " " e " (" label ")"; nwide++ }
-  }
+  # Removal first: a deny that removes the entry makes any narrower deny
+  # under it moot. Denies are walked in the order given, never `for (d in
+  # ds)`, so the output does not depend on awk's hash order.
+  for (i = 1; i <= ndeny; i++)
+    if (under(h, d = dorder[i])) { mark = "✗"; removed[d] = removed[d] " " e " (" label ")"; nremoved++; break }
+  if (mark == "")
+    for (i = 1; i <= ndeny; i++)
+      if (under(d = dorder[i], h)) { mark = "⚠"; wide[d] = wide[d] " " e " (" label ")"; nwide++ }
   if (mark != "✗") print line > allowout
   key = label SUBSEP mark e
   # Sorted by host later, so the marker rides after a "|" until then.
@@ -76,7 +85,9 @@ END {
     for (i = 1; i <= ndeny; i++) {
       d = dorder[i]
       if (d in wide) out = out ind Y "⚠ " d " is NOT blocked — still allowed by" wide[d] Z "\n"
-      else if (!(d in removed)) out = out ind D d ": nothing to remove, already unlisted" Z "\n"
+      else if (d in removed) continue
+      else if ((c = cover(d)) != "") out = out ind D d ": redundant, " c " already denies it" Z "\n"
+      else out = out ind D d ": nothing to remove, already unlisted" Z "\n"
     }
   }
   # Allows are a union — no order among them — listed most specific source
@@ -99,7 +110,7 @@ END {
 
   if (ndeny > 0) {
     printf "egress: EGRESS_DENY removed %d allowlist entr%s\n", nremoved, nremoved == 1 ? "y" : "ies" > "/dev/stderr"
-    for (d in wide)
+    for (i = 1; i <= ndeny; i++) if ((d = dorder[i]) in wide)
       printf "warning: EGRESS_DENY=%s is still allowed via:%s — the allowlist cannot carve a subdomain out of a broader entry\n", d, wide[d] > "/dev/stderr"
   }
 }
