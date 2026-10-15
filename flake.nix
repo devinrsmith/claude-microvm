@@ -123,8 +123,8 @@
         esac
         case "$EGRESS_POLICY" in
           open|monitor)
-            if [ -n "''${EGRESS_ALLOW:-}" ] || [ -n "''${EGRESS_ALLOWLIST:-}" ]; then
-              echo "warning: EGRESS_ALLOW / EGRESS_ALLOWLIST are only read by EGRESS_POLICY=alert|shadow|enforce — ignored" >&2
+            if [ -n "''${EGRESS_ALLOW:-}" ] || [ -n "''${EGRESS_ALLOWLIST:-}" ] || [ -n "''${EGRESS_DENY:-}" ]; then
+              echo "warning: EGRESS_ALLOW / EGRESS_ALLOWLIST / EGRESS_DENY are only read by EGRESS_POLICY=alert|shadow|enforce — ignored" >&2
             fi ;;
         esac
         if ! [[ "''${EGRESS_PCAP_MAXLEN:-4096}" =~ ^[0-9]+$ ]]; then
@@ -335,6 +335,35 @@
             fi
             if [ -n "''${EGRESS_ALLOW:-}" ]; then
               printf '%s\n' "''${EGRESS_ALLOW//,/ }" | tr ' ' '\n' >> "$_EGRESS_ALLOWLIST_FILE"
+            fi
+            # Per-session removals, applied last so they win over every list
+            # above: drop each entry that is a denied domain or below one. The
+            # format has no deny rule, so a broader entry that still covers a
+            # denied domain (anthropic.com for api.anthropic.com) cannot be
+            # narrowed — say so instead of claiming the domain is blocked.
+            if [ -n "''${EGRESS_DENY:-}" ]; then
+              ${pkgs.gawk}/bin/awk -v deny="''${EGRESS_DENY}" '
+                function host(e) {
+                  sub(/#.*/, "", e); gsub(/^[ \t]+|[ \t]+$/, "", e)
+                  sub(/:[0-9]+$/, "", e); sub(/^\*\./, "", e); sub(/\.$/, "", e)
+                  return tolower(e)
+                }
+                function under(h, d) { return h == d || substr(h, length(h) - length(d)) == "." d }
+                BEGIN { n = split(deny, raw, /[, ]+/); for (i = 1; i <= n; i++) if ((d = host(raw[i])) != "") ds[d] = 1 }
+                {
+                  h = host($0)
+                  if (h != "") for (d in ds) {
+                    if (under(h, d)) { removed++; next }
+                    if (under(d, h)) wide[d] = wide[d] " " h
+                  }
+                  print
+                }
+                END {
+                  printf "egress: EGRESS_DENY removed %d allowlist entr%s\n", removed, removed == 1 ? "y" : "ies" > "/dev/stderr"
+                  for (d in wide)
+                    printf "warning: EGRESS_DENY=%s is still allowed via:%s — the allowlist cannot carve a subdomain out of a broader entry\n", d, wide[d] > "/dev/stderr"
+                }' "$_EGRESS_ALLOWLIST_FILE" > "$_EGRESS_ALLOWLIST_FILE.tmp"
+              mv "$_EGRESS_ALLOWLIST_FILE.tmp" "$_EGRESS_ALLOWLIST_FILE"
             fi
           ;; esac
 
@@ -892,6 +921,7 @@ EOF
           _CONTRACT_ALLOW="baked default"
           if [ -n "''${EGRESS_ALLOWLIST:-}" ]; then _CONTRACT_ALLOW="$_CONTRACT_ALLOW + $EGRESS_ALLOWLIST"; fi
           if [ -n "''${EGRESS_ALLOW:-}" ]; then _CONTRACT_ALLOW="$_CONTRACT_ALLOW + EGRESS_ALLOW ($EGRESS_ALLOW)"; fi
+          if [ -n "''${EGRESS_DENY:-}" ]; then _CONTRACT_ALLOW="$_CONTRACT_ALLOW - EGRESS_DENY ($EGRESS_DENY)"; fi
           echo "               allowlist: $_CONTRACT_ALLOW"
         ;; esac
         case "$EGRESS_POLICY" in

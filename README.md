@@ -422,6 +422,13 @@ alerts log. The effective allowlist is the sum of
 - an optional org/project file, `EGRESS_ALLOWLIST=/path/to/file`;
 - per-session additions, `EGRESS_ALLOW=foo.example.com,bar.example.net`.
 
+Per-session removals, `EGRESS_DENY=datadoghq.com,browser-intake-us5-datadoghq.com`,
+drop every entry (from any of the three) that is a listed domain or one of its
+subdomains — e.g. to keep Claude Code's optional telemetry from leaving the
+VM in shadow/enforce. The format has no deny rule, so a domain still covered by
+a broader entry (`api.anthropic.com` under `anthropic.com`) cannot be removed;
+the launcher warns instead of claiming it is blocked.
+
 An entry matches itself and every subdomain. Alerts never block — a flagged
 domain is a line in a log and in the session-end report, nothing more.
 
@@ -595,6 +602,7 @@ Rebuild with `make claude`.
 | `EGRESS_POLICY` | `open` (unrestricted), `monitor` / `alert` (observe-only: record all guest traffic, `alert` adds live off-allowlist alerts), `shadow` / `enforce` (sealed netdev, all traffic through the host-side proxy; `shadow` audits what `enforce` would deny, `enforce` denies it and keeps API keys out of the guest). See [Egress policy](#egress-policy) | `open` |
 | `EGRESS_ALLOW` | Extra allowlist domains for `alert`/`shadow`/`enforce`, comma-separated. An entry matches itself and every subdomain; `host:port` grants a non-443 port | (none) |
 | `EGRESS_ALLOWLIST` | Path to an additional allowlist file (org or project policy), appended to the baked-in default for `alert`/`shadow`/`enforce` | (none) |
+| `EGRESS_DENY` | Allowlist domains to remove for `alert`/`shadow`/`enforce`, comma-separated: drops each entry that is a listed domain or below one, after all additions. Cannot narrow a broader entry (warns instead) | (none) |
 | `EGRESS_KEEP_PCAP` | Set to keep the raw capture after the summary is written; by default it is deleted and only the report persists | (unset) |
 | `EGRESS_PCAP_MAXLEN` | Captured bytes per packet in `monitor`/`alert` | `4096` |
 | `EXTRA_ENV` | Extra environment variables to forward into the VM, comma-separated. `FOO=bar` assigns a literal value; a bare `FOO` forwards `$FOO` from the host environment (keeps secrets off the command line). | (none) |
