@@ -70,7 +70,7 @@
       # .microvm-env.
       egressGuestAddr = "10.0.2.100:3128";
 
-      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlist, egressProxy, flavorEndpoints }:
+      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints }:
         let
           virtiofsd = pkgs.virtiofsd;
           hostname = "${agentName}-vm";
@@ -155,7 +155,20 @@
         _EGRESS_ALLOWLIST_FILE=""
         _EGRESS_PORTFILE=""
         _EGRESS_PROXY_CFG=""
+        _EGRESS_RULES=""
         _CONTRACT_EXTRA=""
+        # Colour for the session contract: only on a terminal, and never with
+        # NO_COLOR set (https://no-color.org).
+        if [ -t 1 ] && [ -z "''${NO_COLOR:-}" ]; then
+          _C_B=$'\e[1m' _C_D=$'\e[2m' _C_R=$'\e[31m' _C_G=$'\e[32m' _C_Y=$'\e[33m' _C_0=$'\e[0m'
+        else
+          _C_B="" _C_D="" _C_R="" _C_G="" _C_Y="" _C_0=""
+        fi
+        # Paths in the contract: $HOME shown as ~ to keep rows on screen. A
+        # tail command keeps the ~ outside the quotes, so it still expands
+        # when pasted.
+        _tilde() { case "$1" in "$HOME"/*) printf '~/%s' "''${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+        _tailf() { case "$1" in "$HOME"/*) printf "tail -f ~/'%s'" "''${1#"$HOME"/}" ;; *) printf "tail -f '%s'" "$1" ;; esac; }
 
         # Volume size knobs are integers in MiB. Validate before QEMU sees them:
         # a bad value otherwise surfaces as a mkfs failure or, worse, a store
@@ -320,51 +333,35 @@
           ;; esac
 
           case "$EGRESS_POLICY" in alert|shadow|enforce)
-            # Effective allowlist = baked-in default (common + flavor), plus
-            # an optional org/project file, plus per-session additions —
-            # assembled into one file so every consumer (the live matcher,
-            # the final report, the proxy) sees the same list.
+            # Effective allowlist = the built-in lists (common + flavor), plus
+            # an optional org/project file, plus per-session additions, minus
+            # EGRESS_DENY — assembled into one file so every consumer (the live
+            # matcher, the final report, the proxy) sees the same list. Each
+            # line is tagged with its source first, so the session contract
+            # can show where every rule comes from and what overrode it.
             _EGRESS_ALLOWLIST_FILE="$EGRESS_DIR/session-$_EGRESS_STAMP.allowlist"
-            cat ${egressAllowlist} > "$_EGRESS_ALLOWLIST_FILE"
-            if [ -n "''${EGRESS_ALLOWLIST:-}" ]; then
-              if [ ! -f "$EGRESS_ALLOWLIST" ]; then
-                echo "error: EGRESS_ALLOWLIST=$EGRESS_ALLOWLIST is not a file" >&2
-                exit 1
+            _EGRESS_RULES="$_EGRESS_ALLOWLIST_FILE.rules"
+            {
+              ${lib.concatMapStrings (s: ''
+              ${pkgs.gawk}/bin/awk -v l=${lib.escapeShellArg s.label} '{ print l "\t" $0 }' ${s.file}
+              '') egressAllowlistSources}
+              if [ -n "''${EGRESS_ALLOWLIST:-}" ]; then
+                if [ ! -f "$EGRESS_ALLOWLIST" ]; then
+                  echo "error: EGRESS_ALLOWLIST=$EGRESS_ALLOWLIST is not a file" >&2
+                  exit 1
+                fi
+                ${pkgs.gawk}/bin/awk -v l="EGRESS_ALLOWLIST · $(_tilde "$EGRESS_ALLOWLIST")" '{ print l "\t" $0 }' "$EGRESS_ALLOWLIST"
               fi
-              cat "$EGRESS_ALLOWLIST" >> "$_EGRESS_ALLOWLIST_FILE"
-            fi
-            if [ -n "''${EGRESS_ALLOW:-}" ]; then
-              printf '%s\n' "''${EGRESS_ALLOW//,/ }" | tr ' ' '\n' >> "$_EGRESS_ALLOWLIST_FILE"
-            fi
-            # Per-session removals, applied last so they win over every list
-            # above: drop each entry that is a denied domain or below one. The
-            # format has no deny rule, so a broader entry that still covers a
-            # denied domain (anthropic.com for api.anthropic.com) cannot be
-            # narrowed — say so instead of claiming the domain is blocked.
-            if [ -n "''${EGRESS_DENY:-}" ]; then
-              ${pkgs.gawk}/bin/awk -v deny="''${EGRESS_DENY}" '
-                function host(e) {
-                  sub(/#.*/, "", e); gsub(/^[ \t]+|[ \t]+$/, "", e)
-                  sub(/:[0-9]+$/, "", e); sub(/^\*\./, "", e); sub(/\.$/, "", e)
-                  return tolower(e)
-                }
-                function under(h, d) { return h == d || substr(h, length(h) - length(d)) == "." d }
-                BEGIN { n = split(deny, raw, /[, ]+/); for (i = 1; i <= n; i++) if ((d = host(raw[i])) != "") ds[d] = 1 }
-                {
-                  h = host($0)
-                  if (h != "") for (d in ds) {
-                    if (under(h, d)) { removed++; next }
-                    if (under(d, h)) wide[d] = wide[d] " " h
-                  }
-                  print
-                }
-                END {
-                  printf "egress: EGRESS_DENY removed %d allowlist entr%s\n", removed, removed == 1 ? "y" : "ies" > "/dev/stderr"
-                  for (d in wide)
-                    printf "warning: EGRESS_DENY=%s is still allowed via:%s — the allowlist cannot carve a subdomain out of a broader entry\n", d, wide[d] > "/dev/stderr"
-                }' "$_EGRESS_ALLOWLIST_FILE" > "$_EGRESS_ALLOWLIST_FILE.tmp"
-              mv "$_EGRESS_ALLOWLIST_FILE.tmp" "$_EGRESS_ALLOWLIST_FILE"
-            fi
+              if [ -n "''${EGRESS_ALLOW:-}" ]; then
+                printf '%s\n' "''${EGRESS_ALLOW//,/ }" | tr ' ' '\n' | ${pkgs.gawk}/bin/awk '{ print "EGRESS_ALLOW\t" $0 }'
+              fi
+            } > "$_EGRESS_RULES.src"
+            ${pkgs.gawk}/bin/awk -f ${./scripts/egress-rules.awk} \
+              -v deny="''${EGRESS_DENY:-}" -v mode="$EGRESS_POLICY" \
+              -v allowout="$_EGRESS_ALLOWLIST_FILE" -v contractout="$_EGRESS_RULES" \
+              -v B="$_C_B" -v D="$_C_D" -v R="$_C_R" -v G="$_C_G" -v Y="$_C_Y" -v Z="$_C_0" \
+              "$_EGRESS_RULES.src"
+            rm -f "$_EGRESS_RULES.src"
           ;; esac
 
           if [ "$EGRESS_POLICY" = "alert" ]; then
@@ -877,70 +874,93 @@ EOF
         # only for credentials — values never appear here.
         _CONTRACT_KEYS=""
         ${contractKeyChecks}
-        echo "── session contract ──────────────────────────────────────────────"
+        # One row per concern: label, a status dot (green: contained, yellow:
+        # worth knowing, red: the host is exposed), what it means, and a dim
+        # hint at the knob that changes it.
+        _dot() { case "$1" in ok) printf '%s● %s' "$_C_G" "$_C_0" ;; warn) printf '%s● %s' "$_C_Y" "$_C_0" ;; bad) printf '%s● %s' "$_C_R" "$_C_0" ;; *) printf '  ' ;; esac; }
+        _row() { printf '  %s%-11s%s %s%s\n' "$_C_B" "$1" "$_C_0" "$(_dot "$2")" "$3"; }
+        _cont() { printf '                %s\n' "$1"; }
+        _hint() { printf '                %s%s%s\n' "$_C_D" "$1" "$_C_0"; }
+        echo
+        echo "$_C_B── session contract$_C_0 $_C_D· ${agentName}$_C_0 ${lib.concatStrings (lib.genList (_: "─") (57 - lib.stringLength agentName))}"
         if [ "$WORKSPACE_MODE" = "ephemeral" ]; then
-          echo "  project:     $WORK → /work (EPHEMERAL — writes stay in the VM and vanish at"
-          echo "               poweroff; vm-work-diff lists them, copy keepers to /home/agent)"
+          _row project ok "$(_tilde "$WORK") → /work, EPHEMERAL"
+          _cont "writes stay in the VM and vanish at poweroff"
+          _hint "vm-work-diff lists them; copy keepers to /home/agent"
         else
-          echo "  project:     $WORK → /work (read-write; edits appear on the host instantly)"
+          _row project warn "$(_tilde "$WORK") → /work, read-write"
+          _cont "edits appear on the host instantly"
+          _hint "WORKSPACE_MODE=ephemeral keeps them in the VM"
         fi
         if [ "$WORK_CACHE" != "auto" ]; then
-          echo "               virtiofs cache: $WORK_CACHE"
+          _cont "virtiofs cache: $WORK_CACHE"
         fi
-        echo "  agent home:  $AGENT_DIR → /home/agent (persists across sessions)"
+        _row "agent home" "" "$(_tilde "$AGENT_DIR") → /home/agent"
+        _cont "persists across sessions"
         if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
-          echo "  dev shell:   loaded from the project — its Nix code is evaluated on the HOST"
+          _row "dev shell" bad "loaded from the project — its Nix code is evaluated on the HOST"
         else
-          echo "  dev shell:   not loaded (DIRENV_ALLOW=1 to enable)"
+          _row "dev shell" ok "not loaded"
+          _hint "DIRENV_ALLOW=1 loads the project's dev shell (evaluated on the host)"
         fi
         if [ "''${WORKSPACE_GUARD:-}" = "1" ]; then
-          echo "  workspace:   guard on — host-executed config paths read-only in the guest"
-          echo "               (.git/hooks, .git/config, .mcp.json, .claude/{commands,agents}, .envrc)"
+          _row workspace ok "guard on — host-executed config is read-only in the guest"
+          _hint ".git/hooks, .git/config, .mcp.json, .claude/{commands,agents}, .envrc"
         else
-          echo "  workspace:   guard off — the guest may write host-executed config paths"
-          echo "               (WORKSPACE_GUARD=1 to make them read-only)"
+          _row workspace warn "guard off — the guest may write host-executed config"
+          _hint "WORKSPACE_GUARD=1 makes .git/hooks, .mcp.json, .envrc, … read-only"
         fi
         case "$EGRESS_POLICY" in
           open)
-            echo "  egress:      open — unrestricted (EGRESS_POLICY=monitor to observe)" ;;
+            _row egress bad "open — unrestricted, nothing recorded"
+            _hint "EGRESS_POLICY=monitor to observe, shadow/enforce to seal" ;;
           monitor)
-            echo "  egress:      monitor — observing all traffic, blocking nothing"
-            echo "               summary at session end; reports in $EGRESS_DIR" ;;
+            _row egress warn "monitor — every flow recorded, nothing blocked"
+            _hint "summary at session end; reports in $(_tilde "$EGRESS_DIR")" ;;
           alert)
-            echo "  egress:      alert — observing all traffic, blocking nothing"
-            echo "               live alerts: tail -f '$EGRESS_DIR/latest.alerts.log'" ;;
+            _row egress warn "alert — every flow recorded, off-list ones flagged live"
+            _hint "$(_tailf "$EGRESS_DIR/latest.alerts.log")" ;;
           shadow)
-            echo "  egress:      shadow — netdev sealed; the proxy audits and denies nothing yet"
-            echo "               audit: tail -f '$EGRESS_DIR/latest.audit.jsonl'" ;;
+            _row egress warn "shadow — sealed; the proxy is the only way out but blocks nothing"
+            _cont "would_deny lines show what enforce would block"
+            _hint "$(_tailf "$EGRESS_DIR/latest.audit.jsonl")" ;;
           enforce)
-            echo "  egress:      enforce — netdev sealed; allowlist enforced"
-            echo "               audit: tail -f '$EGRESS_DIR/latest.audit.jsonl' (denials land"
-            echo "               there; tools see only '403 from proxy' on CONNECT)" ;;
+            _row egress ok "enforce — sealed; the proxy is the only way out, allowlist enforced"
+            _cont "tools see only '403 from proxy' for a denied host"
+            _hint "$(_tailf "$EGRESS_DIR/latest.audit.jsonl")" ;;
         esac
-        case "$EGRESS_POLICY" in alert|shadow|enforce)
-          _CONTRACT_ALLOW="baked default"
-          if [ -n "''${EGRESS_ALLOWLIST:-}" ]; then _CONTRACT_ALLOW="$_CONTRACT_ALLOW + $EGRESS_ALLOWLIST"; fi
-          if [ -n "''${EGRESS_ALLOW:-}" ]; then _CONTRACT_ALLOW="$_CONTRACT_ALLOW + EGRESS_ALLOW ($EGRESS_ALLOW)"; fi
-          if [ -n "''${EGRESS_DENY:-}" ]; then _CONTRACT_ALLOW="$_CONTRACT_ALLOW - EGRESS_DENY ($EGRESS_DENY)"; fi
-          echo "               allowlist: $_CONTRACT_ALLOW"
-        ;; esac
+        if [ -n "$_EGRESS_RULES" ] && [ -f "$_EGRESS_RULES" ]; then
+          cat "$_EGRESS_RULES"
+        fi
         case "$EGRESS_POLICY" in
           shadow|enforce)
-            echo "  env → guest: keys:''${_CONTRACT_KEYS:- (none)} — placeholders only, real keys stay with the proxy''${_CONTRACT_EXTRA:+; EXTRA_ENV:$_CONTRACT_EXTRA}" ;;
+            if [ -n "$_CONTRACT_KEYS" ]; then
+              _row "credentials" ok "''${_CONTRACT_KEYS# } — placeholders in the guest, real keys stay with the proxy"
+            else
+              _row "credentials" "" "no API keys (OAuth passes through the proxy)"
+            fi ;;
           *)
-            echo "  env → guest: keys:''${_CONTRACT_KEYS:- (none)}''${_CONTRACT_EXTRA:+; EXTRA_ENV:$_CONTRACT_EXTRA}" ;;
+            if [ -n "$_CONTRACT_KEYS" ]; then
+              _row "credentials" warn "''${_CONTRACT_KEYS# } — real keys inside the guest"
+              _hint "EGRESS_POLICY=shadow|enforce keeps them with the host-side proxy"
+            else
+              _row "credentials" "" "no API keys"
+            fi ;;
         esac
+        if [ -n "$_CONTRACT_EXTRA" ]; then
+          _row "extra env" warn "''${_CONTRACT_EXTRA# } (EXTRA_ENV, values not shown)"
+        fi
         if [ "$CRI_ATTACH" -eq 1 ]; then
           if [ -n "''${ENABLE_CRI:-}" ]; then
-            echo "  containers:  ENABLE_CRI=$ENABLE_CRI — storage disk attached (''${CRI_STORAGE_SIZE} MiB cap at creation)"
+            _row containers "" "$ENABLE_CRI — storage disk attached, ''${CRI_STORAGE_SIZE} MiB cap at creation"
           else
-            echo "  containers:  runtimes off; existing storage disk stays attached"
+            _row containers "" "runtimes off; the existing storage disk stays attached"
           fi
         else
-          echo "  containers:  off"
+          _row containers "" "off"
         fi
-        echo "  resources:   ''${VM_MEM} MiB RAM, $VM_VCPU vCPUs${lib.optionalString storeDiskBacked "; writable store \${VM_STORE_SIZE} MiB (fresh each boot)"}"
-        echo "──────────────────────────────────────────────────────────────────"
+        _row resources "" "''${VM_MEM} MiB RAM · $VM_VCPU vCPUs${lib.optionalString storeDiskBacked " · writable store \${VM_STORE_SIZE} MiB, fresh each boot"}"
+        echo "$_C_D────────────────────────────────────────────────────────────────────────────────$_C_0"
         # The contract is the last thing before the kernel's boot log scrolls
         # it away, so pause on it — but only with a terminal to read it and a
         # human to press the key. A one-shot run (AGENTS_ARGS with -p), a pipe,
@@ -1084,9 +1104,11 @@ EOF
           defaultCriSize = nixosCfg.claude-vm.cri.storageSize;
           storeDiskBacked = nixosCfg.claude-vm.store.diskBacked;
           defaultStoreSize = nixosCfg.claude-vm.store.size;
-          egressAllowlist = pkgs.writeText "egress-allowlist-${name}"
-            (lib.concatMapStringsSep "\n" builtins.readFile
-              ([ "${microvm-policy}/allowlists/common.txt" ] ++ flavor.egressAllowlists));
+          # The session allowlist is assembled from these at launch, each line
+          # tagged with its label so the session contract can show its source.
+          egressAllowlistSources =
+            [ { label = "built-in · common.txt (microvm-policy)"; file = "${microvm-policy}/allowlists/common.txt"; } ]
+            ++ map (f: { label = "built-in · ${baseNameOf f}"; file = f; }) flavor.egressAllowlists;
         }) vmFlavors
       );
 

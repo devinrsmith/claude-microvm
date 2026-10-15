@@ -289,9 +289,18 @@ The VM provides strong isolation from the host:
 
 Every launch prints a **session contract** before boot: project path and mount
 mode, whether the dev shell evaluated the project's Nix code on the host,
-egress mode and allowlist sources, which env vars reach the guest (names
-only, never values), container state, and resources — so what a run can reach
-is visible while it is still cheap to stop.
+workspace guard, egress mode, which env vars reach the guest (names only,
+never values), container state, and resources — so what a run can reach is
+visible while it is still cheap to stop. Each row carries a status dot (green:
+contained, yellow: worth knowing, red: the host is exposed) and a hint at the
+knob that changes it; colour is off without a terminal or with `NO_COLOR` set.
+
+In `alert`/`shadow`/`enforce` it also lists every egress rule, highest
+precedence first: `EGRESS_DENY`, then each allow source (`EGRESS_ALLOW`,
+`EGRESS_ALLOWLIST`, the built-in lists) with all of its entries, then what
+happens to everything else. Entries an `EGRESS_DENY` removed are marked `✗`
+in their source; a broader entry that keeps a denied domain reachable is
+marked `⚠`.
 
 #### Hardening notes
 
