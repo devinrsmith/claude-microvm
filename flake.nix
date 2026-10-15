@@ -138,6 +138,15 @@
             echo "error: WORKSPACE_MODE must be passthrough or ephemeral (got '$WORKSPACE_MODE')" >&2
             exit 1 ;;
         esac
+        # virtiofsd's --cache policy for the /work share; the agent-home share
+        # keeps the default. See README "Work share caching".
+        WORK_CACHE="''${WORK_CACHE:-auto}"
+        case "$WORK_CACHE" in
+          auto|always|never|metadata) ;;
+          *)
+            echo "error: WORK_CACHE must be auto, always, never or metadata (got '$WORK_CACHE')" >&2
+            exit 1 ;;
+        esac
         EGRESS_DIR=""
         EGRESS_PCAP=""
         EGRESS_UNIT=""
@@ -254,7 +263,8 @@
               --translate-uid "map:1000:0:1" \
               --translate-gid "map:1000:0:1" \
               --socket-group="$(id -gn)" \
-              --xattr
+              --xattr \
+              --cache="$WORK_CACHE"
 
           echo "$WORK" > "$STATE"
 
@@ -840,6 +850,9 @@ EOF
         else
           echo "  project:     $WORK → /work (read-write; edits appear on the host instantly)"
         fi
+        if [ "$WORK_CACHE" != "auto" ]; then
+          echo "               virtiofs cache: $WORK_CACHE"
+        fi
         echo "  agent home:  $AGENT_DIR → /home/agent (persists across sessions)"
         if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
           echo "  dev shell:   loaded from the project — its Nix code is evaluated on the HOST"
@@ -1066,6 +1079,10 @@ EOF
           runner = self.packages.${system}.claude;
         };
         settings-seed = import ./tests/settings-seed.nix {
+          inherit pkgs lib;
+          runner = self.packages.${system}.claude;
+        };
+        work-cache = import ./tests/work-cache.nix {
           inherit pkgs lib;
           runner = self.packages.${system}.claude;
         };

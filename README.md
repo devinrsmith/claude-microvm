@@ -235,6 +235,39 @@ does not clear on its own and retrying makes it worse. The guest ships
 prevention, and why the two flags usually suggested for this do not apply to a
 rootless daemon.
 
+#### Work share caching
+
+`WORK_CACHE` sets the `/work` virtiofsd's `--cache` policy: how long the guest
+trusts its cached view of `WORK_DIR` before asking the host again. It only
+matters when something outside the VM — the host, or another VM on the same
+`WORK_DIR` — changes files there.
+
+| `WORK_CACHE` | File contents | Attributes and directory entries |
+|---|---|---|
+| `never` | Not cached; every read and write goes to the host | Not cached |
+| `auto` (default) | Re-read when a file is opened (close-to-open, as on NFS) | Cached for 1 second |
+| `metadata` | Not cached | Cached for up to 24 hours |
+| `always` | Kept across opens, with no time limit | Cached for up to 24 hours |
+
+Under `never` and `metadata`, shared (`MAP_SHARED`) mappings of files on
+`/work` fail — SQLite in WAL mode, for one. Private mappings, as git uses, work.
+
+Two cases call for something other than the default:
+
+- **VMs coordinating through a shared `WORK_DIR`: `never`.** Each VM has its
+  own guest cache, so under any other policy one VM can act on a stale view of
+  what another just wrote. `flock` and `fcntl` locks do not cross VMs under any
+  policy — virtiofsd does not implement locking, so each guest kernel keeps its
+  own. Coordinate through operations the host performs atomically instead:
+  creating a lock file with `O_CREAT|O_EXCL`, `mkdir`, or `rename`. `never`
+  makes each VM see the others' results immediately.
+- **One VM that owns `WORK_DIR` exclusively: `always`,** for the fastest
+  repeated reads and lookups, such as builds over large trees. Nothing else is
+  expected to change `WORK_DIR` while the VM runs, the host included: if
+  something does, the guest can keep serving old metadata for up to a day, and
+  old file contents for as long as they stay in its cache — reopening the file
+  does not refresh them.
+
 ### Home directory persistence
 
 Agent state (sessions, credentials, settings) is stored in `$XDG_DATA_HOME/<agent>-microvm/<basename>-<hash>` (defaulting to `~/.local/share/<agent>-microvm/<basename>-<hash>`), where `<agent>` is the flavor name, `<basename>` is the first 12 chars of the project directory name, and `<hash>` is derived from the `WORK_DIR` path. Each agent has its own isolated home directory. All instances of the same agent on the same project share this directory automatically. To use a different directory, set `AGENT_HOME` explicitly:
@@ -541,6 +574,7 @@ Rebuild with `make claude`.
 |----------|-------------|---------|
 | `WORK_DIR` | Host directory to mount at `/work` | Current directory |
 | `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<hash>` |
+| `WORK_CACHE` | virtiofsd cache policy for `/work`: `auto`, `always`, `never` or `metadata` — see [Work share caching](#work-share-caching) | `auto` |
 | `AGENT_SETTINGS` | Host path to a settings file seeded into the agent home before boot (flavor-specific destination, e.g. `.claude/settings.json`) — see [Pre-seeding agent settings](#pre-seeding-agent-settings) | (none) |
 | `VM_MEM` | VM memory in MB | `8192` |
 | `VM_VCPU` | VM vCPU count | `4` |
