@@ -202,18 +202,57 @@
         [ -z "$WORK_BASENAME" ] && WORK_BASENAME="root"
         VM_ID="$WORK_BASENAME-${hostname}"
 
-        # --- Work share (virtiofsd) ---
-        SOCK="$RUNTIME/$VM_ID-virtiofs-$ID.sock"
-        UNIT="$VM_ID-virtiofsd-$ID"
-        AGENT_SOCK="$RUNTIME/$VM_ID-virtiofs-$ID-agent-home.sock"
-        AGENT_UNIT="$VM_ID-virtiofsd-$ID-agent-home"
-        # The per-launch instance share (options.claude-vm.instance in
-        # modules/base.nix); its directory is set once AGENT_DIR is known.
-        INSTANCE_SOCK="$RUNTIME/$VM_ID-virtiofs-$ID-instance.sock"
-        INSTANCE_UNIT="$VM_ID-virtiofsd-$ID-instance"
-        INSTANCE_ROOT=""
+        # --- Instance dir (per launch, in the runtime dir) ---
+        # Everything this launch keeps for itself lives under one directory,
+        # and every path below is derived from it:
+        #
+        #   $XDG_RUNTIME_DIR/claude-microvm/     one root for every flavor
+        #     <basename>-<agent>-vm-<id>/        this launch; 0700, sticky
+        #       guest/                           its own --readonly virtiofsd → /run/microvm
+        #         env  ca-certs/  nix-db.sqlite
+        #       instance.json                    what this is, for tools that list VMs
+        #       lock                             held for the launch's lifetime
+        #       qmp.sock                         QEMU's control socket
+        #       virtiofs-{work,agent-home,guest}.sock
+        #       egress.port  egress.json         EGRESS_POLICY=shadow|enforce
+        #
+        # The runtime dir rather than beside agent home: it is tmpfs, so the
+        # env file's API keys never reach a disk, and if cleanup never runs (a
+        # SIGKILL, a host crash) what is left goes at logout or reboot rather
+        # than staying on disk; it is local and private to the user, where
+        # agent home may be anywhere; and socket paths there stay well inside
+        # the 107-byte limit. Only guest/ is exported, so the rest never
+        # reaches the guest. The disk images stay beside agent home: they are
+        # gigabytes.
+        if [ ! -d "$RUNTIME" ]; then
+          echo "error: no runtime directory: $RUNTIME does not exist (is XDG_RUNTIME_DIR set, with a user session?)" >&2
+          exit 1
+        fi
+        INSTANCE_ROOT="$RUNTIME/claude-microvm"
+        # Set only once this launch has created it, so cleanup removes exactly
+        # what it made and never a directory it did not.
         INSTANCE_DIR=""
-        INSTANCE_GUEST=""
+        _INSTANCE_PATH="$INSTANCE_ROOT/$VM_ID-$ID"
+        INSTANCE_GUEST="$_INSTANCE_PATH/guest"
+        INSTANCE_ENV="$INSTANCE_GUEST/env"
+        QMP_SOCK="$_INSTANCE_PATH/qmp.sock"
+
+        SOCK="$_INSTANCE_PATH/virtiofs-work.sock"
+        UNIT="$VM_ID-virtiofsd-$ID"
+        AGENT_SOCK="$_INSTANCE_PATH/virtiofs-agent-home.sock"
+        AGENT_UNIT="$VM_ID-virtiofsd-$ID-agent-home"
+        GUEST_SOCK="$_INSTANCE_PATH/virtiofs-guest.sock"
+        GUEST_UNIT="$VM_ID-virtiofsd-$ID-guest"
+        # sun_path is 108 bytes, NUL included. A runtime dir long enough to
+        # break this would otherwise surface as QEMU or virtiofsd failing to
+        # bind, after the daemons before it had started.
+        for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK"; do
+          if [ "''${#_s}" -gt 107 ]; then
+            echo "error: socket path too long (''${#_s} bytes, the limit is 107): $_s" >&2
+            echo "       it is under XDG_RUNTIME_DIR=$RUNTIME; a shorter one avoids this" >&2
+            exit 1
+          fi
+        done
         AGENT_TEMP=""
         STORE_IMG=""
         STORE_STATE_DIR=""
@@ -223,12 +262,12 @@
         # exporting a host directory with nothing to stop it. Everything it
         # touches is initialised above for that reason.
         # virtiofsd removes neither its socket nor its `<socket>.pid` when
-        # stopped with SIGTERM, which is what `systemctl stop` sends — so both
-        # are removed here, or every launch leaves them in $RUNTIME.
+        # stopped with SIGTERM, which is what `systemctl stop` sends; both are
+        # in the instance dir, which goes last, after every daemon has stopped.
         cleanup() {
           ${pkgs.systemd}/bin/systemctl --user stop "$UNIT" 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --user stop "$AGENT_UNIT" 2>/dev/null || true
-          ${pkgs.systemd}/bin/systemctl --user stop "$INSTANCE_UNIT" 2>/dev/null || true
+          ${pkgs.systemd}/bin/systemctl --user stop "$GUEST_UNIT" 2>/dev/null || true
           if [ -n "$EGRESS_UNIT" ]; then
             ${pkgs.systemd}/bin/systemctl --user stop "$EGRESS_UNIT" 2>/dev/null || true
           fi
@@ -237,12 +276,6 @@
           if [ -n "$EGRESS_PCAP" ] && [ -z "''${EGRESS_KEEP_PCAP:-}" ]; then
             rm -f "$EGRESS_PCAP"
           fi
-          if [ -n "$_EGRESS_PORTFILE" ]; then
-            rm -f "$_EGRESS_PORTFILE" "$_EGRESS_PROXY_CFG"
-          fi
-          for _s in "$SOCK" "$AGENT_SOCK" "$INSTANCE_SOCK"; do
-            rm -f "$_s" "$_s.pid"
-          done
           if [ -n "$STORE_IMG" ]; then
             rm -f "$STORE_IMG"
             # Leave nothing behind on the host: the dir is ours and the image is
@@ -253,15 +286,31 @@
             rm -rf "$AGENT_TEMP"
           fi
           # This launch's instance dir goes with it: guest/ — env (API keys
-          # included), CA certs, DB snapshot — and anything kept beside it. The
-          # parent is shared by concurrent launches, so it goes only once the
-          # last of them has.
+          # included), CA certs, DB snapshot — and its sockets, lock and egress
+          # files. The root is shared by concurrent launches, so it goes only
+          # once the last of them has.
           if [ -n "$INSTANCE_DIR" ]; then
             rm -rf "$INSTANCE_DIR"
             rmdir "$INSTANCE_ROOT" 2>/dev/null || true
           fi
         }
         trap cleanup EXIT
+
+        # Created before the first daemon, whose socket lives in it. The root
+        # may already exist (another launch); this launch's dir must not, and
+        # mkdir without -p refuses if it does. Sticky, as the XDG spec asks of
+        # runtime files that must survive its periodic clean-up of anything
+        # untouched for six hours — a VM can run for days.
+        mkdir -p "$INSTANCE_ROOT"
+        chmod 700 "$INSTANCE_ROOT"
+        mkdir -m 1700 "$_INSTANCE_PATH"
+        INSTANCE_DIR="$_INSTANCE_PATH"
+        mkdir -m 1700 "$INSTANCE_GUEST"
+        # Held until this launch — QEMU included, which inherits the descriptor
+        # — has gone, so a dir whose lock can be taken is one nobody is using.
+        exec {_INSTANCE_LOCK_FD}>"$INSTANCE_DIR/lock"
+        chmod 1600 "$INSTANCE_DIR/lock"
+        ${pkgs.util-linux}/bin/flock -n "$_INSTANCE_LOCK_FD"
 
         # Every launch starts its own daemons: the unit and socket names carry
         # this launch's random $ID, so there is never one to reuse, and the
@@ -301,31 +350,26 @@
           mkdir -p "$AGENT_DIR"
         fi
 
-        # --- Instance dir (per-launch; guest/ exported read-only) ---
+        # What this instance is, for anything that lists running VMs: read
+        # this rather than parsing the directory name.
+        ${pkgs.jq}/bin/jq -n \
+          --argjson pid "$$" --arg flavor ${lib.escapeShellArg agentName} \
+          --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg work "$WORK" --arg agentHome "$AGENT_DIR" --arg guest "$INSTANCE_GUEST" \
+          --arg qmp "$QMP_SOCK" --arg workSock "$SOCK" --arg agentHomeSock "$AGENT_SOCK" --arg guestSock "$GUEST_SOCK" \
+          '{version: 1, pid: $pid, flavor: $flavor, vmId: $vmId, id: $id, started: $started,
+            work: $work, agentHome: $agentHome, guest: $guest, guestMount: "/run/microvm",
+            sockets: {qmp: $qmp, work: $workSock, agentHome: $agentHomeSock, guest: $guestSock}}' \
+          > "$INSTANCE_DIR/instance.json"
+        chmod 1600 "$INSTANCE_DIR/instance.json"
+
         # What this launch hands the guest — the env file, EXTRA_CA_CERTS, the
-        # nix DB snapshot — is written here, not into $AGENT_DIR. Agent home is
-        # shared by every launch on the project and writable from the guest, so
-        # files there were overwritten by the next launch and could be rewritten
-        # by any of them, while root services in the guest act on all three.
-        # This dir is this launch's alone: a host-only sibling of agent home
-        # like the CRI image, removed on exit. Owner-only, since the env file
-        # carries API keys.
-        #
-        #   $INSTANCE_DIR/          host-only, per launch
-        #     guest/                its own --readonly virtiofsd → /run/microvm
-        #
-        # Only guest/ is exported, so whatever else this launch keeps for
-        # itself sits beside it and never reaches the guest.
-        INSTANCE_ROOT="$AGENT_DIR-instance"
-        mkdir -p "$INSTANCE_ROOT"
-        chmod 700 "$INSTANCE_ROOT"
-        INSTANCE_DIR="$INSTANCE_ROOT/$ID"
-        mkdir -m 700 "$INSTANCE_DIR"
-        INSTANCE_GUEST="$INSTANCE_DIR/guest"
-        mkdir -m 700 "$INSTANCE_GUEST"
-        INSTANCE_ENV="$INSTANCE_GUEST/env"
-        # Earlier launchers left these in agent home — the env file with API
-        # keys in it. Nothing reads them there any more.
+        # nix DB snapshot — goes to the instance dir's guest/, not agent home.
+        # Agent home is shared by every launch on the project and writable from
+        # the guest, so files there were overwritten by the next launch and
+        # could be rewritten by any of them, while root services in the guest
+        # act on all three. Earlier launchers left them here, the env file with
+        # API keys in it; nothing reads them here any more.
         rm -rf "$AGENT_DIR/.microvm-env" "$AGENT_DIR/.microvm-ca-certs" "$AGENT_DIR/.microvm-nix-db.sqlite"
 
         # --- Egress setup (EGRESS_POLICY != open) ---
@@ -408,8 +452,8 @@
             EGRESS_AUDIT="$EGRESS_DIR/session-$_EGRESS_STAMP.audit.jsonl"
             : > "$EGRESS_AUDIT"
             ln -sfn "$(basename "$EGRESS_AUDIT")" "$EGRESS_DIR/latest.audit.jsonl"
-            _EGRESS_PORTFILE="$RUNTIME/$VM_ID-egress-$ID.port"
-            _EGRESS_PROXY_CFG="$RUNTIME/$VM_ID-egress-$ID.json"
+            _EGRESS_PORTFILE="$INSTANCE_DIR/egress.port"
+            _EGRESS_PROXY_CFG="$INSTANCE_DIR/egress.json"
             _EGRESS_PROXY_MODE="enforce"
             [ "$EGRESS_POLICY" = "shadow" ] && _EGRESS_PROXY_MODE="log"
             # tests/egress-config.nix extracts the region between these
@@ -781,16 +825,18 @@ EOF
             || rm -f "$INSTANCE_GUEST/nix-db.sqlite"
         fi
 
-        # --- Instance share (virtiofsd, read-only) ---
+        # --- Guest share (virtiofsd, read-only) ---
         # Exports guest/ only, never the instance dir around it. Started last,
         # once everything above has written its file: from here on guest/ is
-        # only read. --readonly is the guarantee — virtiofsd refuses every
+        # only read, so its files are made sticky now (see the instance dir's
+        # creation). --readonly is the guarantee — virtiofsd refuses every
         # write, so root in the guest cannot change these files whatever it
         # remounts. --translate-uid shows them as the agent's, so the 0600 env
         # file stays readable by the agent and by no one else.
-        ${pkgs.systemd}/bin/systemd-run --user --unit="$INSTANCE_UNIT" --collect \
+        chmod -R +t "$INSTANCE_GUEST"
+        ${pkgs.systemd}/bin/systemd-run --user --unit="$GUEST_UNIT" --collect \
           -- ${virtiofsd}/bin/virtiofsd \
-            --socket-path="$INSTANCE_SOCK" \
+            --socket-path="$GUEST_SOCK" \
             --shared-dir="$INSTANCE_GUEST" \
             --readonly \
             --sandbox=namespace \
@@ -801,10 +847,10 @@ EOF
             --socket-group="$(id -gn)"
 
         for i in $(seq 1 50); do
-          [ -S "$INSTANCE_SOCK" ] && break
+          [ -S "$GUEST_SOCK" ] && break
           sleep 0.1
         done
-        [ -S "$INSTANCE_SOCK" ] || { echo "error: instance virtiofsd socket did not appear"; exit 1; }
+        [ -S "$GUEST_SOCK" ] || { echo "error: guest-share virtiofsd socket did not appear"; exit 1; }
 
         # $CRI_IMG is used as sed replacement text below. Escape characters
         # that are special on the replacement side (\, &) and the | delimiter
@@ -823,7 +869,11 @@ EOF
           -e "s|/tmp/${hostname}-home|$AGENT_DIR|g"
           -e "s|${hostname}-virtiofs-agent-home.sock|$AGENT_SOCK|g"
           -e "s|/tmp/${hostname}-instance|$INSTANCE_GUEST|g"
-          -e "s|${hostname}-virtiofs-instance.sock|$INSTANCE_SOCK|g"
+          -e "s|${hostname}-virtiofs-instance.sock|$GUEST_SOCK|g"
+          # QEMU's QMP socket: microvm.socket is a relative "<hostname>.sock",
+          # which would land in whatever directory the launcher runs from, and
+          # two launches from one directory would take it from each other.
+          -e "s|-qmp unix:${hostname}.sock,|-qmp unix:$QMP_SOCK,|g"
           # CRI storage volume image: microvm.nix emits the relative path
           # "cri-storage.img" in both the createVolumesScript and the QEMU
           # -drive; point both at the persistent image in agent home.

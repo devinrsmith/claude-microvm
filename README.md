@@ -289,16 +289,27 @@ AGENT_HOME=~/.my-agent-home make claude.run
 
 This mounts the host directory at `/home/agent` inside the guest via a second virtiofs share with the same unprivileged UID/GID mapping.
 
-### Per-launch instance share
+### Per-launch instance directory
 
-What a launch hands its guest is not kept in agent home: that directory is
-shared by every launch on the project and writable from each guest. Instead
-each launch writes it to a directory of its own, `$AGENT_HOME-instance/<id>/`
-(owner-only, beside agent home rather than inside it), and exports its `guest/`
-subdirectory read-only at `/run/microvm`. Only `guest/` reaches the guest;
-anything else the launch keeps for itself sits beside it. The guest sees:
+Each launch keeps what is its alone in one directory under the runtime dir:
 
-| file | what |
+```
+$XDG_RUNTIME_DIR/claude-microvm/          one root for every flavor
+  <basename>-<agent>-vm-<id>/             this launch; owner-only
+    guest/                                exported read-only at /run/microvm
+      env  ca-certs/  nix-db.sqlite
+    instance.json                         what this launch is (see below)
+    lock                                  held while the launch runs
+    qmp.sock                              QEMU's QMP control socket
+    virtiofs-work.sock  virtiofs-agent-home.sock  virtiofs-guest.sock
+    egress.port  egress.json              EGRESS_POLICY=shadow|enforce
+```
+
+Only `guest/` reaches the guest. It holds what the launch hands the guest,
+which used to live in agent home — a directory shared by every launch on the
+project and writable from each guest:
+
+| in the guest | what |
 |---|---|
 | `/run/microvm/env` | the values the launcher passes in — API keys, `EXTRA_ENV`, `ENABLE_CRI`, the egress settings — sourced by the agent's shell and read as data by the guest's services |
 | `/run/microvm/ca-certs/` | `EXTRA_CA_CERTS` |
@@ -306,10 +317,31 @@ anything else the launch keeps for itself sits beside it. The guest sees:
 
 Its virtiofsd runs with `--readonly`, so nothing in the guest — root included —
 can change these files, and two VMs on the same project each see only their
-own. The directory is removed when the launch exits, whether the VM shut down,
-failed or never started. Launchers before this kept the three in agent home as
-`.microvm-env`, `.microvm-ca-certs` and `.microvm-nix-db.sqlite`; the first
-launch that has this removes them.
+own. The runtime dir is tmpfs, so the env file's API keys never reach a disk.
+The directory is removed when the launch exits, whether the VM shut down,
+failed or never started; if the launcher itself is killed, what is left goes
+at logout or reboot. Launchers before this kept the guest's three files in
+agent home as `.microvm-env`, `.microvm-ca-certs` and `.microvm-nix-db.sqlite`;
+the first launch that has this removes them.
+
+`instance.json` describes the launch for anything that wants to find running
+VMs — read it rather than parsing the directory name:
+
+```sh
+jq . "$XDG_RUNTIME_DIR"/claude-microvm/*/instance.json
+# {"version":1,"pid":…,"flavor":"claude","vmId":…,"id":…,"started":…,
+#  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
+#  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…}}
+```
+
+The QMP socket gives full control of the VM, e.g.
+`echo '{"execute":"qmp_capabilities"}{"execute":"query-status"}' | socat - UNIX:<qmp.sock>`.
+microvm.nix's own `microvm-shutdown` and `microvm-balloon` helpers still look
+for a relative `claude-vm.sock`, so they do not work with this launcher.
+
+The launcher refuses to start without a runtime dir (`XDG_RUNTIME_DIR`, or
+`/run/user/<uid>`), or with one long enough to push a socket path past the
+107-byte limit.
 
 ### Sandboxing
 
@@ -589,7 +621,7 @@ a private or self-hosted endpoint — the token stays on the host and nothing
 endpoint-specific is baked into the image.
 
 > Values are written to `/run/microvm/env` (mode `600`, on the read-only
-> [instance share](#per-launch-instance-share)) and are readable by the agent
+> [instance share](#per-launch-instance-directory)) and are readable by the agent
 > and by root in the guest. Nothing in the guest can change them, and the
 > guest's root services never source the file: they read only the keys they
 > need, as plain text.
@@ -767,7 +799,7 @@ and what you can do about each:
 |---|---|---|
 | `$AGENT_HOME-cri/cri-storage.img` | persistent, ~133 MiB minimum, grows to the cap | not created unless `ENABLE_CRI` is set; `CRI_STORAGE_SIZE=0` also detaches an existing one |
 | `$AGENT_HOME-store/nix-store-overlay.img` | per-run, ~69 MiB, deleted on exit along with its directory | build-time only: `claude-vm.store.diskBacked = false` |
-| `$AGENT_HOME-instance/<id>/` (in `guest/`: env file with API keys, CA certs, nix DB snapshot ~97 MiB) | per-run, deleted on exit, and its parent once no launch is using it | — |
+| `$XDG_RUNTIME_DIR/claude-microvm/<vm>-<id>/` (env file with API keys, CA certs, nix DB snapshot ~97 MiB; sockets) | per-run, on tmpfs, deleted on exit — or at logout/reboot if the launcher is killed | — |
 | `$AGENT_HOME` (agent state, dev-shell cache) | persistent | point `AGENT_HOME` somewhere disposable |
 
 The CRI disk used to be created on every launch whether or not `ENABLE_CRI` was
