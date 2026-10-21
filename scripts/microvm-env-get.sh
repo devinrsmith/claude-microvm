@@ -2,24 +2,25 @@
 #
 #   microvm-env-get <env-file> <KEY>
 #
-# Prints the value of the last `KEY=` line, literally, or nothing when the file
-# or the key is absent. `set -euo pipefail` comes from writeShellApplication.
+# Prints the value of the last `KEY=` line, or nothing when the file or the key
+# is absent. `set -euo pipefail` comes from writeShellApplication.
 #
 # The guest's root services (cri-proxy-env, cri-activate in modules/cri.nix)
 # need a few keys from this file, but it sits in /home/agent, which the agent
 # can write — and `sudo systemctl restart` reruns a service on demand. Sourcing
 # it as root would run whatever the agent appended. So nothing here evaluates
-# the file: no expansion, no quote removal, no command substitution.
+# the file: no expansion, no command substitution, no word splitting.
 #
 # Last match wins, as it does when the agent's login shell sources the file:
 # EXTRA_ENV is written after everything else so that it can override a key.
-# This is the same reading microvm-policy's services use for its own keys
-# (`sed -n 's/^KEY=//p' | tail -n1`).
+# microvm-policy's services read their own keys from this file the same way.
 #
-# The value is the raw text after `KEY=`. The keys read this way are written
-# unquoted by the launcher, or are %q-quoted values that contain nothing %q
-# would escape; anything else comes back with its quoting intact, and the
-# caller's own validation turns it away.
+# The launcher writes some values plainly and some with printf %q. For
+# printable text %q only ever backslash-escapes — `a,b` becomes `a\,b` — and
+# writes an empty value as `''`, so this undoes exactly those two forms and
+# gets what sourcing would have assigned. Anything else (`$'…'`, which %q uses
+# only for control characters, or quotes the launcher never writes) comes back
+# as plain text, for the caller's own validation to turn away.
 
 env_file="${1:?usage: microvm-env-get <env-file> <KEY>}"
 key="${2:?usage: microvm-env-get <env-file> <KEY>}"
@@ -31,11 +32,23 @@ fi
 
 [ -f "$env_file" ] || exit 0
 
-value=""
+raw=""
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
-    "$key="*) value="${line#"$key="}" ;;
+    "$key="*) raw="${line#"$key="}" ;;
   esac
 done < "$env_file"
+
+[ "$raw" = "''" ] && raw=""
+
+# \X is X; a trailing lone backslash is dropped, as the shell would.
+value=""
+while [[ "$raw" == *\\* ]]; do
+  value+="${raw%%\\*}"
+  raw="${raw#*\\}"
+  value+="${raw:0:1}"
+  raw="${raw:1}"
+done
+value+="$raw"
 
 printf '%s\n' "$value"

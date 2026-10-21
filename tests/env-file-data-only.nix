@@ -75,7 +75,14 @@ pkgs.runCommand "env-file-data-only" { } ''
   [ "$($get $E ENABLE_CRI)" = podman ] && ok "the last line for a key wins, as EXTRA_ENV relies on" || bad "last match: got '$($get $E ENABLE_CRI)'"
   [ "$($get $E ENABLE_CRI_EXTRA)" = nope ] && ok "a key is not matched by a longer one" || bad "key prefix confused"
   [ "$($get $E URLISH)" = a=b=c ] && ok "a value keeps its own '='" || bad "value split on '='"
-  [ "$($get $E AGENTS_ARGS)" = '-p\ \"hi\ there\"' ] && ok "a quoted value comes back literally, unevaluated" || bad "quoted value: got '$($get $E AGENTS_ARGS)'"
+  [ "$($get $E AGENTS_ARGS)" = '-p "hi there"' ] && ok "a %q-escaped value reads as sourcing would assign it" || bad "escaped value: got '$($get $E AGENTS_ARGS)'"
+  # What the launcher writes with %q comes back exactly, and is never run.
+  for v in 'docker.io=http://10.0.2.2:5101,ghcr.io=http://10.0.2.2:5102' "" "a'b" '-p "x y"' \
+           "\$(touch $canary)" "\`touch $canary\`" '~x' 'back\slash' 'trailing\'; do
+    printf 'V=%q\n' "$v" > $TMPDIR/q.env
+    got="$($get $TMPDIR/q.env V)"
+    [ "$got" = "$v" ] && ok "%q round-trips '$v'" || bad "%q round-trip: wrote '$v', read '$got'"
+  done
   [ "$($get $E LAST)" = no-newline ] && ok "a final line without a newline is read" || bad "final line dropped"
   [ -z "$($get $E MISSING)" ] && ok "a missing key reads as empty" || bad "missing key not empty"
   [ -z "$($get $TMPDIR/absent MISSING)" ] && ok "a missing file reads as empty" || bad "missing file not empty"
