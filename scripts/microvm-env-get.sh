@@ -6,10 +6,12 @@
 # is absent. `set -euo pipefail` comes from writeShellApplication.
 #
 # The guest's root services (cri-proxy-env, cri-activate in modules/cri.nix)
-# need a few keys from this file, but it sits in /home/agent, which the agent
-# can write — and `sudo systemctl restart` reruns a service on demand. Sourcing
-# it as root would run whatever the agent appended. So nothing here evaluates
-# the file: no expansion, no command substitution, no word splitting.
+# need a few keys from this file. It reaches the guest on the read-only
+# instance share (options.claude-vm.instance in modules/base.nix), but a root
+# service still has no business executing it: sourcing would run whatever the
+# file says, so a launcher bug or a value that escaped its quoting would run as
+# root. So nothing here evaluates the file: no expansion, no command
+# substitution, no word splitting.
 #
 # Last match wins, as it does when the agent's login shell sources the file:
 # EXTRA_ENV is written after everything else so that it can override a key.

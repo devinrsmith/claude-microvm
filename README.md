@@ -289,6 +289,27 @@ AGENT_HOME=~/.my-agent-home make claude.run
 
 This mounts the host directory at `/home/agent` inside the guest via a second virtiofs share with the same unprivileged UID/GID mapping.
 
+### Per-launch instance share
+
+What a launch hands its guest is not kept in agent home: that directory is
+shared by every launch on the project and writable from each guest. Instead
+each launch writes it to a directory of its own,
+`$AGENT_HOME-instance/<id>/` (owner-only, beside agent home rather than inside
+it), and exports that read-only at `/run/microvm`:
+
+| file | what |
+|---|---|
+| `/run/microvm/env` | the values the launcher passes in — API keys, `EXTRA_ENV`, `ENABLE_CRI`, the egress settings — sourced by the agent's shell and read as data by the guest's services |
+| `/run/microvm/ca-certs/` | `EXTRA_CA_CERTS` |
+| `/run/microvm/nix-db.sqlite` | the snapshot of the host's Nix database the guest imports at boot |
+
+Its virtiofsd runs with `--readonly`, so nothing in the guest — root included —
+can change these files, and two VMs on the same project each see only their
+own. The directory is removed when the launch exits, whether the VM shut down,
+failed or never started. Launchers before this kept the three in agent home as
+`.microvm-env`, `.microvm-ca-certs` and `.microvm-nix-db.sqlite`; the first
+launch that has this removes them.
+
 ### Sandboxing
 
 The VM provides strong isolation from the host:
@@ -566,10 +587,11 @@ can interpolate environment variables, this is also the way to point an agent at
 a private or self-hosted endpoint — the token stays on the host and nothing
 endpoint-specific is baked into the image.
 
-> Values are written to `.microvm-env` (mode `600`) in the agent home directory
-> and are readable by anything running in the guest, including the agent itself.
-> The agent can also write the file, so the guest's root services never source
-> it: they read only the keys they need, as plain text.
+> Values are written to `/run/microvm/env` (mode `600`, on the read-only
+> [instance share](#per-launch-instance-share)) and are readable by the agent
+> and by root in the guest. Nothing in the guest can change them, and the
+> guest's root services never source the file: they read only the keys they
+> need, as plain text.
 
 ## Customization
 
@@ -744,7 +766,8 @@ and what you can do about each:
 |---|---|---|
 | `$AGENT_HOME-cri/cri-storage.img` | persistent, ~133 MiB minimum, grows to the cap | not created unless `ENABLE_CRI` is set; `CRI_STORAGE_SIZE=0` also detaches an existing one |
 | `$AGENT_HOME-store/nix-store-overlay.img` | per-run, ~69 MiB, deleted on exit along with its directory | build-time only: `claude-vm.store.diskBacked = false` |
-| `$AGENT_HOME` (agent state, dev-shell cache, nix DB snapshot ~97 MiB) | persistent | point `AGENT_HOME` somewhere disposable |
+| `$AGENT_HOME-instance/<id>/` (env file with API keys, CA certs, nix DB snapshot ~97 MiB) | per-run, deleted on exit, and its parent once no launch is using it | — |
+| `$AGENT_HOME` (agent state, dev-shell cache) | persistent | point `AGENT_HOME` somewhere disposable |
 
 The CRI disk used to be created on every launch whether or not `ENABLE_CRI` was
 set, and it is never deleted. It is now only created for a run that asks for

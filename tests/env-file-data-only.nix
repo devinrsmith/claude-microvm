@@ -1,15 +1,16 @@
-# The guest's root services read the launcher's .microvm-env as data, never as
-# code. The file sits in /home/agent, which the agent can write, and the agent
-# may `sudo systemctl restart` any unit — so a root service that sources it
-# runs whatever the agent appended, as root.
+# The guest's root services read the launcher's env file as data, never as
+# code. It reaches the guest on the read-only instance share (see
+# tests/instance-share.nix), but a root service that sources it would still run
+# whatever it says — a launcher bug, or a value that escaped its quoting, would
+# run as root.
 #
 #   - scripts/microvm-env-get.sh, the reader they use: last match wins, values
-#     come back literally, nothing in the file is evaluated;
+#     come back as sourcing would assign them, nothing in the file is evaluated;
 #   - cri-proxy-env and cri-activate, run here from their evaluated `script`
 #     text against a scratch env file, with their fixed paths redirected and
 #     systemctl stubbed: a hostile file runs nothing, and a well-formed one does
 #     what it did before;
-#   - no unit in the evaluated guest that names .microvm-env sources it.
+#   - no unit in the evaluated guest that names the env file sources it.
 { pkgs, lib, config }:
 
 let
@@ -19,25 +20,26 @@ let
   };
 
   services = config.systemd.services;
+  envFile = "${config.claude-vm.instance.dir}/env";
 
   # A service's script with its fixed paths moved under $T, so it can run
   # unprivileged against a scratch env file.
   relocate = name: pkgs.writeText "${name}.sh" (lib.replaceStrings
-    [ "/home/agent/.microvm-env" "/run/cri-proxy.env" "/etc/crictl.yaml" ]
+    [ envFile "/run/cri-proxy.env" "/etc/crictl.yaml" ]
     [ "$T/env" "$T/run/cri-proxy.env" "$T/etc/crictl.yaml" ]
     services.${name}.script);
 
-  readers = lib.filterAttrs (_: s: lib.hasInfix ".microvm-env" (s.script or "")) services;
+  readers = lib.filterAttrs (_: s: lib.hasInfix envFile (s.script or "")) services;
   sources = s: lib.any (p: lib.hasInfix p s.script)
-    [ ''source "$ENV_FILE"'' ''. "$ENV_FILE"'' "source /home/agent/.microvm-env" ". /home/agent/.microvm-env" ];
+    [ ''source "$ENV_FILE"'' ''. "$ENV_FILE"'' "source ${envFile}" ". ${envFile}" ];
 
   structural = [
     {
-      name = "cri-proxy-env and cri-activate read .microvm-env";
+      name = "cri-proxy-env and cri-activate read ${envFile}";
       ok = readers ? cri-proxy-env && readers ? cri-activate;
     }
     {
-      name = "no unit that reads .microvm-env sources it (${lib.concatStringsSep ", " (lib.attrNames readers)})";
+      name = "no unit that reads ${envFile} sources it (${lib.concatStringsSep ", " (lib.attrNames readers)})";
       ok = !lib.any sources (lib.attrValues readers);
     }
   ];

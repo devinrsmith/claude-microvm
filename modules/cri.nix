@@ -1,9 +1,10 @@
 { pkgs, lib, config, ... }:
 let
   cfg = config.claude-vm.cri;
+  instance = config.claude-vm.instance;
 
-  # The root services below read .microvm-env with this rather than `source`:
-  # the agent can write the file. See scripts/microvm-env-get.sh.
+  # The root services below read the launcher's env file with this rather than
+  # `source`. See scripts/microvm-env-get.sh.
   microvmEnvGet = pkgs.writeShellApplication {
     name = "microvm-env-get";
     text = builtins.readFile ../scripts/microvm-env-get.sh;
@@ -321,10 +322,10 @@ CRIEOF
 
     # Container daemons run as their own systemd services, so they inherit
     # neither the agent shell's proxy env nor the guest's (there isn't one —
-    # the agent gets proxy vars from .microvm-env, not the whole system). Under
-    # a sealed netdev (EGRESS_POLICY=shadow|enforce) their only route out is
-    # the egress proxy, so without this a pull fails with no route under
-    # enforce and goes straight out unaudited under shadow. The daemons read
+    # the agent gets proxy vars from the launcher's env file, not the whole
+    # system). Under a sealed netdev (EGRESS_POLICY=shadow|enforce) their only
+    # route out is the egress proxy, so without this a pull fails with no route
+    # under enforce and goes straight out unaudited under shadow. The daemons read
     # the file this writes via `EnvironmentFile=-/run/cri-proxy.env`; it is
     # created only in the sealed modes, so passthrough/observe behaviour is
     # unchanged. Image pull in containerd/docker/crio/podman is all Go, which
@@ -332,7 +333,7 @@ CRIEOF
     # resolv.conf under enforce is not a problem.
     systemd.services.cri-proxy-env = {
       description = "Proxy env for container daemons under a sealed egress netdev";
-      after = [ "home-agent.mount" ];
+      after = [ instance.mountUnit ];
       before = [ "cri-activate.service" "containerd.service" "containerd-crun.service" "crio.service" "docker.service" "podman.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
@@ -340,7 +341,7 @@ CRIEOF
         RemainAfterExit = true;
       };
       script = ''
-        ENV_FILE="/home/agent/.microvm-env"
+        ENV_FILE="${instance.dir}/env"
         policy="$(${envGet} "$ENV_FILE" EGRESS_POLICY)"
         case "$policy" in shadow|enforce) ;; *) exit 0 ;; esac
 
@@ -372,7 +373,7 @@ CRIEOF
 
     systemd.services.cri-activate = {
       description = "Activate CRI runtimes based on ENABLE_CRI";
-      after = [ "network.target" "home-agent.mount" "var-lib-containers.mount" "cri-proxy-env.service" ];
+      after = [ "network.target" instance.mountUnit "var-lib-containers.mount" "cri-proxy-env.service" ];
       before = [ "getty@tty1.service" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
@@ -380,7 +381,7 @@ CRIEOF
         RemainAfterExit = true;
       };
       script = ''
-        ENV_FILE="/home/agent/.microvm-env"
+        ENV_FILE="${instance.dir}/env"
         ENABLE_CRI="$(${envGet} "$ENV_FILE" ENABLE_CRI)"
         [ -z "$ENABLE_CRI" ] && exit 0
 

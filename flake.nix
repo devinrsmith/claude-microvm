@@ -66,8 +66,8 @@
       # Where the guest reaches the proxy: a slirp-internal address that
       # guestfwd maps onto the host-side listener. Chosen to dodge 10.0.2.2
       # (host), 10.0.2.3 (DNS) and 10.0.2.15 (guest). microvm-policy's
-      # egress module ssh wrapper learns it from EGRESS_PROXY_ADDR in
-      # .microvm-env.
+      # egress module ssh wrapper learns it from EGRESS_PROXY_ADDR in the
+      # launcher's env file.
       egressGuestAddr = "10.0.2.100:3128";
 
       mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints }:
@@ -75,7 +75,7 @@
           virtiofsd = pkgs.virtiofsd;
           hostname = "${agentName}-vm";
           apiKeyForwarding = lib.concatStringsSep "\n" (map (var:
-            ''[ -n "''${${var}:-}" ] && echo "${var}=''${${var}}" >> "$AGENT_DIR/.microvm-env"''
+            ''[ -n "''${${var}:-}" ] && echo "${var}=''${${var}}" >> "$INSTANCE_ENV"''
           ) apiKeyVars);
           # Bash fragments for the shadow/enforce wiring, one per endpoint.
           # keyEnv is decided at launch: the var's presence on the host picks
@@ -91,12 +91,12 @@
           contractKeyChecks = lib.concatStringsSep "\n" (map (var: ''
             if [ -n "''${${var}:-}" ]; then _CONTRACT_KEYS="$_CONTRACT_KEYS ${var}"; fi'') apiKeyVars);
           egressGuestEnv = lib.concatMapStringsSep "\n" (ep: ''
-            echo "${ep.baseUrlVar}=http://${egressGuestAddr}${ep.prefix}" >> "$AGENT_DIR/.microvm-env"
+            echo "${ep.baseUrlVar}=http://${egressGuestAddr}${ep.prefix}" >> "$INSTANCE_ENV"
             if [ -n "''${${ep.keyVar}:-}" ]; then
               # Clients insist on a key being present; the proxy strips and
               # replaces whatever travels, so a placeholder satisfies them
               # and the real key never enters the guest.
-              echo "${ep.keyVar}=egress-proxy-placeholder" >> "$AGENT_DIR/.microvm-env"
+              echo "${ep.keyVar}=egress-proxy-placeholder" >> "$INSTANCE_ENV"
             fi'') flavorEndpoints;
         in pkgs.writeShellScriptBin "microvm-run" ''
         set -euo pipefail
@@ -207,6 +207,12 @@
         UNIT="$VM_ID-virtiofsd-$ID"
         AGENT_SOCK="$RUNTIME/$VM_ID-virtiofs-$ID-agent-home.sock"
         AGENT_UNIT="$VM_ID-virtiofsd-$ID-agent-home"
+        # The per-launch instance share (options.claude-vm.instance in
+        # modules/base.nix); its directory is set once AGENT_DIR is known.
+        INSTANCE_SOCK="$RUNTIME/$VM_ID-virtiofs-$ID-instance.sock"
+        INSTANCE_UNIT="$VM_ID-virtiofsd-$ID-instance"
+        INSTANCE_ROOT=""
+        INSTANCE_DIR=""
         AGENT_TEMP=""
         STORE_IMG=""
         STORE_STATE_DIR=""
@@ -221,6 +227,7 @@
         cleanup() {
           ${pkgs.systemd}/bin/systemctl --user stop "$UNIT" 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --user stop "$AGENT_UNIT" 2>/dev/null || true
+          ${pkgs.systemd}/bin/systemctl --user stop "$INSTANCE_UNIT" 2>/dev/null || true
           if [ -n "$EGRESS_UNIT" ]; then
             ${pkgs.systemd}/bin/systemctl --user stop "$EGRESS_UNIT" 2>/dev/null || true
           fi
@@ -232,7 +239,7 @@
           if [ -n "$_EGRESS_PORTFILE" ]; then
             rm -f "$_EGRESS_PORTFILE" "$_EGRESS_PROXY_CFG"
           fi
-          for _s in "$SOCK" "$AGENT_SOCK"; do
+          for _s in "$SOCK" "$AGENT_SOCK" "$INSTANCE_SOCK"; do
             rm -f "$_s" "$_s.pid"
           done
           if [ -n "$STORE_IMG" ]; then
@@ -243,6 +250,13 @@
           fi
           if [ -n "$AGENT_TEMP" ]; then
             rm -rf "$AGENT_TEMP"
+          fi
+          # This launch's env (API keys included), CA certs and DB snapshot go
+          # with it. The parent is shared by concurrent launches, so it goes
+          # only once the last of them has.
+          if [ -n "$INSTANCE_DIR" ]; then
+            rm -rf "$INSTANCE_DIR"
+            rmdir "$INSTANCE_ROOT" 2>/dev/null || true
           fi
         }
         trap cleanup EXIT
@@ -284,6 +298,25 @@
         if [ ! -d "$AGENT_DIR" ]; then
           mkdir -p "$AGENT_DIR"
         fi
+
+        # --- Instance dir (per-launch, exported read-only) ---
+        # What this launch hands the guest — the env file, EXTRA_CA_CERTS, the
+        # nix DB snapshot — is written here, not into $AGENT_DIR. Agent home is
+        # shared by every launch on the project and writable from the guest, so
+        # files there were overwritten by the next launch and could be rewritten
+        # by any of them, while root services in the guest act on all three.
+        # This dir is this launch's alone: a host-only sibling of agent home
+        # like the CRI image, served by its own --readonly virtiofsd, and
+        # removed on exit. Owner-only, since the env file carries API keys.
+        INSTANCE_ROOT="$AGENT_DIR-instance"
+        mkdir -p "$INSTANCE_ROOT"
+        chmod 700 "$INSTANCE_ROOT"
+        INSTANCE_DIR="$INSTANCE_ROOT/$ID"
+        mkdir -m 700 "$INSTANCE_DIR"
+        INSTANCE_ENV="$INSTANCE_DIR/env"
+        # Earlier launchers left these in agent home — the env file with API
+        # keys in it. Nothing reads them there any more.
+        rm -rf "$AGENT_DIR/.microvm-env" "$AGENT_DIR/.microvm-ca-certs" "$AGENT_DIR/.microvm-nix-db.sqlite"
 
         # --- Egress setup (EGRESS_POLICY != open) ---
         if [ "$EGRESS_POLICY" != "open" ]; then
@@ -530,23 +563,23 @@ EOF
         done
         [ -S "$AGENT_SOCK" ] || { echo "error: agent-home virtiofsd socket did not appear"; exit 1; }
 
-        # Write host env vars for the VM
-        echo "DIRENV_ALLOW=''${DIRENV_ALLOW:-0}" > "$AGENT_DIR/.microvm-env"
-        # The file carries API keys and whatever EXTRA_ENV forwards, and it
-        # lives in the agent data dir on the host — keep it owner-only.
-        chmod 600 "$AGENT_DIR/.microvm-env"
-        echo "ENABLE_CRI=''${ENABLE_CRI:-}" >> "$AGENT_DIR/.microvm-env"
+        # Write host env vars for the VM, into this launch's instance dir
+        echo "DIRENV_ALLOW=''${DIRENV_ALLOW:-0}" > "$INSTANCE_ENV"
+        # The file carries API keys and whatever EXTRA_ENV forwards — keep it
+        # owner-only. In the guest it shows as the agent's, still 0600.
+        chmod 600 "$INSTANCE_ENV"
+        echo "ENABLE_CRI=''${ENABLE_CRI:-}" >> "$INSTANCE_ENV"
         # %q produces a single-quoted/escaped form that survives `source`
         # so values like AGENTS_ARGS='-p "hi there"' round-trip intact.
-        printf 'AGENTS_ARGS=%q\n' "''${AGENTS_ARGS:-}" >> "$AGENT_DIR/.microvm-env"
+        printf 'AGENTS_ARGS=%q\n' "''${AGENTS_ARGS:-}" >> "$INSTANCE_ENV"
         # The guest reads the policy for the seal service and the ssh wrapper
         # (modules/egress.nix); it is informational in the open modes.
-        echo "EGRESS_POLICY=$EGRESS_POLICY" >> "$AGENT_DIR/.microvm-env"
+        echo "EGRESS_POLICY=$EGRESS_POLICY" >> "$INSTANCE_ENV"
         # Read by modules/workspace.nix: read-only binds over workspace paths
         # whose contents execute on the host later, and the ephemeral /work
         # overlay.
-        echo "WORKSPACE_GUARD=''${WORKSPACE_GUARD:-}" >> "$AGENT_DIR/.microvm-env"
-        echo "WORKSPACE_MODE=$WORKSPACE_MODE" >> "$AGENT_DIR/.microvm-env"
+        echo "WORKSPACE_GUARD=''${WORKSPACE_GUARD:-}" >> "$INSTANCE_ENV"
+        echo "WORKSPACE_MODE=$WORKSPACE_MODE" >> "$INSTANCE_ENV"
         case "$EGRESS_POLICY" in
           shadow|enforce)
             # The key never enters the guest: the agent talks plaintext HTTP
@@ -554,17 +587,17 @@ EOF
             # host), and the proxy originates genuine TLS upstream. NO_PROXY
             # keeps the BASE_URL requests origin-form instead of routing
             # them through the CONNECT handler.
-            echo "EGRESS_PROXY_ADDR=${egressGuestAddr}" >> "$AGENT_DIR/.microvm-env"
+            echo "EGRESS_PROXY_ADDR=${egressGuestAddr}" >> "$INSTANCE_ENV"
             # Negative control for the guest's seal self-test (microvm-policy
             # v0.3.0+): slirp maps 10.0.2.2 to the host's loopback, so without
             # restrict=on this reaches the proxy's host listener. Sealed, it
             # must be refused; with no probe the self-test fails inconclusive.
-            echo "EGRESS_SEAL_PROBE=10.0.2.2:$_EGRESS_PORT" >> "$AGENT_DIR/.microvm-env"
+            echo "EGRESS_SEAL_PROBE=10.0.2.2:$_EGRESS_PORT" >> "$INSTANCE_ENV"
             for _v in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
-              echo "$_v=http://${egressGuestAddr}" >> "$AGENT_DIR/.microvm-env"
+              echo "$_v=http://${egressGuestAddr}" >> "$INSTANCE_ENV"
             done
-            echo "NO_PROXY=${lib.head (lib.splitString ":" egressGuestAddr)},localhost,127.0.0.1" >> "$AGENT_DIR/.microvm-env"
-            echo "no_proxy=${lib.head (lib.splitString ":" egressGuestAddr)},localhost,127.0.0.1" >> "$AGENT_DIR/.microvm-env"
+            echo "NO_PROXY=${lib.head (lib.splitString ":" egressGuestAddr)},localhost,127.0.0.1" >> "$INSTANCE_ENV"
+            echo "no_proxy=${lib.head (lib.splitString ":" egressGuestAddr)},localhost,127.0.0.1" >> "$INSTANCE_ENV"
             ${egressGuestEnv}
             ;;
           *)
@@ -607,15 +640,14 @@ EOF
             fi
             # %q again: the guest sources this file, so an unescaped value
             # would be executable code, not data.
-            printf '%s=%q\n' "$_name" "$_value" >> "$AGENT_DIR/.microvm-env"
+            printf '%s=%q\n' "$_name" "$_value" >> "$INSTANCE_ENV"
             _CONTRACT_EXTRA="$_CONTRACT_EXTRA $_name"
           done
         fi
 
-        # Copy custom CA certificates into agent home for the VM
+        # Copy custom CA certificates into the instance dir for the VM
         if [ -n "''${EXTRA_CA_CERTS:-}" ]; then
-          _CA_DIR="$AGENT_DIR/.microvm-ca-certs"
-          rm -rf "$_CA_DIR"
+          _CA_DIR="$INSTANCE_DIR/ca-certs"
           mkdir -p "$_CA_DIR"
           if [ -f "$EXTRA_CA_CERTS" ]; then
             cp "$EXTRA_CA_CERTS" "$_CA_DIR/"
@@ -733,11 +765,35 @@ EOF
             ".timeout 30000" \
             "BEGIN;" \
             "SELECT count(*) FROM sqlite_master;" \
-            ".backup '$AGENT_DIR/.microvm-nix-db.sqlite'" \
+            ".backup '$INSTANCE_DIR/nix-db.sqlite'" \
             "COMMIT;" \
             > /dev/null \
-            || rm -f "$AGENT_DIR/.microvm-nix-db.sqlite"
+            || rm -f "$INSTANCE_DIR/nix-db.sqlite"
         fi
+
+        # --- Instance share (virtiofsd, read-only) ---
+        # Started last, once everything above has written its file: from here
+        # on the dir is only read. --readonly is the guarantee — virtiofsd
+        # refuses every write, so root in the guest cannot change these files
+        # whatever it remounts. --translate-uid shows them as the agent's, so
+        # the 0600 env file stays readable by the agent and by no one else.
+        ${pkgs.systemd}/bin/systemd-run --user --unit="$INSTANCE_UNIT" --collect \
+          -- ${virtiofsd}/bin/virtiofsd \
+            --socket-path="$INSTANCE_SOCK" \
+            --shared-dir="$INSTANCE_DIR" \
+            --readonly \
+            --sandbox=namespace \
+            --uid-map ":0:$(id -u):1:" \
+            --gid-map ":0:$(id -g):1:" \
+            --translate-uid "map:1000:0:1" \
+            --translate-gid "map:1000:0:1" \
+            --socket-group="$(id -gn)"
+
+        for i in $(seq 1 50); do
+          [ -S "$INSTANCE_SOCK" ] && break
+          sleep 0.1
+        done
+        [ -S "$INSTANCE_SOCK" ] || { echo "error: instance virtiofsd socket did not appear"; exit 1; }
 
         # $CRI_IMG is used as sed replacement text below. Escape characters
         # that are special on the replacement side (\, &) and the | delimiter
@@ -755,6 +811,8 @@ EOF
           -e "s|${hostname}-virtiofs-work.sock|$SOCK|g"
           -e "s|/tmp/${hostname}-home|$AGENT_DIR|g"
           -e "s|${hostname}-virtiofs-agent-home.sock|$AGENT_SOCK|g"
+          -e "s|/tmp/${hostname}-instance|$INSTANCE_DIR|g"
+          -e "s|${hostname}-virtiofs-instance.sock|$INSTANCE_SOCK|g"
           # CRI storage volume image: microvm.nix emits the relative path
           # "cri-storage.img" in both the createVolumesScript and the QEMU
           # -drive; point both at the persistent image in agent home.
@@ -1002,8 +1060,13 @@ EOF
               microvm.nixosModules.microvm
               ./modules/base.nix
               ./modules/cri.nix
-              # microvmPolicy.* defaults match this repo's layout.
               microvm-policy.nixosModules.default
+              # Its other defaults match this repo's layout; its state file is
+              # the launcher's env file, on the read-only instance share.
+              ({ config, ... }: {
+                microvmPolicy.stateFile = "${config.claude-vm.instance.dir}/env";
+                microvmPolicy.stateAfter = [ config.claude-vm.instance.mountUnit ];
+              })
               { claude-vm.cri.enable = true; }
               flavor.agentModule
             ];
@@ -1099,6 +1162,11 @@ EOF
         };
         env-file-data-only = import ./tests/env-file-data-only.nix {
           inherit pkgs lib;
+          config = self.nixosConfigurations."claude-${system}".config;
+        };
+        instance-share = import ./tests/instance-share.nix {
+          inherit pkgs lib;
+          runner = self.packages.${system}.claude;
           config = self.nixosConfigurations."claude-${system}".config;
         };
         seed-idempotence = import ./tests/seed-idempotence.nix {
