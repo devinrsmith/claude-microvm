@@ -568,6 +568,8 @@ endpoint-specific is baked into the image.
 
 > Values are written to `.microvm-env` (mode `600`) in the agent home directory
 > and are readable by anything running in the guest, including the agent itself.
+> The agent can also write the file, so the guest's root services never source
+> it: they read only the keys they need, as plain text.
 
 ## Customization
 
