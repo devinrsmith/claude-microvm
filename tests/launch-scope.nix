@@ -7,9 +7,11 @@
 # terminal, real systemd-run, real virtiofsd. Only QEMU is replaced, by a
 # stand-in that stays up — as a VM would — until told to exit.
 #
-#   - the launcher and its "VM" run in the launch scope, in
-#     claude_microvm.slice, and the three virtiofsd units are bound to it and
+#   - the launcher and its "VM" run in the launch scope, which with the three
+#     virtiofsd units makes up the launch's own slice, nested in
+#     claude_microvm.slice; the units are bound to the scope, described, and
 #     tagged in the journal with the launch's ID;
+#   - stopping that slice stops the whole launch, and its cleanup runs;
 #   - killing the launcher with SIGKILL, which no trap sees, leaves the daemons
 #     running while the VM does, and systemd stops them when it exits;
 #   - `systemctl --user stop <scope>` stops the VM, and the launcher's cleanup
@@ -71,6 +73,10 @@ pkgs.testers.runNixOSTest {
         inst = json.loads(machine.succeed(f"cat {path}"))
         return inst, path.rsplit("/", 1)[0], machine.succeed(f"cat /tmp/qemu{n}.pid").strip()
 
+    def units_named(pattern):
+        out = machine.succeed(user(f"list-units --no-legend --plain --all '{pattern}'"))
+        return {line.split()[0] for line in out.splitlines() if line.strip()}
+
     def daemons(inst):
         return [inst["units"][k] for k in ("work", "agentHome", "guest")]
 
@@ -80,12 +86,16 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_unit("user@1000.service")
 
-    with subtest("the launch runs in its scope, and its daemons are bound to it"):
+    with subtest("the launch runs in its scope, in its own slice, and its daemons are bound to it"):
         inst, d, qemu = launch(1)
-        scope = inst["units"]["scope"]
-        assert scope, f"no scope recorded: {inst}"
+        scope, slice, lid = inst["units"]["scope"], inst["slice"], inst["id"]
+        assert scope == f"claude_microvm-{lid}.scope", f"scope is {scope!r}"
+        assert slice == f"claude_microvm-{lid}.slice", f"slice is {slice!r}"
         machine.succeed(user(f"is-active --quiet {scope}"))
-        assert prop(scope, "Slice") == "claude_microvm.slice"
+        assert prop(scope, "Slice") == slice
+        # Nested by its name: the launch's slice is in claude_microvm.slice.
+        assert prop(slice, "Slice") == "claude_microvm.slice", f"{slice} is in {prop(slice, 'Slice')}"
+        assert prop(scope, "Description") == f"claude microvm {lid}: the VM, for {inst['work']}", prop(scope, "Description")
         cgroup = prop(scope, "ControlGroup")
         for pid in (inst["pid"], qemu):
             got = machine.succeed(f"cut -d: -f3 /proc/{pid}/cgroup").strip()
@@ -94,7 +104,12 @@ pkgs.testers.runNixOSTest {
             machine.succeed(user(f"is-active --quiet {u}"))
             assert scope in prop(u, "BindsTo").split(), f"{u} is not bound to {scope}"
             assert scope in prop(u, "After").split(), f"{u} is not ordered after {scope}"
-            assert prop(u, "Slice") == "claude_microvm.slice"
+            assert prop(u, "Slice") == slice, f"{u} is in {prop(u, 'Slice')}, not {slice}"
+            desc = prop(u, "Description")
+            assert desc.startswith(f"claude microvm {lid}: ") and desc.endswith(f", for {inst['work']}"), f"{u}: {desc!r}"
+        # The slice holds the launch and nothing else: the scope and its daemons.
+        members = units_named(f"claude_microvm-{lid}*")
+        assert members == {scope, slice} | {f"{u}.service" for u in daemons(inst)}, members
         machine.succeed(f"journalctl MICROVM_ID={inst['id']} -o cat | grep -q .")
 
     with subtest("SIGKILL of the launcher: the daemons outlive it while the VM runs, then stop"):
@@ -119,12 +134,22 @@ pkgs.testers.runNixOSTest {
         for u in daemons(inst):
             wait_stopped(u)
 
+    with subtest("stopping the launch's slice stops all of it, and the launcher still cleans up"):
+        inst, d, qemu = launch(4)
+        machine.succeed(user(f"stop {inst['slice']}"))
+        machine.wait_until_fails(f"test -e {d}", timeout=timedelta(seconds=60))
+        for u in daemons(inst) + [inst["units"]["scope"]]:
+            wait_stopped(u)
+
     with subtest("a VM that exits normally leaves nothing"):
         inst, d, qemu = launch(3)
         machine.succeed("touch /tmp/exit3")
         machine.wait_until_fails(f"test -e {d}", timeout=timedelta(seconds=60))
         for u in daemons(inst) + [inst["units"]["scope"]]:
             wait_stopped(u)
+        # The slice itself stays, empty, until logout; nothing is left in it.
+        left = units_named(f"claude_microvm-{inst['id']}*")
+        assert left <= {inst["slice"]}, left
         machine.succeed(f"test ! -e {ROOT}")
         machine.fail("grep -i error /tmp/launch3.log")
   '';

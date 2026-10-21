@@ -238,32 +238,39 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
     ok "instance.json names exactly the units the launch started; egress is null under EGRESS_POLICY=open"
   else bad "instance.json units: named [$named], started [$started]"; fi
 
-  # The launch scope: the launcher re-ran itself in it, and every daemon is in
-  # the slice, bound to the scope, and tagged with the launch's ID.
-  SC=$(jq -r .units.scope $J); LID=$(jq -r .id $J)
-  if [ "$SC" = "$(jq -r .vmId $J)-$LID.scope" ] && [ "$(basename $D)" = "$(jq -r .vmId $J)-$LID" ] \
-     && grep -qx -- --scope $L/$SC.opts && grep -qx -- --slice=claude_microvm.slice $L/$SC.opts; then
-    ok "the launcher runs in its own scope, $SC, in claude_microvm.slice, under the instance dir's ID"
-  else bad "no launch scope: scope '$SC', id '$LID', dir $(basename $D)"; cat $L/$SC.opts >&2 2>/dev/null || true; fi
+  # The launch's units: one stem, claude_microvm-<id>, in a slice of their own
+  # nested in claude_microvm.slice. The launcher re-ran itself in the scope,
+  # and every daemon is in the slice, bound to the scope, tagged with the
+  # launch's ID, and described.
+  SC=$(jq -r .units.scope $J); LID=$(jq -r .id $J); SL=claude_microvm-$LID.slice
+  if [ "$SC" = "claude_microvm-$LID.scope" ] && [ "$(jq -r .slice $J)" = $SL ] && [ "$(basename $D)" = "$(jq -r .vmId $J)-$LID" ] \
+     && grep -qx -- --scope $L/$SC.opts && grep -qx -- --slice=$SL $L/$SC.opts \
+     && grep -qx -- "--description=claude microvm $LID: the VM, for $WORK_DIR" $L/$SC.opts; then
+    ok "the launcher runs in its own scope, $SC, in its own slice, $SL, under the instance dir's ID"
+  else bad "no launch scope: scope '$SC', slice '$(jq -r .slice $J)', id '$LID', dir $(basename $D)"; cat $L/$SC.opts >&2 2>/dev/null || true; fi
+  names=$(jq -r '[.units.work, .units.agentHome, .units.guest] | join(" ")' $J)
+  [ "$names" = "claude_microvm-$LID-work claude_microvm-$LID-agent-home claude_microvm-$LID-guest" ] \
+    && ok "the daemons are named claude_microvm-<id>-{work,agent-home,guest}" || bad "daemon names: $names"
   props_ok=1
   for u in $(jq -r '.units | to_entries[] | select(.key != "scope" and .value != null) | .value' $J); do
-    for want in --slice=claude_microvm.slice "BindsTo=$SC" "After=$SC" "LogExtraFields=MICROVM_ID=$LID"; do
+    for want in --slice=$SL "BindsTo=$SC" "After=$SC" "LogExtraFields=MICROVM_ID=$LID"; do
       grep -qx -- "$want" $L/$u.opts || { props_ok=0; echo "  $u lacks $want" >&2; }
     done
+    grep -qE -- "^--description=claude microvm $LID: .+, for $WORK_DIR$" $L/$u.opts || { props_ok=0; echo "  $u lacks a description" >&2; }
   done
-  [ $props_ok = 1 ] && ok "every daemon is in the slice, bound to the scope (BindsTo= + After=), and tagged MICROVM_ID" \
-    || bad "daemons are not all bound to the launch scope"
+  [ $props_ok = 1 ] && ok "every daemon is in the launch's slice, bound to its scope (BindsTo= + After=), tagged MICROVM_ID, and described" \
+    || bad "daemons are not all in the launch's slice and bound to its scope"
 
   # Where no scope can be had, the launch still runs — unbound, and saying so.
   launch unscoped STUB_NO_SCOPE=1
-  U=$TMPDIR/unscoped; UJ=$U/instance.json
+  U=$TMPDIR/unscoped; UJ=$U/instance.json; USL=claude_microvm-$(jq -r .id $UJ 2>/dev/null).slice
   if [ "$(cat $U/rc)" = 0 ] && [ -e $U/started ] && grep -q 'cannot run this launch in a systemd --user scope' $U/out \
      && [ "$(jq -r .units.scope $UJ)" = null ] && [ -z "$(find $U -name '*.scope.opts')" ]; then
     ok "without a scope to be had, the launch still runs, warns, and records no scope"
   else bad "unscoped launch: rc $(cat $U/rc)"; cat $U/out >&2; fi
-  if ! grep -q '^BindsTo=\|^After=' $U/*.opts && grep -qx -- --slice=claude_microvm.slice $(ls $U/*-guest.opts); then
-    ok "...and its daemons start unbound (BindsTo= a missing scope would stop them starting), still in the slice"
-  else bad "unscoped launch's daemons are bound to a scope that does not exist"; fi
+  if ! grep -q '^BindsTo=\|^After=' $U/*.opts && grep -qx -- --slice=$USL $(ls $U/*-guest.opts); then
+    ok "...and its daemons start unbound (BindsTo= a missing scope would stop them starting), still in their slice"
+  else bad "unscoped launch's daemons are bound to a scope that does not exist, or not in $USL"; fi
   gone || bad "unscoped launch left: $(left)"
 
   gone && ok "on exit the instance dir goes, the root with the last launch, and no sockets are left" || bad "left behind: $(left)"

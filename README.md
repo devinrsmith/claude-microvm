@@ -230,7 +230,7 @@ target architecture, not just the host's).
 
 ### virtiofs (host directory sharing)
 
-The host `WORK_DIR` is shared into the VM at `/work` using virtiofs. A `virtiofsd` daemon is started automatically as a systemd user service (`<basename>-<agent>-vm-virtiofsd-<id>`, where `<basename>` is the project directory name and `<id>` is a random instance UUID) — no root or sudo needed. It runs unprivileged in a user namespace with UID/GID translation so files created inside the VM are owned by your host user.
+The host `WORK_DIR` is shared into the VM at `/work` using virtiofs. A `virtiofsd` daemon is started automatically as a systemd user service (`claude_microvm-<id>-work`, where `<id>` is the launch's random 12-hex-digit ID; see [Launch scope](#launch-scope)) — no root or sudo needed. It runs unprivileged in a user namespace with UID/GID translation so files created inside the VM are owned by your host user.
 
 Each work directory gets its own virtiofsd instance, so multiple VMs can run in parallel on different projects. Multiple VMs on the **same** project also work automatically — each launch gets a random instance ID with its own virtiofsd daemons and sockets.
 
@@ -353,17 +353,35 @@ The launcher refuses to start without a runtime dir (`XDG_RUNTIME_DIR`, or
 
 ### Launch scope
 
-Each launch runs in a transient systemd user scope,
-`<basename>-<agent>-vm-<id>.scope`, in `claude_microvm.slice`: the launcher
-and QEMU, so the VM's processes, memory and CPU are accounted together. Its
-daemons — the three virtiofsd instances, and the egress proxy or follower —
-are services in the same slice, bound to the scope:
+Each launch's systemd user units share one name, `claude_microvm-<id>`, and a
+slice of their own, nested in `claude_microvm.slice`:
+
+```
+claude_microvm.slice
+  claude_microvm-<id>.slice                 one launch
+    claude_microvm-<id>.scope               the launcher and QEMU
+    claude_microvm-<id>-work.service        virtiofsd for /work
+    claude_microvm-<id>-agent-home.service  virtiofsd for agent home
+    claude_microvm-<id>-guest.service       virtiofsd for the read-only guest share
+    claude_microvm-<id>-egress.service      the egress proxy or follower, when the policy runs one
+```
+
+The scope holds the VM's processes, and the slice the whole launch, so each
+is accounted together. The unit names carry only the ID — the slice does not
+namespace them, and the ID is what keeps two launches apart — and each unit's
+description says what it is and for which project, which is what
+`systemctl --user list-units` shows beside it:
 
 ```sh
-systemctl --user status claude_microvm.slice      # every running VM and its daemons
-systemctl --user stop <scope>                     # stop one VM; the launcher still cleans up
-journalctl MICROVM_ID=<id>                        # every daemon's log for one launch
+systemctl --user status claude_microvm.slice          # every running VM and its daemons
+systemctl --user status claude_microvm-<id>.slice     # one launch
+systemctl --user stop claude_microvm-<id>.slice       # stop one VM; the launcher still cleans up
+journalctl MICROVM_ID=<id>                            # every daemon's log for one launch
 ```
+
+A launch's slice is made on first use and, once empty, stays until logout —
+whether a launch is still running is for `instance.json` and its lock to say,
+not the slice.
 
 The binding is what keeps a killed launcher from leaving its daemons behind.
 The launcher's cleanup stops them on any normal exit, `systemctl stop`, or a

@@ -106,25 +106,44 @@
         [ -z "$WORK_BASENAME" ] && WORK_BASENAME="root"
         VM_ID="$WORK_BASENAME-${hostname}"
 
-        # --- Launch scope ---
-        # The launcher re-runs itself, once, inside a transient systemd --user
-        # scope, $VM_ID-$ID.scope, in claude_microvm.slice (an underscore: a
-        # dash in a slice name is a level of nesting). QEMU runs as its child,
-        # so the scope holds the VM's processes for as long as any of them
-        # lives, and every daemon below is bound to it (BindsTo= + After=): if
+        # --- Launch scope and slice ---
+        # Every systemd --user unit of a launch shares one stem,
+        # claude_microvm-<id>, and sits in its own slice of that name, nested
+        # in claude_microvm.slice (a dash in a slice name is a level of
+        # nesting, hence the underscore before it):
+        #
+        #   claude_microvm.slice
+        #     claude_microvm-<id>.slice           this launch
+        #       claude_microvm-<id>.scope         the launcher, and QEMU
+        #       claude_microvm-<id>-work.service        virtiofsd for /work
+        #       claude_microvm-<id>-agent-home.service  virtiofsd for agent home
+        #       claude_microvm-<id>-guest.service       virtiofsd for the guest share
+        #       claude_microvm-<id>-egress.service      EGRESS_POLICY=alert|shadow|enforce
+        #
+        # Unit names are global to the user manager, so the slice does not
+        # namespace them: the ID keeps them apart, and each unit's description
+        # says what it is and for which project. `systemctl --user status
+        # claude_microvm-<id>.slice` shows a launch and `systemctl --user stop`
+        # on it stops one. The slice is made on first use and, once empty,
+        # stays until logout — instance.json and its lock, not the slice, say
+        # whether a launch is live.
+        #
+        # The launcher re-runs itself, once, in the scope. QEMU runs as its
+        # child, so the scope holds the VM's processes for as long as any of
+        # them lives, and every daemon is bound to it (BindsTo= + After=): if
         # the launcher is killed outright, the trap that would stop them never
         # runs, but systemd stops them as soon as the scope empties — and not
         # before, since QEMU outliving the launcher means the VM still runs.
-        # `systemctl --user stop <scope>` stops the whole launch. systemd-run
-        # --scope runs the command in this same process, so the terminal, the
-        # environment and the PID carry over; the ID is passed along so the
-        # scope and the instance dir share it.
+        # systemd-run --scope runs the command in this same process, so the
+        # terminal, the environment and the PID carry over; the ID is passed
+        # along so the units and the instance dir share it.
         #
-        # Not every caller can have one: moving a process into the user
+        # Not every caller can have a scope: moving a process into the user
         # manager's cgroups works from a login session or from under the user
         # manager, but not from, say, a system service. A probe scope finds out
-        # first; without one the launch goes ahead as before, unbound, and says
-        # so.
+        # first; without one the launch goes ahead unbound, and says so. Its
+        # daemons still get the slice.
+        _DESCRIBE=${lib.escapeShellArg "${agentName} microvm"}
         if [ -z "''${_MICROVM_SCOPE:-}" ]; then
           # The launch ID: 12 hex digits, 48 random bits — unique enough among
           # one user's launches (and mkdir refuses a clash rather than sharing
@@ -134,11 +153,11 @@
           _MICROVM_ID="$(cat /proc/sys/kernel/random/uuid)"
           _MICROVM_ID="''${_MICROVM_ID//-/}"; _MICROVM_ID="''${_MICROVM_ID:0:12}"
           if _SCOPE_ERR=$(${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect -- true 2>&1); then
-            _MICROVM_SCOPE="$VM_ID-$_MICROVM_ID.scope"
+            _MICROVM_SCOPE="claude_microvm-$_MICROVM_ID.scope"
             export _MICROVM_ID _MICROVM_SCOPE
             exec ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect \
-              --unit="$_MICROVM_SCOPE" --slice=claude_microvm.slice \
-              --description=${lib.escapeShellArg "${agentName} microvm"}": $WORK" \
+              --unit="$_MICROVM_SCOPE" --slice="claude_microvm-$_MICROVM_ID.slice" \
+              --description="$_DESCRIBE $_MICROVM_ID: the VM, for $WORK" \
               -- "$0" "$@"
           fi
           echo "warning: cannot run this launch in a systemd --user scope: ''${_SCOPE_ERR:-systemd-run failed}" >&2
@@ -149,14 +168,18 @@
           exit 1
         fi
         ID="$_MICROVM_ID"
-        # Every daemon this launch starts: in the slice, tagged so
+        UNIT_STEM="claude_microvm-$ID"
+        SLICE="$UNIT_STEM.slice"
+        # Every daemon this launch starts: in its slice, tagged so
         # `journalctl MICROVM_ID=<id>` finds all of their logs, and bound to
         # the scope when there is one — BindsTo= a unit that does not exist
-        # would stop them starting at all.
-        _UNIT_PROPS=(--slice=claude_microvm.slice -p "LogExtraFields=MICROVM_ID=$ID")
+        # would stop them starting at all. Each call adds its own
+        # --description, from describe().
+        _UNIT_PROPS=(--slice="$SLICE" -p "LogExtraFields=MICROVM_ID=$ID")
         if [ -n "$_MICROVM_SCOPE" ]; then
           _UNIT_PROPS+=(-p "BindsTo=$_MICROVM_SCOPE" -p "After=$_MICROVM_SCOPE")
         fi
+        describe () { printf -- '--description=%s %s: %s, for %s' "$_DESCRIBE" "$ID" "$1" "$WORK"; }
 
         VM_MEM="''${VM_MEM:-${toString defaultMem}}"
         VM_VCPU="''${VM_VCPU:-${toString defaultVcpu}}"
@@ -289,11 +312,11 @@
         QMP_SOCK="$_INSTANCE_PATH/qmp.sock"
 
         SOCK="$_INSTANCE_PATH/work.sock"
-        UNIT="$VM_ID-virtiofsd-$ID"
+        UNIT="$UNIT_STEM-work"
         AGENT_SOCK="$_INSTANCE_PATH/agent-home.sock"
-        AGENT_UNIT="$VM_ID-virtiofsd-$ID-agent-home"
+        AGENT_UNIT="$UNIT_STEM-agent-home"
         GUEST_SOCK="$_INSTANCE_PATH/guest.sock"
-        GUEST_UNIT="$VM_ID-virtiofsd-$ID-guest"
+        GUEST_UNIT="$UNIT_STEM-guest"
         # sun_path is 108 bytes, NUL included. The longest default is
         # /run/user/<uid>/claude-microvm/<12-char basename>-<agent>-vm-<id>/agent-home.sock,
         # 81 bytes for a 4-digit uid, leaving room for longer uids and runtime
@@ -378,7 +401,7 @@
         # virtiofsd runs unprivileged in a user namespace (--sandbox=namespace).
         # --uid-map / --gid-map: map host user to namespace root (single-entry, no /etc/subuid needed)
         # --translate-uid / --translate-gid: map guest uid/gid 1000 to namespace uid/gid 0 (= host user)
-        ${pkgs.systemd}/bin/systemd-run --user --unit="$UNIT" --collect "''${_UNIT_PROPS[@]}" \
+        ${pkgs.systemd}/bin/systemd-run --user --unit="$UNIT" --collect "''${_UNIT_PROPS[@]}" "$(describe "virtiofsd for /work")" \
           -- ${virtiofsd}/bin/virtiofsd \
             --socket-path="$SOCK" \
             --shared-dir="$WORK" \
@@ -415,20 +438,20 @@
         # for the policies that run something on the host (the alert follower,
         # the shadow/enforce proxy), and is null otherwise.
         _EGRESS_UNIT_NAME=""
-        case "$EGRESS_POLICY" in alert|shadow|enforce) _EGRESS_UNIT_NAME="$VM_ID-egress-$ID" ;; esac
+        case "$EGRESS_POLICY" in alert|shadow|enforce) _EGRESS_UNIT_NAME="$UNIT_STEM-egress" ;; esac
         ${pkgs.jq}/bin/jq -n \
           --argjson pid "$$" --arg flavor ${lib.escapeShellArg agentName} \
           --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg work "$WORK" --arg agentHome "$AGENT_DIR" --arg guest "$INSTANCE_GUEST" \
           --arg egressPolicy "$EGRESS_POLICY" \
           --arg qmp "$QMP_SOCK" --arg workSock "$SOCK" --arg agentHomeSock "$AGENT_SOCK" --arg guestSock "$GUEST_SOCK" \
-          --arg scopeUnit "$_MICROVM_SCOPE" \
+          --arg scopeUnit "$_MICROVM_SCOPE" --arg slice "$SLICE" \
           --arg workUnit "$UNIT" --arg agentHomeUnit "$AGENT_UNIT" --arg guestUnit "$GUEST_UNIT" --arg egressUnit "$_EGRESS_UNIT_NAME" \
           '{version: 1, pid: $pid, flavor: $flavor, vmId: $vmId, id: $id, started: $started,
             work: $work, agentHome: $agentHome, guest: $guest, guestMount: "/run/microvm",
             egressPolicy: $egressPolicy,
             sockets: {qmp: $qmp, work: $workSock, agentHome: $agentHomeSock, guest: $guestSock},
-            slice: "claude_microvm.slice",
+            slice: $slice,
             units: {scope: (if $scopeUnit == "" then null else $scopeUnit end), work: $workUnit, agentHome: $agentHomeUnit, guest: $guestUnit,
                     egress: (if $egressUnit == "" then null else $egressUnit end)}}' \
           > "$INSTANCE_DIR/instance.json"
@@ -542,7 +565,7 @@ EOF
             EGRESS_UNIT="$_EGRESS_UNIT_NAME"
             _EGRESS_SETENV=()
             ${egressProxySetenv}
-            ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect "''${_UNIT_PROPS[@]}" \
+            ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect "''${_UNIT_PROPS[@]}" "$(describe "egress proxy, EGRESS_POLICY=$EGRESS_POLICY")" \
               ''${_EGRESS_SETENV[@]+"''${_EGRESS_SETENV[@]}"} \
               -- ${egressProxy}/bin/egress-proxy -config "$_EGRESS_PROXY_CFG"
             for i in $(seq 1 50); do
@@ -670,7 +693,7 @@ EOF
         rm -f "$STORE_IMG"
         ''}
 
-        ${pkgs.systemd}/bin/systemd-run --user --unit="$AGENT_UNIT" --collect "''${_UNIT_PROPS[@]}" \
+        ${pkgs.systemd}/bin/systemd-run --user --unit="$AGENT_UNIT" --collect "''${_UNIT_PROPS[@]}" "$(describe "virtiofsd for agent home")" \
           -- ${virtiofsd}/bin/virtiofsd \
             --socket-path="$AGENT_SOCK" \
             --shared-dir="$AGENT_DIR" \
@@ -905,7 +928,7 @@ EOF
         # remounts. --translate-uid shows them as the agent's, so the 0600 env
         # file stays readable by the agent and by no one else.
         chmod -R +t "$INSTANCE_GUEST"
-        ${pkgs.systemd}/bin/systemd-run --user --unit="$GUEST_UNIT" --collect "''${_UNIT_PROPS[@]}" \
+        ${pkgs.systemd}/bin/systemd-run --user --unit="$GUEST_UNIT" --collect "''${_UNIT_PROPS[@]}" "$(describe "virtiofsd for the read-only guest share")" \
           -- ${virtiofsd}/bin/virtiofsd \
             --socket-path="$GUEST_SOCK" \
             --shared-dir="$INSTANCE_GUEST" \
@@ -1011,7 +1034,7 @@ EOF
             )
             if [ "$EGRESS_POLICY" = "alert" ]; then
               EGRESS_UNIT="$_EGRESS_UNIT_NAME"
-              ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect "''${_UNIT_PROPS[@]}" \
+              ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect "''${_UNIT_PROPS[@]}" "$(describe "egress alert follower")" \
                 -- ${egressReport}/bin/egress-report follow "$EGRESS_PCAP" \
                    --allowlist "$_EGRESS_ALLOWLIST_FILE" --alerts "$EGRESS_ALERTS"
             fi
