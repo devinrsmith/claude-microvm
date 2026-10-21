@@ -252,6 +252,24 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   [ -n "$q1" ] && [ "$q1" != "$q2" ] && ok "...and its own QMP socket" || bad "concurrent launches share a QMP socket: $q1"
   gone && ok "after both exit, nothing is left" || bad "left after both: $(left)"
 
+  # --- the longest default paths ---------------------------------------------------
+  # A 12-character project name, the most WORK_BASENAME keeps, under a runtime
+  # dir as long as /run/user/<7-digit uid>. With a UUID for the launch ID and
+  # virtiofs-* socket names, a 4-digit uid was already past the limit.
+  RT=$TMPDIR/r; while [ "''${#RT}" -lt 17 ]; do RT="$RT"x; done
+  mkdir -p $RT $TMPDIR/longprojectname
+  launch longest XDG_RUNTIME_DIR=$RT WORK_DIR=$TMPDIR/longprojectname
+  LJ=$TMPDIR/longest/instance.json
+  # `|| true`: a refused launch writes no instance.json, and the build shell
+  # runs with -e and pipefail — that must be a FAIL below, not a crash here.
+  longest=$({ jq -r '.sockets[]' $LJ 2>/dev/null || true; } | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
+  if [ "$(cat $TMPDIR/longest/rc)" = 0 ] && [ -e $TMPDIR/longest/started ] && [ "$longest" -le 107 ] \
+     && [ "$(jq -r .vmId $LJ)" = longprojectn-claude-vm ]; then
+    ok "a 12-character project under a 7-digit uid's runtime dir launches: longest socket path $longest bytes, of 107"
+  else bad "longest default paths: rc $(cat $TMPDIR/longest/rc), longest socket $longest"; cat $TMPDIR/longest/out >&2; fi
+  [[ "$(jq -r .id $LJ)" =~ ^[0-9a-f]{12}$ ]] && ok "the launch ID is 12 hex digits" || bad "launch ID is '$(jq -r .id $LJ)'"
+  [ ! -e $RT/claude-microvm ] || bad "longest-path launch left: $(ls -R $RT)"
+
   # --- failure paths ----------------------------------------------------------------
   launch crash QEMU_RC=3
   [ "$(cat $TMPDIR/crash/rc)" = 3 ] && gone \

@@ -295,13 +295,13 @@ Each launch keeps what is its alone in one directory under the runtime dir:
 
 ```
 $XDG_RUNTIME_DIR/claude-microvm/          one root for every flavor
-  <basename>-<agent>-vm-<id>/             this launch; owner-only
+  <basename>-<agent>-vm-<id>/             this launch; owner-only; <id> is 12 hex digits
     guest/                                exported read-only at /run/microvm
       env  ca-certs/  nix-db.sqlite
     instance.json                         what this launch is (see below)
     lock                                  held while the launch runs
     qmp.sock                              QEMU's QMP control socket
-    virtiofs-work.sock  virtiofs-agent-home.sock  virtiofs-guest.sock
+    work.sock  agent-home.sock  guest.sock    the three virtiofsd sockets
     egress.port  egress.json              EGRESS_POLICY=shadow|enforce
 ```
 

@@ -106,7 +106,12 @@
         CRI_STORAGE_SIZE="''${CRI_STORAGE_SIZE:-${toString defaultCriSize}}"
         ${lib.optionalString storeDiskBacked ''VM_STORE_SIZE="''${VM_STORE_SIZE:-${toString defaultStoreSize}}"''}
         RUNTIME="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-        ID="$(cat /proc/sys/kernel/random/uuid)"
+        # 12 hex digits, 48 random bits: unique enough among one user's
+        # launches (and mkdir below refuses a clash rather than sharing a dir),
+        # and short enough that the instance dir's socket paths fit; a UUID
+        # pushed them past the limit. The first 12 hex digits of a v4 UUID are
+        # all random.
+        ID="$(cat /proc/sys/kernel/random/uuid)"; ID="''${ID//-/}"; ID="''${ID:0:12}"
 
         # --- Egress policy (monitor / alert) ---
         # Passive observation of the guest's traffic via a QEMU filter-dump
@@ -213,7 +218,7 @@
         #       instance.json                    what this is, for tools that list VMs
         #       lock                             held for the launch's lifetime
         #       qmp.sock                         QEMU's control socket
-        #       virtiofs-{work,agent-home,guest}.sock
+        #       work.sock  agent-home.sock  guest.sock   the three virtiofsd
         #       egress.port  egress.json         EGRESS_POLICY=shadow|enforce
         #
         # The runtime dir rather than beside agent home: it is tmpfs, so the
@@ -237,15 +242,18 @@
         INSTANCE_ENV="$INSTANCE_GUEST/env"
         QMP_SOCK="$_INSTANCE_PATH/qmp.sock"
 
-        SOCK="$_INSTANCE_PATH/virtiofs-work.sock"
+        SOCK="$_INSTANCE_PATH/work.sock"
         UNIT="$VM_ID-virtiofsd-$ID"
-        AGENT_SOCK="$_INSTANCE_PATH/virtiofs-agent-home.sock"
+        AGENT_SOCK="$_INSTANCE_PATH/agent-home.sock"
         AGENT_UNIT="$VM_ID-virtiofsd-$ID-agent-home"
-        GUEST_SOCK="$_INSTANCE_PATH/virtiofs-guest.sock"
+        GUEST_SOCK="$_INSTANCE_PATH/guest.sock"
         GUEST_UNIT="$VM_ID-virtiofsd-$ID-guest"
-        # sun_path is 108 bytes, NUL included. A runtime dir long enough to
-        # break this would otherwise surface as QEMU or virtiofsd failing to
-        # bind, after the daemons before it had started.
+        # sun_path is 108 bytes, NUL included. The longest default is
+        # /run/user/<uid>/claude-microvm/<12-char basename>-<agent>-vm-<id>/agent-home.sock,
+        # 81 bytes for a 4-digit uid, leaving room for longer uids and runtime
+        # dirs; tests/instance-share.nix launches with that worst case. A
+        # runtime dir long enough to break it would otherwise surface as QEMU
+        # or virtiofsd failing to bind, after the daemons before it had started.
         for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK"; do
           if [ "''${#_s}" -gt 107 ]; then
             echo "error: socket path too long (''${#_s} bytes, the limit is 107): $_s" >&2
