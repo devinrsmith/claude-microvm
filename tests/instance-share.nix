@@ -222,6 +222,14 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
      && [ "$(jq -r .sockets.guest $J)" = "$S" ]; then
     ok "instance.json describes the launch: pid, flavor, work, agent home, guest dir and mount, sockets"
   else bad "instance.json is off:"; cat $J >&2; fi
+  # The units it names are the ones the launcher started (the stub records each
+  # under its unit name), and no egress unit runs under the default policy.
+  started=$(cd $L && ls *.args | sed 's/\.args$//' | sort)
+  named=$(jq -r '.units | to_entries[] | select(.value != null) | .value' $J | sort)
+  if [ "$started" = "$named" ] && [ "$(jq -r .units.egress $J)" = null ] && [ "$(jq -r .egressPolicy $J)" = open ] \
+     && [ "$(jq -r .units.guest $J)" = "$(basename $A .args)" ]; then
+    ok "instance.json names exactly the units the launch started; egress is null under EGRESS_POLICY=open"
+  else bad "instance.json units: named [$named], started [$started]"; fi
 
   gone && ok "on exit the instance dir goes, the root with the last launch, and no sockets are left" || bad "left behind: $(left)"
   grep -qx "$(basename $A .args)" $L/stopped && ok "on exit the guest-share virtiofsd is stopped" || bad "guest-share virtiofsd not stopped"

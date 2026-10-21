@@ -331,8 +331,13 @@ VMs — read it rather than parsing the directory name:
 jq . "$XDG_RUNTIME_DIR"/claude-microvm/*/instance.json
 # {"version":1,"pid":…,"flavor":"claude","vmId":…,"id":…,"started":…,
 #  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
-#  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…}}
+#  "egressPolicy":"open",
+#  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…},
+#  "units":{"work":…,"agentHome":…,"guest":…,"egress":null}}
 ```
+
+`units` are the `systemctl --user` units the launch runs; `egress` is set only
+under `EGRESS_POLICY=alert|shadow|enforce`, which run something on the host.
 
 The QMP socket gives full control of the VM, e.g.
 `echo '{"execute":"qmp_capabilities"}{"execute":"query-status"}' | socat - UNIX:<qmp.sock>`.

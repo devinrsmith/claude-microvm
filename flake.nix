@@ -351,15 +351,25 @@
         fi
 
         # What this instance is, for anything that lists running VMs: read
-        # this rather than parsing the directory name.
+        # this rather than parsing the directory name. `units` are the
+        # systemd --user units this launch starts; the egress one exists only
+        # for the policies that run something on the host (the alert follower,
+        # the shadow/enforce proxy), and is null otherwise.
+        _EGRESS_UNIT_NAME=""
+        case "$EGRESS_POLICY" in alert|shadow|enforce) _EGRESS_UNIT_NAME="$VM_ID-egress-$ID" ;; esac
         ${pkgs.jq}/bin/jq -n \
           --argjson pid "$$" --arg flavor ${lib.escapeShellArg agentName} \
           --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg work "$WORK" --arg agentHome "$AGENT_DIR" --arg guest "$INSTANCE_GUEST" \
+          --arg egressPolicy "$EGRESS_POLICY" \
           --arg qmp "$QMP_SOCK" --arg workSock "$SOCK" --arg agentHomeSock "$AGENT_SOCK" --arg guestSock "$GUEST_SOCK" \
+          --arg workUnit "$UNIT" --arg agentHomeUnit "$AGENT_UNIT" --arg guestUnit "$GUEST_UNIT" --arg egressUnit "$_EGRESS_UNIT_NAME" \
           '{version: 1, pid: $pid, flavor: $flavor, vmId: $vmId, id: $id, started: $started,
             work: $work, agentHome: $agentHome, guest: $guest, guestMount: "/run/microvm",
-            sockets: {qmp: $qmp, work: $workSock, agentHome: $agentHomeSock, guest: $guestSock}}' \
+            egressPolicy: $egressPolicy,
+            sockets: {qmp: $qmp, work: $workSock, agentHome: $agentHomeSock, guest: $guestSock},
+            units: {work: $workUnit, agentHome: $agentHomeUnit, guest: $guestUnit,
+                    egress: (if $egressUnit == "" then null else $egressUnit end)}}' \
           > "$INSTANCE_DIR/instance.json"
         chmod 1600 "$INSTANCE_DIR/instance.json"
 
@@ -468,7 +478,7 @@
 EOF
             chmod 600 "$_EGRESS_PROXY_CFG"
             # END egress-proxy-config
-            EGRESS_UNIT="$VM_ID-egress-$ID"
+            EGRESS_UNIT="$_EGRESS_UNIT_NAME"
             _EGRESS_SETENV=()
             ${egressProxySetenv}
             ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect \
@@ -939,7 +949,7 @@ EOF
               -e "s|-netdev 'user,id=usernet'|-netdev 'user,id=usernet' -object 'filter-dump,id=egress-dump,netdev=usernet,file=$_EGRESS_PCAP_ESC,maxlen=''${EGRESS_PCAP_MAXLEN:-4096}'|"
             )
             if [ "$EGRESS_POLICY" = "alert" ]; then
-              EGRESS_UNIT="$VM_ID-egress-$ID"
+              EGRESS_UNIT="$_EGRESS_UNIT_NAME"
               ${pkgs.systemd}/bin/systemd-run --user --unit="$EGRESS_UNIT" --collect \
                 -- ${egressReport}/bin/egress-report follow "$EGRESS_PCAP" \
                    --allowlist "$_EGRESS_ALLOWLIST_FILE" --alerts "$EGRESS_ALERTS"
