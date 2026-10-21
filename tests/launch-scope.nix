@@ -58,12 +58,16 @@ pkgs.testers.runNixOSTest {
         return machine.succeed(user(f"show -p {name} --value {unit}")).strip()
 
     def launch(n):
+        # A project name long enough that the launcher keeps only its first
+        # 12 characters, so the instance dir's socket paths under the real
+        # /run/user/1000 are as long as they get by default.
+        project = f"{n}-a-long-project-name"
         machine.succeed(alice(
-            f"mkdir -p ~/w{n} && cd ~/w{n} && "
+            f"mkdir -p ~/{project} && cd ~/{project} && "
             f"FAKE_QEMU=${fakeQemu} FAKE_QEMU_PID=/tmp/qemu{n}.pid FAKE_QEMU_EXIT=/tmp/exit{n} NO_PAUSE=1 "
             f"setsid -f ${launcher} </dev/null >/tmp/launch{n}.log 2>&1"))
         machine.wait_until_succeeds(f"test -s /tmp/qemu{n}.pid", timeout=timedelta(seconds=120))
-        path = machine.succeed(f"ls -d {ROOT}/w{n}-claude-vm-*/instance.json").strip()
+        path = machine.succeed(f"ls -d {ROOT}/{project[:12]}-claude-vm-*/instance.json").strip()
         inst = json.loads(machine.succeed(f"cat {path}"))
         return inst, path.rsplit("/", 1)[0], machine.succeed(f"cat /tmp/qemu{n}.pid").strip()
 

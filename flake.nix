@@ -126,7 +126,13 @@
         # first; without one the launch goes ahead as before, unbound, and says
         # so.
         if [ -z "''${_MICROVM_SCOPE:-}" ]; then
+          # The launch ID: 12 hex digits, 48 random bits — unique enough among
+          # one user's launches (and mkdir refuses a clash rather than sharing
+          # an instance dir), and short enough that its socket paths fit; a
+          # whole UUID pushed them past the limit. The first 12 hex digits of a
+          # v4 UUID are all random.
           _MICROVM_ID="$(cat /proc/sys/kernel/random/uuid)"
+          _MICROVM_ID="''${_MICROVM_ID//-/}"; _MICROVM_ID="''${_MICROVM_ID:0:12}"
           if _SCOPE_ERR=$(${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect -- true 2>&1); then
             _MICROVM_SCOPE="$VM_ID-$_MICROVM_ID.scope"
             export _MICROVM_ID _MICROVM_SCOPE
@@ -138,8 +144,8 @@
           echo "warning: cannot run this launch in a systemd --user scope: ''${_SCOPE_ERR:-systemd-run failed}" >&2
           echo "         continuing without one — if the launcher is killed outright, nothing stops its daemons" >&2
           _MICROVM_SCOPE=""
-        elif ! [[ "''${_MICROVM_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-          echo "error: _MICROVM_SCOPE is set but _MICROVM_ID is not a UUID; unset both (they are the launcher's own)" >&2
+        elif ! [[ "''${_MICROVM_ID:-}" =~ ^[0-9a-f]{12}$ ]]; then
+          echo "error: _MICROVM_SCOPE is set but _MICROVM_ID is not a launch ID (12 hex digits); unset both (they are the launcher's own)" >&2
           exit 1
         fi
         ID="$_MICROVM_ID"
@@ -258,7 +264,7 @@
         #       instance.json                    what this is, for tools that list VMs
         #       lock                             held for the launch's lifetime
         #       qmp.sock                         QEMU's control socket
-        #       virtiofs-{work,agent-home,guest}.sock
+        #       work.sock  agent-home.sock  guest.sock   the three virtiofsd
         #       egress.port  egress.json         EGRESS_POLICY=shadow|enforce
         #
         # The runtime dir rather than beside agent home: it is tmpfs, so the
@@ -282,15 +288,18 @@
         INSTANCE_ENV="$INSTANCE_GUEST/env"
         QMP_SOCK="$_INSTANCE_PATH/qmp.sock"
 
-        SOCK="$_INSTANCE_PATH/virtiofs-work.sock"
+        SOCK="$_INSTANCE_PATH/work.sock"
         UNIT="$VM_ID-virtiofsd-$ID"
-        AGENT_SOCK="$_INSTANCE_PATH/virtiofs-agent-home.sock"
+        AGENT_SOCK="$_INSTANCE_PATH/agent-home.sock"
         AGENT_UNIT="$VM_ID-virtiofsd-$ID-agent-home"
-        GUEST_SOCK="$_INSTANCE_PATH/virtiofs-guest.sock"
+        GUEST_SOCK="$_INSTANCE_PATH/guest.sock"
         GUEST_UNIT="$VM_ID-virtiofsd-$ID-guest"
-        # sun_path is 108 bytes, NUL included. A runtime dir long enough to
-        # break this would otherwise surface as QEMU or virtiofsd failing to
-        # bind, after the daemons before it had started.
+        # sun_path is 108 bytes, NUL included. The longest default is
+        # /run/user/<uid>/claude-microvm/<12-char basename>-<agent>-vm-<id>/agent-home.sock,
+        # 81 bytes for a 4-digit uid, leaving room for longer uids and runtime
+        # dirs; tests/instance-share.nix launches with that worst case. A
+        # runtime dir long enough to break it would otherwise surface as QEMU
+        # or virtiofsd failing to bind, after the daemons before it had started.
         for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK"; do
           if [ "''${#_s}" -gt 107 ]; then
             echo "error: socket path too long (''${#_s} bytes, the limit is 107): $_s" >&2
