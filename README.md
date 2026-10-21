@@ -293,9 +293,10 @@ This mounts the host directory at `/home/agent` inside the guest via a second vi
 
 What a launch hands its guest is not kept in agent home: that directory is
 shared by every launch on the project and writable from each guest. Instead
-each launch writes it to a directory of its own,
-`$AGENT_HOME-instance/<id>/` (owner-only, beside agent home rather than inside
-it), and exports that read-only at `/run/microvm`:
+each launch writes it to a directory of its own, `$AGENT_HOME-instance/<id>/`
+(owner-only, beside agent home rather than inside it), and exports its `guest/`
+subdirectory read-only at `/run/microvm`. Only `guest/` reaches the guest;
+anything else the launch keeps for itself sits beside it. The guest sees:
 
 | file | what |
 |---|---|
@@ -766,7 +767,7 @@ and what you can do about each:
 |---|---|---|
 | `$AGENT_HOME-cri/cri-storage.img` | persistent, ~133 MiB minimum, grows to the cap | not created unless `ENABLE_CRI` is set; `CRI_STORAGE_SIZE=0` also detaches an existing one |
 | `$AGENT_HOME-store/nix-store-overlay.img` | per-run, ~69 MiB, deleted on exit along with its directory | build-time only: `claude-vm.store.diskBacked = false` |
-| `$AGENT_HOME-instance/<id>/` (env file with API keys, CA certs, nix DB snapshot ~97 MiB) | per-run, deleted on exit, and its parent once no launch is using it | — |
+| `$AGENT_HOME-instance/<id>/` (in `guest/`: env file with API keys, CA certs, nix DB snapshot ~97 MiB) | per-run, deleted on exit, and its parent once no launch is using it | — |
 | `$AGENT_HOME` (agent state, dev-shell cache) | persistent | point `AGENT_HOME` somewhere disposable |
 
 The CRI disk used to be created on every launch whether or not `ENABLE_CRI` was

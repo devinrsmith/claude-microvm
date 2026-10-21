@@ -8,10 +8,11 @@
 #     everything that reads these files — its own services, the agent's shell,
 #     microvm-policy — reads them there, after the mount, and nowhere else;
 #   - the built launcher, run for real with systemd-run, systemctl and QEMU
-#     stubbed: the files land in the instance dir and not in agent home, its
-#     virtiofsd is --readonly and is what QEMU is pointed at, two concurrent
-#     launches on one agent home keep their own files, and the dir is gone
-#     after a normal exit, a failed VM, and a refusal before the VM starts.
+#     stubbed: the files land in the instance dir's guest/ — the only part
+#     exported — and not in agent home, its virtiofsd is --readonly and is
+#     what QEMU is pointed at, two concurrent launches on one agent home keep
+#     their own files, and the dir is gone after a normal exit, a failed VM,
+#     and a refusal before the VM starts.
 #
 # What this cannot show is virtiofsd's --readonly holding against a guest: that
 # needs a guest kernel on the other end of the socket. The flag is checked on
@@ -126,7 +127,7 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   #!${pkgs.bash}/bin/bash
   cat "$1" > "$LOG/qemu.sh"
   dir=$(sed -n 's/^--shared-dir=//p' "$LOG"/*-instance.args)
-  echo "$dir" > "$LOG/instance-dir"
+  echo "$dir" > "$LOG/exported"
   cp -a "$dir" "$LOG/boot"
   touch "$LOG/started"
   if [ -n "''${HOLD:-}" ]; then
@@ -156,13 +157,15 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   mkdir $AGENT_HOME/.microvm-ca-certs; touch $AGENT_HOME/.microvm-nix-db.sqlite
 
   launch one EXTRA_ENV=WHO=one EXTRA_CA_CERTS=$TMPDIR/fixture.pem ANTHROPIC_API_KEY=sk-test
-  L=$TMPDIR/one; D=$(cat $L/instance-dir 2>/dev/null)
+  # G is what the instance virtiofsd exports; D, the instance dir around it.
+  L=$TMPDIR/one; G=$(cat $L/exported 2>/dev/null); D=$(dirname "$G")
   if [ "$(cat $L/rc)" = 0 ] && [ -e $L/started ]; then ok "a launch runs to the VM and exits cleanly"
   else bad "the launch did not reach the VM (rc $(cat $L/rc))"; cat $L/out >&2; fi
-  case "$D" in
-    $AGENT_HOME-instance/*) ok "the instance dir is a host-only sibling of agent home, per launch" ;;
-    *) bad "instance dir is '$D', not under $AGENT_HOME-instance/" ;;
+  case "$G" in
+    $AGENT_HOME-instance/*/guest) ok "the instance dir is a host-only sibling of agent home, per launch, and only its guest/ is exported" ;;
+    *) bad "exported '$G', not $AGENT_HOME-instance/<id>/guest" ;;
   esac
+  [ "$(stat -c %a $L/boot)" = 700 ] && ok "guest/ is owner-only" || bad "guest/ is $(stat -c %a $L/boot)"
   grep -qx 'WHO=one' $L/boot/env && grep -qx 'ANTHROPIC_API_KEY=sk-test' $L/boot/env \
     && ok "the guest finds this launch's env on the share" || { bad "env not on the share"; cat $L/boot/env >&2; }
   [ "$(stat -c %a $L/boot/env)" = 600 ] && ok "the env file is 0600" || bad "env file is $(stat -c %a $L/boot/env)"
@@ -174,9 +177,9 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   else bad "agent home still has: $(ls -A $AGENT_HOME)"; fi
 
   A=$(ls $L/*-instance.args 2>/dev/null)
-  if [ -n "$A" ] && grep -qx -- '--readonly' $A && grep -qx -- "--shared-dir=$D" $A; then
-    ok "the instance dir is served by its own virtiofsd, --readonly"
-  else bad "no --readonly virtiofsd serving $D"; cat $A >&2 2>/dev/null || true; fi
+  if [ -n "$A" ] && grep -qx -- '--readonly' $A && grep -qx -- "--shared-dir=$G" $A; then
+    ok "guest/ is served by its own virtiofsd, --readonly"
+  else bad "no --readonly virtiofsd serving $G"; cat $A >&2 2>/dev/null || true; fi
   grep -qx -- '--translate-uid' $A && grep -qx -- 'map:1000:0:1' $A \
     && ok "...which shows the files as the agent's" || bad "instance virtiofsd does not translate uids"
   H=$(ls $L/*-agent-home.args)

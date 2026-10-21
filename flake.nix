@@ -213,6 +213,7 @@
         INSTANCE_UNIT="$VM_ID-virtiofsd-$ID-instance"
         INSTANCE_ROOT=""
         INSTANCE_DIR=""
+        INSTANCE_GUEST=""
         AGENT_TEMP=""
         STORE_IMG=""
         STORE_STATE_DIR=""
@@ -251,9 +252,10 @@
           if [ -n "$AGENT_TEMP" ]; then
             rm -rf "$AGENT_TEMP"
           fi
-          # This launch's env (API keys included), CA certs and DB snapshot go
-          # with it. The parent is shared by concurrent launches, so it goes
-          # only once the last of them has.
+          # This launch's instance dir goes with it: guest/ — env (API keys
+          # included), CA certs, DB snapshot — and anything kept beside it. The
+          # parent is shared by concurrent launches, so it goes only once the
+          # last of them has.
           if [ -n "$INSTANCE_DIR" ]; then
             rm -rf "$INSTANCE_DIR"
             rmdir "$INSTANCE_ROOT" 2>/dev/null || true
@@ -299,21 +301,29 @@
           mkdir -p "$AGENT_DIR"
         fi
 
-        # --- Instance dir (per-launch, exported read-only) ---
+        # --- Instance dir (per-launch; guest/ exported read-only) ---
         # What this launch hands the guest — the env file, EXTRA_CA_CERTS, the
         # nix DB snapshot — is written here, not into $AGENT_DIR. Agent home is
         # shared by every launch on the project and writable from the guest, so
         # files there were overwritten by the next launch and could be rewritten
         # by any of them, while root services in the guest act on all three.
         # This dir is this launch's alone: a host-only sibling of agent home
-        # like the CRI image, served by its own --readonly virtiofsd, and
-        # removed on exit. Owner-only, since the env file carries API keys.
+        # like the CRI image, removed on exit. Owner-only, since the env file
+        # carries API keys.
+        #
+        #   $INSTANCE_DIR/          host-only, per launch
+        #     guest/                its own --readonly virtiofsd → /run/microvm
+        #
+        # Only guest/ is exported, so whatever else this launch keeps for
+        # itself sits beside it and never reaches the guest.
         INSTANCE_ROOT="$AGENT_DIR-instance"
         mkdir -p "$INSTANCE_ROOT"
         chmod 700 "$INSTANCE_ROOT"
         INSTANCE_DIR="$INSTANCE_ROOT/$ID"
         mkdir -m 700 "$INSTANCE_DIR"
-        INSTANCE_ENV="$INSTANCE_DIR/env"
+        INSTANCE_GUEST="$INSTANCE_DIR/guest"
+        mkdir -m 700 "$INSTANCE_GUEST"
+        INSTANCE_ENV="$INSTANCE_GUEST/env"
         # Earlier launchers left these in agent home — the env file with API
         # keys in it. Nothing reads them there any more.
         rm -rf "$AGENT_DIR/.microvm-env" "$AGENT_DIR/.microvm-ca-certs" "$AGENT_DIR/.microvm-nix-db.sqlite"
@@ -647,7 +657,7 @@ EOF
 
         # Copy custom CA certificates into the instance dir for the VM
         if [ -n "''${EXTRA_CA_CERTS:-}" ]; then
-          _CA_DIR="$INSTANCE_DIR/ca-certs"
+          _CA_DIR="$INSTANCE_GUEST/ca-certs"
           mkdir -p "$_CA_DIR"
           if [ -f "$EXTRA_CA_CERTS" ]; then
             cp "$EXTRA_CA_CERTS" "$_CA_DIR/"
@@ -765,22 +775,23 @@ EOF
             ".timeout 30000" \
             "BEGIN;" \
             "SELECT count(*) FROM sqlite_master;" \
-            ".backup '$INSTANCE_DIR/nix-db.sqlite'" \
+            ".backup '$INSTANCE_GUEST/nix-db.sqlite'" \
             "COMMIT;" \
             > /dev/null \
-            || rm -f "$INSTANCE_DIR/nix-db.sqlite"
+            || rm -f "$INSTANCE_GUEST/nix-db.sqlite"
         fi
 
         # --- Instance share (virtiofsd, read-only) ---
-        # Started last, once everything above has written its file: from here
-        # on the dir is only read. --readonly is the guarantee — virtiofsd
-        # refuses every write, so root in the guest cannot change these files
-        # whatever it remounts. --translate-uid shows them as the agent's, so
-        # the 0600 env file stays readable by the agent and by no one else.
+        # Exports guest/ only, never the instance dir around it. Started last,
+        # once everything above has written its file: from here on guest/ is
+        # only read. --readonly is the guarantee — virtiofsd refuses every
+        # write, so root in the guest cannot change these files whatever it
+        # remounts. --translate-uid shows them as the agent's, so the 0600 env
+        # file stays readable by the agent and by no one else.
         ${pkgs.systemd}/bin/systemd-run --user --unit="$INSTANCE_UNIT" --collect \
           -- ${virtiofsd}/bin/virtiofsd \
             --socket-path="$INSTANCE_SOCK" \
-            --shared-dir="$INSTANCE_DIR" \
+            --shared-dir="$INSTANCE_GUEST" \
             --readonly \
             --sandbox=namespace \
             --uid-map ":0:$(id -u):1:" \
@@ -811,7 +822,7 @@ EOF
           -e "s|${hostname}-virtiofs-work.sock|$SOCK|g"
           -e "s|/tmp/${hostname}-home|$AGENT_DIR|g"
           -e "s|${hostname}-virtiofs-agent-home.sock|$AGENT_SOCK|g"
-          -e "s|/tmp/${hostname}-instance|$INSTANCE_DIR|g"
+          -e "s|/tmp/${hostname}-instance|$INSTANCE_GUEST|g"
           -e "s|${hostname}-virtiofs-instance.sock|$INSTANCE_SOCK|g"
           # CRI storage volume image: microvm.nix emits the relative path
           # "cri-storage.img" in both the createVolumesScript and the QEMU
