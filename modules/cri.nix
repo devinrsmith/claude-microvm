@@ -2,6 +2,14 @@
 let
   cfg = config.claude-vm.cri;
 
+  # The root services below read .microvm-env with this rather than `source`:
+  # the agent can write the file. See scripts/microvm-env-get.sh.
+  microvmEnvGet = pkgs.writeShellApplication {
+    name = "microvm-env-get";
+    text = builtins.readFile ../scripts/microvm-env-get.sh;
+  };
+  envGet = "${microvmEnvGet}/bin/microvm-env-get";
+
   registryMirrors = pkgs.writeShellApplication {
     name = "registry-mirrors";
     runtimeInputs = with pkgs; [ coreutils ];
@@ -349,12 +357,18 @@ CRIEOF
       };
       script = ''
         ENV_FILE="/home/agent/.microvm-env"
-        [ -f "$ENV_FILE" ] && source "$ENV_FILE"
-        case "''${EGRESS_POLICY:-}" in shadow|enforce) ;; *) exit 0 ;; esac
+        policy="$(${envGet} "$ENV_FILE" EGRESS_POLICY)"
+        case "$policy" in shadow|enforce) ;; *) exit 0 ;; esac
 
-        addr="''${EGRESS_PROXY_ADDR:-}"
+        addr="$(${envGet} "$ENV_FILE" EGRESS_PROXY_ADDR)"
         if [ -z "$addr" ]; then
           echo "cri-proxy-env: EGRESS_POLICY is sealed but EGRESS_PROXY_ADDR is unset — not writing proxy env" >&2
+          exit 0
+        fi
+        # It becomes a line in the daemons' environment, so it must be the
+        # host:port the launcher wrote and nothing more.
+        if ! [[ "$addr" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]]; then
+          echo "cri-proxy-env: EGRESS_PROXY_ADDR is not host:port ('$addr') — not writing proxy env" >&2
           exit 0
         fi
         # NO_PROXY keeps loopback and the CNI/slirp ranges off the proxy;
@@ -402,9 +416,7 @@ CRIEOF
       };
       script = ''
         ENV_FILE="/home/agent/.microvm-env"
-        [ -f "$ENV_FILE" ] && source "$ENV_FILE"
-
-        ENABLE_CRI="''${ENABLE_CRI:-}"
+        ENABLE_CRI="$(${envGet} "$ENV_FILE" ENABLE_CRI)"
         [ -z "$ENABLE_CRI" ] && exit 0
 
         IFS=',' read -ra RUNTIMES <<< "$ENABLE_CRI"

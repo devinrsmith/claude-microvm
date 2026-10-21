@@ -1124,6 +1124,10 @@ EOF
           inherit pkgs lib;
           config = self.nixosConfigurations."claude-${system}".config;
         };
+        env-file-data-only = import ./tests/env-file-data-only.nix {
+          inherit pkgs lib;
+          config = self.nixosConfigurations."claude-${system}".config;
+        };
         seed-idempotence = import ./tests/seed-idempotence.nix {
           inherit pkgs lib;
           config = self.nixosConfigurations."claude-${system}".config;
