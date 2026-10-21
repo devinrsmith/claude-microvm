@@ -12,7 +12,7 @@ let
 
   registryMirrors = pkgs.writeShellApplication {
     name = "registry-mirrors";
-    runtimeInputs = with pkgs; [ coreutils ];
+    runtimeInputs = with pkgs; [ coreutils microvmEnvGet ];
     text = builtins.readFile ../scripts/registry-mirrors.sh;
   };
 in

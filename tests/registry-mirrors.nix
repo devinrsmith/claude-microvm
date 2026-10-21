@@ -12,9 +12,13 @@
 { pkgs, lib, runner, config }:
 
 let
+  envGet = pkgs.writeShellApplication {
+    name = "microvm-env-get";
+    text = builtins.readFile ../scripts/microvm-env-get.sh;
+  };
   mirrors = pkgs.writeShellApplication {
     name = "registry-mirrors";
-    runtimeInputs = with pkgs; [ coreutils ];
+    runtimeInputs = with pkgs; [ coreutils envGet ];
     text = builtins.readFile ../scripts/registry-mirrors.sh;
   };
 
@@ -24,6 +28,13 @@ let
   etc = config.environment.etc;
 
   structural = [
+    {
+      # The env file is guest-writable and this runs as root.
+      name = "the boot script reads the env file as data, never sources it";
+      ok = let s = builtins.readFile ../scripts/registry-mirrors.sh; in
+        !lib.any (p: lib.hasInfix p s) [ ''source "$env_file"'' ''. "$env_file"'' ]
+        && lib.hasInfix ''microvm-env-get "$env_file" REGISTRY_MIRRORS'' s;
+    }
     {
       name = "cri-registry-mirrors runs before every container daemon";
       ok = lib.all (d: lib.elem d svc.before) daemons;
@@ -72,6 +83,13 @@ pkgs.runCommand "registry-mirrors" { } ''
       bad "REGISTRY_MIRRORS='$v' failed, but not with the validation message:"; cat launch.err >&2
     fi
   done
+  if REGISTRY_MIRRORS='docker.io=http://h,ghcr.io=http://g,docker.io=http://g' WORK_DIR=$TMPDIR/w "$script" >/dev/null 2>launch.err; then
+    bad "a registry listed twice was accepted"
+  elif grep -q "REGISTRY_MIRRORS lists docker.io more than once" launch.err; then
+    ok "the launcher refuses a registry listed twice"
+  else
+    bad "a registry listed twice failed, but not with the duplicate message:"; cat launch.err >&2
+  fi
   # A good value gets past validation; the launch then fails for want of a
   # host, which is not what is under test.
   REGISTRY_MIRRORS='docker.io=http://10.0.2.2:5101,localhost:5000=https://m.example:8443/' \
@@ -88,6 +106,8 @@ pkgs.runCommand "registry-mirrors" { } ''
   fi
 
   # --- the boot script --------------------------------------------------------
+  # An env line as the launcher writes it: printf %q, which escapes the commas.
+  q () { printf '%s=%q' "$1" "$2"; }
   run () { # name env-file-content
     root="$TMPDIR/$1"; mkdir -p "$root"
     printf '%s\n' "$2" > "$root.env"
@@ -100,7 +120,7 @@ pkgs.runCommand "registry-mirrors" { } ''
   run unset 'ENABLE_CRI=docker'
   if [ -z "$(find "$TMPDIR/unset" -type f)" ]; then ok "unset writes nothing"; else bad "unset wrote files"; fi
 
-  run typical "REGISTRY_MIRRORS='docker.io=http://10.0.2.2:5101,ghcr.io=http://10.0.2.2:5102/,localhost:5000=https://m.example:8443'"
+  run typical "$(q REGISTRY_MIRRORS 'docker.io=http://10.0.2.2:5101,ghcr.io=http://10.0.2.2:5102/,localhost:5000=https://m.example:8443')"
   R=$TMPDIR/typical
   has $R/etc/containerd/certs.d/docker.io/hosts.toml 'server = "https://registry-1.docker.io"' "Docker Hub's API host is the containerd server"
   has $R/etc/containerd/certs.d/docker.io/hosts.toml '[host."http://10.0.2.2:5101"]' "docker.io gets its mirror"
@@ -118,13 +138,13 @@ pkgs.runCommand "registry-mirrors" { } ''
   has $R/run/cri-registry-mirrors.env 'DOCKERD_MIRROR_ARGS=--registry-mirror=http://10.0.2.2:5101' "dockerd mirrors Docker Hub"
   has $R.out 'mirroring docker.io ghcr.io localhost:5000' "says what it mirrored"
 
-  run nohub "REGISTRY_MIRRORS='ghcr.io=http://10.0.2.2:5102'"
+  run nohub "$(q REGISTRY_MIRRORS 'ghcr.io=http://10.0.2.2:5102')"
   if [ "$(cat $TMPDIR/nohub/run/cri-registry-mirrors.env)" = "DOCKERD_MIRROR_ARGS=" ]; then
     ok "without docker.io, dockerd gets no mirror"
   else bad "dockerd got a mirror with no docker.io entry"; fi
 
   for p in shadow enforce; do
-    run "sealed-$p" "REGISTRY_MIRRORS='docker.io=http://10.0.2.2:5101'
+    run "sealed-$p" "$(q REGISTRY_MIRRORS 'docker.io=http://10.0.2.2:5101')
 EGRESS_POLICY=$p"
     if [ -z "$(find "$TMPDIR/sealed-$p" -type f)" ] && grep -q "ignoring REGISTRY_MIRRORS" "$TMPDIR/sealed-$p.out"; then
       ok "EGRESS_POLICY=$p writes nothing, and says why"
@@ -133,7 +153,7 @@ EGRESS_POLICY=$p"
 
   # The env file is guest-writable: an entry that reaches here unvalidated must
   # not become a path outside the root, or a config line it was not meant to be.
-  run hostile "REGISTRY_MIRRORS='../../evil=http://h,docker.io=http://h/x\"y,a/b=http://h,ghcr.io=http://10.0.2.2:5102'"
+  run hostile "$(q REGISTRY_MIRRORS '../../evil=http://h,docker.io=http://h/x"y,a/b=http://h,ghcr.io=http://10.0.2.2:5102')"
   R=$TMPDIR/hostile
   if [ -z "$(find "$TMPDIR" -maxdepth 1 -name evil)" ] && [ ! -e "$R/etc/evil" ] && [ ! -e "$R/evil" ]; then
     ok "a ../ registry name writes nothing outside the hosts dir"
@@ -144,6 +164,31 @@ EGRESS_POLICY=$p"
   if [ "$(grep -c 'skipping malformed entry' "$R.out")" -eq 3 ]; then
     ok "each malformed entry is reported"
   else bad "malformed entries not all reported"; cat "$R.out" >&2; fi
+
+  # Nor may anything in the file run: the script is root, the file is not.
+  canary=$TMPDIR/canary
+  run code "touch $canary
+REGISTRY_MIRRORS=\$(touch $canary)docker.io=http://h
+EGRESS_POLICY=\`touch $canary\`
+REGISTRY_MIRRORS=ghcr.io=http://10.0.2.2:5102; touch $canary"
+  if [ ! -e $canary ]; then ok "nothing in the env file is run"; else bad "the boot script ran code from the env file"; fi
+  if [ -z "$(find $TMPDIR/code/etc/containerd -type f 2>/dev/null)" ]; then
+    ok "a hostile REGISTRY_MIRRORS line mirrors nothing"
+  else bad "a hostile REGISTRY_MIRRORS line was mirrored: $(find $TMPDIR/code -type f)"; fi
+
+  # A registry listed twice keeps its first mirror, the same in every runtime.
+  run dup "$(q REGISTRY_MIRRORS 'docker.io=http://10.0.2.2:5101,ghcr.io=http://10.0.2.2:5102,docker.io=http://10.0.2.2:5999')"
+  R=$TMPDIR/dup
+  has $R/etc/containerd/certs.d/docker.io/hosts.toml '[host."http://10.0.2.2:5101"]' "duplicate: containerd keeps the first mirror"
+  if ! grep -q 5999 $R/etc/containerd/certs.d/docker.io/hosts.toml $R/run/cri-registry-mirrors.env $R/etc/containers/registries.conf.d/50-registry-mirrors.conf; then
+    ok "duplicate: the later mirror is written nowhere"
+  else bad "duplicate: the later mirror was written"; fi
+  has $R/run/cri-registry-mirrors.env 'DOCKERD_MIRROR_ARGS=--registry-mirror=http://10.0.2.2:5101' "duplicate: dockerd keeps the first mirror"
+  if [ "$(grep -c 'prefix = "docker.io"' $R/etc/containers/registries.conf.d/50-registry-mirrors.conf)" -eq 1 ]; then
+    ok "duplicate: podman/CRI-O get one docker.io entry"
+  else bad "duplicate: podman/CRI-O got docker.io more than once"; fi
+  has $R.out "skipping duplicate entry 'docker.io=http://10.0.2.2:5999'" "duplicate: the skipped entry is reported"
+  has $R.out 'mirroring docker.io ghcr.io' "duplicate: the rest is still mirrored"
 
   [ "$fail" -eq 0 ] || exit 1
   touch $out
