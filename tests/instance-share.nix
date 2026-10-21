@@ -107,13 +107,20 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   export STUBS=$TMPDIR/stubs; mkdir -p $STUBS
   # systemd-run: record the daemon's arguments, and stand in for it with a
   # listener on its --socket-path, which is all the launcher waits for.
+  # Its own options go to <unit>.opts. With --scope it does what systemd-run
+  # does: runs the command in this same process.
   cat > $STUBS/systemd-run <<'EOF'
   #!${pkgs.bash}/bin/bash
-  unit=
+  unit= scope= opts=()
   while [ $# -gt 0 ]; do
-    case "$1" in --unit=*) unit="''${1#--unit=}" ;; --) shift; break ;; esac
-    shift
+    case "$1" in --unit=*) unit="''${1#--unit=}" ;; --scope) scope=1 ;; --) shift; break ;; esac
+    opts+=("$1"); shift
   done
+  if [ -n "$scope" ] && [ -n "''${STUB_NO_SCOPE:-}" ]; then
+    echo "Failed to start transient scope unit: Access denied" >&2; exit 1
+  fi
+  printf '%s\n' "''${opts[@]}" > "$LOG/$unit.opts"
+  [ -n "$scope" ] && exec "$@"
   printf '%s\n' "$@" > "$LOG/$unit.args"
   for a in "$@"; do case "$a" in --socket-path=*) sock="''${a#--socket-path=}" ;; esac; done
   ${pkgs.socat}/bin/socat UNIX-LISTEN:"$sock",fork /dev/null &
@@ -224,12 +231,40 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   else bad "instance.json is off:"; cat $J >&2; fi
   # The units it names are the ones the launcher started (the stub records each
   # under its unit name), and no egress unit runs under the default policy.
-  started=$(cd $L && ls *.args | sed 's/\.args$//' | sort)
+  started=$(cd $L && ls *.opts | sed 's/\.opts$//' | sort)
   named=$(jq -r '.units | to_entries[] | select(.value != null) | .value' $J | sort)
   if [ "$started" = "$named" ] && [ "$(jq -r .units.egress $J)" = null ] && [ "$(jq -r .egressPolicy $J)" = open ] \
      && [ "$(jq -r .units.guest $J)" = "$(basename $A .args)" ]; then
     ok "instance.json names exactly the units the launch started; egress is null under EGRESS_POLICY=open"
   else bad "instance.json units: named [$named], started [$started]"; fi
+
+  # The launch scope: the launcher re-ran itself in it, and every daemon is in
+  # the slice, bound to the scope, and tagged with the launch's ID.
+  SC=$(jq -r .units.scope $J); LID=$(jq -r .id $J)
+  if [ "$SC" = "$(jq -r .vmId $J)-$LID.scope" ] && [ "$(basename $D)" = "$(jq -r .vmId $J)-$LID" ] \
+     && grep -qx -- --scope $L/$SC.opts && grep -qx -- --slice=claude_microvm.slice $L/$SC.opts; then
+    ok "the launcher runs in its own scope, $SC, in claude_microvm.slice, under the instance dir's ID"
+  else bad "no launch scope: scope '$SC', id '$LID', dir $(basename $D)"; cat $L/$SC.opts >&2 2>/dev/null || true; fi
+  props_ok=1
+  for u in $(jq -r '.units | to_entries[] | select(.key != "scope" and .value != null) | .value' $J); do
+    for want in --slice=claude_microvm.slice "BindsTo=$SC" "After=$SC" "LogExtraFields=MICROVM_ID=$LID"; do
+      grep -qx -- "$want" $L/$u.opts || { props_ok=0; echo "  $u lacks $want" >&2; }
+    done
+  done
+  [ $props_ok = 1 ] && ok "every daemon is in the slice, bound to the scope (BindsTo= + After=), and tagged MICROVM_ID" \
+    || bad "daemons are not all bound to the launch scope"
+
+  # Where no scope can be had, the launch still runs — unbound, and saying so.
+  launch unscoped STUB_NO_SCOPE=1
+  U=$TMPDIR/unscoped; UJ=$U/instance.json
+  if [ "$(cat $U/rc)" = 0 ] && [ -e $U/started ] && grep -q 'cannot run this launch in a systemd --user scope' $U/out \
+     && [ "$(jq -r .units.scope $UJ)" = null ] && [ -z "$(find $U -name '*.scope.opts')" ]; then
+    ok "without a scope to be had, the launch still runs, warns, and records no scope"
+  else bad "unscoped launch: rc $(cat $U/rc)"; cat $U/out >&2; fi
+  if ! grep -q '^BindsTo=\|^After=' $U/*.opts && grep -qx -- --slice=claude_microvm.slice $(ls $U/*-guest.opts); then
+    ok "...and its daemons start unbound (BindsTo= a missing scope would stop them starting), still in the slice"
+  else bad "unscoped launch's daemons are bound to a scope that does not exist"; fi
+  gone || bad "unscoped launch left: $(left)"
 
   gone && ok "on exit the instance dir goes, the root with the last launch, and no sockets are left" || bad "left behind: $(left)"
   grep -qx "$(basename $A .args)" $L/stopped && ok "on exit the guest-share virtiofsd is stopped" || bad "guest-share virtiofsd not stopped"

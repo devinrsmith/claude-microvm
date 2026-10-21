@@ -333,11 +333,14 @@ jq . "$XDG_RUNTIME_DIR"/claude-microvm/*/instance.json
 #  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
 #  "egressPolicy":"open",
 #  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…},
-#  "units":{"work":…,"agentHome":…,"guest":…,"egress":null}}
+#  "slice":"claude_microvm.slice",
+#  "units":{"scope":…,"work":…,"agentHome":…,"guest":…,"egress":null}}
 ```
 
-`units` are the `systemctl --user` units the launch runs; `egress` is set only
-under `EGRESS_POLICY=alert|shadow|enforce`, which run something on the host.
+`units` are the `systemctl --user` units the launch runs (see
+[Launch scope](#launch-scope)); `egress` is set only under
+`EGRESS_POLICY=alert|shadow|enforce`, which run something on the host, and
+`scope` is null if the launch could not have one.
 
 The QMP socket gives full control of the VM, e.g.
 `echo '{"execute":"qmp_capabilities"}{"execute":"query-status"}' | socat - UNIX:<qmp.sock>`.
@@ -347,6 +350,32 @@ for a relative `claude-vm.sock`, so they do not work with this launcher.
 The launcher refuses to start without a runtime dir (`XDG_RUNTIME_DIR`, or
 `/run/user/<uid>`), or with one long enough to push a socket path past the
 107-byte limit.
+
+### Launch scope
+
+Each launch runs in a transient systemd user scope,
+`<basename>-<agent>-vm-<id>.scope`, in `claude_microvm.slice`: the launcher
+and QEMU, so the VM's processes, memory and CPU are accounted together. Its
+daemons — the three virtiofsd instances, and the egress proxy or follower —
+are services in the same slice, bound to the scope:
+
+```sh
+systemctl --user status claude_microvm.slice      # every running VM and its daemons
+systemctl --user stop <scope>                     # stop one VM; the launcher still cleans up
+journalctl MICROVM_ID=<id>                        # every daemon's log for one launch
+```
+
+The binding is what keeps a killed launcher from leaving its daemons behind.
+The launcher's cleanup stops them on any normal exit, `systemctl stop`, or a
+closed terminal, but nothing runs it on `SIGKILL` (or the OOM killer). systemd
+then stops the daemons itself once the scope empties — that is, once QEMU has
+exited too, since a VM that outlives its launcher still needs its shares. Its
+instance directory is left in the runtime dir in that case, and goes at logout
+or reboot.
+
+A caller that cannot have a user scope — one running outside both a login
+session and the user manager, such as a system service — gets a warning and
+a launch without one, as before: its daemons are then not bound to anything.
 
 ### Sandboxing
 
