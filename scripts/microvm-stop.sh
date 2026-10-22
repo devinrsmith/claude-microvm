@@ -7,11 +7,13 @@
 # Without an argument it stops the only running launch, and lists them if
 # there is more than one. `set -euo pipefail` comes from writeShellApplication.
 #
-# A launch's instance.json names its QMP socket, and its lock says whether it
-# is still running (see microvm-instances.sh). The power button is QMP's
-# system_powerdown. --force sends QMP's quit instead: QEMU exits at once, with
-# no shutdown in the guest — as `systemctl --user stop` on the launch's slice
-# does, but working for launches without a scope too.
+# A launch's QMP socket is always qmp.sock in its instance dir — taken from the
+# layout, not from instance.json, which only describes the launch and whose id
+# must match the dir's name — and its lock says whether it is still running
+# (see microvm-instances.sh). The power button is QMP's system_powerdown.
+# --force sends QMP's quit instead: QEMU exits at once, with no shutdown in the
+# guest — as `systemctl --user stop` on the launch's slice does, but working for
+# launches without a scope too.
 #
 # Exit status: 0 stopped (or was not running), 1 not found or unreachable,
 # 2 usage, 3 still running after the timeout.
@@ -53,7 +55,7 @@ if [ -z "$target" ]; then
     *)
       echo "microvm-stop: ${#live[@]} launches are running; name one:" >&2
       for d in "${live[@]}"; do
-        printf '  %s  %s\n' "$(jq -r .id "$d/instance.json")" "$(jq -r .work "$d/instance.json")" >&2
+        printf '  %s  %s\n' "$(basename "$d")" "$(jq -r .work "$d/instance.json" 2>/dev/null)" >&2
       done
       exit 1 ;;
   esac
@@ -67,9 +69,16 @@ else
   exit 2
 fi
 
-id="$(jq -r .id "$dir/instance.json")"
+# An instance.json edited by hand, or copied from another launch's dir, must
+# not send us to the wrong VM: the ID is the dir's name, and the socket is
+# where the layout puts it, whatever the file says.
+id="$(basename "$dir")"
+if [ "$(jq -r .id "$dir/instance.json" 2>/dev/null)" != "$id" ]; then
+  echo "microvm-stop: $dir/instance.json is not this launch's (its id is not $id); not acting on it" >&2
+  exit 1
+fi
 work="$(jq -r .work "$dir/instance.json")"
-qmp="$(jq -r .sockets.qmp "$dir/instance.json")"
+qmp="$dir/qmp.sock"
 
 if ! running "$dir"; then
   echo "microvm-stop: $id is not running (its launcher has gone; $dir is left over)"

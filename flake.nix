@@ -384,8 +384,10 @@
           # This launch's instance dir goes with it: guest/ — env (API keys
           # included), CA certs, DB snapshot — and its sockets, lock and egress
           # files. vms/ and the root are shared by concurrent launches, so they
-          # go only once the last of them has.
+          # go only once the last of them has. Its finished files are
+          # read-only (see the guest share), so they are made writable first.
           if [ -n "$INSTANCE_DIR" ]; then
+            chmod -R u+w "$INSTANCE_DIR" 2>/dev/null || true
             rm -rf "$INSTANCE_DIR"
             rmdir "$INSTANCE_VMS" 2>/dev/null && rmdir "$INSTANCE_ROOT" 2>/dev/null || true
           fi
@@ -408,8 +410,10 @@
         mkdir -m 1700 "$INSTANCE_GUEST"
         # Held until this launch — QEMU included, which inherits the descriptor
         # — has gone, so a dir whose lock can be taken is one nobody is using.
+        # Read-only once open: the descriptor keeps working, and the tools
+        # that check it open it read-only.
         exec {_INSTANCE_LOCK_FD}>"$INSTANCE_DIR/lock"
-        chmod 1600 "$INSTANCE_DIR/lock"
+        chmod 1400 "$INSTANCE_DIR/lock"
         ${pkgs.util-linux}/bin/flock -n "$_INSTANCE_LOCK_FD"
 
         # Every launch starts its own daemons: the unit and socket names carry
@@ -473,8 +477,13 @@
             slice: $slice,
             units: {scope: (if $scopeUnit == "" then null else $scopeUnit end), work: $workUnit, agentHome: $agentHomeUnit, guest: $guestUnit,
                     egress: (if $egressUnit == "" then null else $egressUnit end)}}' \
-          > "$INSTANCE_DIR/instance.json"
-        chmod 1600 "$INSTANCE_DIR/instance.json"
+          > "$INSTANCE_DIR/instance.json.new"
+        # Read-only, against accidental edits, and put in place whole, so a
+        # tool never reads half of it. It describes the launch; the tools here
+        # take nothing from it that the layout already says (the QMP socket is
+        # always qmp.sock), and refuse one whose id is not its dir's name.
+        chmod 1400 "$INSTANCE_DIR/instance.json.new"
+        mv "$INSTANCE_DIR/instance.json.new" "$INSTANCE_DIR/instance.json"
 
         # What this launch hands the guest — the env file, EXTRA_CA_CERTS, the
         # nix DB snapshot — goes to the instance dir's guest/, not agent home.
@@ -941,12 +950,14 @@ EOF
         # --- Guest share (virtiofsd, read-only) ---
         # Exports guest/ only, never the instance dir around it. Started last,
         # once everything above has written its file: from here on guest/ is
-        # only read, so its files are made sticky now (see the instance dir's
-        # creation). --readonly is the guarantee — virtiofsd refuses every
-        # write, so root in the guest cannot change these files whatever it
-        # remounts. --translate-uid shows them as the agent's, so the 0600 env
-        # file stays readable by the agent and by no one else.
-        chmod -R +t "$INSTANCE_GUEST"
+        # only read, so it is made read-only and owner-only now — files 0400,
+        # dirs 0500 — against accidental edits or removal on the host, and
+        # sticky (see the instance dir's creation). --readonly is the guarantee
+        # against the guest — virtiofsd refuses every write, so root in the
+        # guest cannot change these files whatever it remounts; the modes do
+        # not add to it. --translate-uid shows them as the agent's, so the
+        # 0400 env file stays readable by the agent and by no one else.
+        chmod -R a-w,go-rwx,+t "$INSTANCE_GUEST"
         ${pkgs.systemd}/bin/systemd-run --user --unit="$GUEST_UNIT" --collect "''${_UNIT_PROPS[@]}" "$(describe "virtiofsd for the read-only guest share")" \
           -- ${virtiofsd}/bin/virtiofsd \
             --socket-path="$GUEST_SOCK" \

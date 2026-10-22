@@ -324,6 +324,16 @@ at logout or reboot. Launchers before this kept the guest's three files in
 agent home as `.microvm-env`, `.microvm-ca-certs` and `.microvm-nix-db.sqlite`;
 the first launch that has this removes them.
 
+Once written, the launch's files are read-only on the host too — everything in
+`guest/`, `instance.json` and `lock` (files 0400, directories 0500) — so an
+editor or a stray redirect cannot change them by accident, and
+`instance.json` is put in place whole. Removing a directory a killed launcher
+left behind therefore takes `chmod -R u+w` first. Nothing here stops a
+deliberate change by your own user, and nothing needs to: `microvm-stop` takes
+a launch's QMP socket from the layout (`vms/<id>/qmp.sock`), not from
+`instance.json`, and refuses an `instance.json` whose `id` is not its
+directory's name.
+
 A launch's directory is named by its ID alone, like its systemd units, so a
 tool with an ID has the path: `$XDG_RUNTIME_DIR/claude-microvm/vms/<id>/`.
 `instance.json` there says what the launch is — its project, flavor, sockets
@@ -719,7 +729,7 @@ can interpolate environment variables, this is also the way to point an agent at
 a private or self-hosted endpoint — the token stays on the host and nothing
 endpoint-specific is baked into the image.
 
-> Values are written to `/run/microvm/env` (mode `600`, on the read-only
+> Values are written to `/run/microvm/env` (mode `400`, on the read-only
 > [instance share](#per-launch-instance-directory)) and are readable by the agent
 > and by root in the guest. Nothing in the guest can change them, and the
 > guest's root services never source the file: they read only the keys they

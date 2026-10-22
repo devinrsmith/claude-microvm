@@ -121,6 +121,25 @@ pkgs.runCommand "microvm-stop" { nativeBuildInputs = with pkgs; [ jq socat util-
   run 333333333333
   [ $rc = 1 ] && grep -q 'cannot reach QEMU' <<< "$msg" && ok "a socket with nothing behind it is reported (exit 1)" || bad "unreachable: rc $rc: $msg"
 
+  # instance.json describes a launch but must not direct microvm-stop: the
+  # socket is where the layout puts it, and the file's id must be its dir's.
+  fake 444444444444; fake 555555555555
+  jq --arg qmp $VMS/444444444444/qmp.sock '.sockets.qmp = $qmp' $VMS/555555555555/instance.json > $TMPDIR/j \
+    && mv $TMPDIR/j $VMS/555555555555/instance.json
+  run 555555555555
+  if [ $rc = 0 ] && grep -q system_powerdown $TMPDIR/555555555555.qmp && [ ! -e $TMPDIR/444444444444.qmp ] \
+     && [ -d $VMS/444444444444 ]; then
+    ok "an instance.json naming another launch's socket: the launch's own qmp.sock is used, the other left alone"
+  else bad "misdirected socket: rc $rc: $msg; 444 QMP got $(cat $TMPDIR/444444444444.qmp 2>/dev/null)"; fi
+  run 444444444444
+  fake 666666666666
+  jq '.id = "777777777777"' $VMS/666666666666/instance.json > $TMPDIR/j && mv $TMPDIR/j $VMS/666666666666/instance.json
+  run 666666666666
+  if [ $rc = 1 ] && grep -q 'is not this launch' <<< "$msg" && [ ! -e $TMPDIR/666666666666.qmp ]; then
+    ok "an instance.json whose id is not its dir's is refused, and QMP is not touched"
+  else bad "mismatched id: rc $rc: $msg"; fi
+  touch $TMPDIR/666666666666.off
+
   run 999999999999
   [ $rc = 1 ] && grep -q 'no launch 999999999999' <<< "$msg" && ok "an unknown ID is reported (exit 1)" || bad "unknown: rc $rc: $msg"
   run not-an-id
