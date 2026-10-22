@@ -176,7 +176,10 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
     rc=0; (cd $TMPDIR/cwd && exec env "$@" ${launcher}/bin/microvm-run) </dev/null >$LOG/out 2>&1 || rc=$?; echo $rc > $LOG/rc
   }
   sockets_left () { find $XDG_RUNTIME_DIR -name '*.sock*' | wc -l; }
-  gone () { [ ! -e $ROOT ] && [ ! -e $AGENT_HOME-instance ] && [ "$(sockets_left)" = 0 ]; }
+  # No launch dirs, sockets or old-style dirs left. The root and vms/ stay,
+  # empty: removing them on exit would race a launch starting meanwhile.
+  gone () { [ "$(ls -A $ROOT 2>/dev/null)" = vms ] && [ -z "$(ls -A $ROOT/vms)" ] \
+              && [ ! -e $AGENT_HOME-instance ] && [ "$(sockets_left)" = 0 ]; }
   left () { ls -R $ROOT $AGENT_HOME-instance 2>/dev/null | head -20; }
 
   # --- one launch ---------------------------------------------------------------
@@ -299,7 +302,7 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   else bad "unscoped launch's daemons are bound to a scope that does not exist, or not in $USL"; fi
   gone || bad "unscoped launch left: $(left)"
 
-  gone && ok "on exit the instance dir goes, the root with the last launch, and no sockets are left" || bad "left behind: $(left)"
+  gone && ok "on exit the instance dir goes and no sockets are left; the shared root and vms/ stay, empty" || bad "left behind: $(left)"
   grep -qx "$(basename $A .args)" $L/stopped && ok "on exit the guest-share virtiofsd is stopped" || bad "guest-share virtiofsd not stopped"
 
   # --- two at once, one agent home ------------------------------------------------
@@ -340,7 +343,7 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
     ok "a 12-character project under a 7-digit uid's runtime dir launches: longest socket path $longest bytes, of 107"
   else bad "longest default paths: rc $(cat $TMPDIR/longest/rc), longest socket $longest"; cat $TMPDIR/longest/out >&2; fi
   [[ "$(jq -r .id $LJ)" =~ ^[0-9a-f]{12}$ ]] && ok "the launch ID is 12 hex digits" || bad "launch ID is '$(jq -r .id $LJ)'"
-  [ ! -e $RT/claude-microvm ] || bad "longest-path launch left: $(ls -R $RT)"
+  [ -z "$(ls -A $RT/claude-microvm/vms 2>/dev/null)" ] || bad "longest-path launch left: $(ls -R $RT)"
 
   # --- failure paths ----------------------------------------------------------------
   launch crash QEMU_RC=3

@@ -213,7 +213,8 @@ pkgs.testers.runNixOSTest {
         # The slice itself stays, empty, until logout; nothing is left in it.
         left = units_named(f"claude_microvm-{inst['id']}*")
         assert left <= {inst["slice"]}, left
-        machine.succeed(f"test ! -e {ROOT}")
+        # The shared root and vms/ stay, empty, until logout.
+        machine.succeed(f"test -d {ROOT}/vms && test -z \"$(ls -A {ROOT}/vms)\"")
         machine.fail("grep -i error /tmp/launch3.log")
   '';
 }
