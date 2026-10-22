@@ -148,6 +148,8 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   cp -a "$dir" "$LOG/boot"
   inst=$(dirname "$dir")
   stat -c %a "$inst" > "$LOG/instance-mode"
+  ( cd "$inst" && stat -c '%n %a' instance.json lock ) > "$LOG/modes"
+  ls -A "$inst" > "$LOG/instance-ls"
   cp "$inst/instance.json" "$LOG/instance.json"
   # A new open of the lock file is a new lock: it must find this launch's held.
   if ${pkgs.util-linux}/bin/flock -n "$inst/lock" true; then echo free; else echo held; fi > "$LOG/lock"
@@ -191,10 +193,16 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
     ok "the instance dir is \$XDG_RUNTIME_DIR/claude-microvm/vms/<id>, and only its guest/ is exported"
   else bad "exported '$G', not $ROOT/vms/<id>/guest"; fi
   [ "$(cat $L/instance-mode)" = 1700 ] && ok "the instance dir is owner-only and sticky" || bad "instance dir is $(cat $L/instance-mode)"
-  [ "$(stat -c %a $L/boot)" = 1700 ] && ok "guest/ is owner-only and sticky" || bad "guest/ is $(stat -c %a $L/boot)"
+  [ "$(stat -c %a $L/boot)" = 1500 ] && ok "guest/ is owner-only, read-only and sticky" || bad "guest/ is $(stat -c %a $L/boot)"
   grep -qx 'WHO=one' $L/boot/env && grep -qx 'ANTHROPIC_API_KEY=sk-test' $L/boot/env \
     && ok "the guest finds this launch's env on the share" || { bad "env not on the share"; cat $L/boot/env >&2; }
-  [ "$(stat -c %a $L/boot/env)" = 1600 ] && ok "the env file is 0600, and sticky" || bad "env file is $(stat -c %a $L/boot/env)"
+  [ "$(stat -c %a $L/boot/env)" = 1400 ] && ok "the env file is 0400, and sticky" || bad "env file is $(stat -c %a $L/boot/env)"
+  # Finished files are read-only against accidental edits, and instance.json
+  # is put in place whole.
+  ro=$(cd $L/boot && find . -mindepth 1 \( -type d ! -perm 1500 -o -type f ! -perm 1400 \) -printf '%p %m\n')
+  if [ -z "$ro" ] && [ "$(cat $L/modes)" = $'instance.json 1400\nlock 1400' ] && ! grep -q '\.new$' $L/instance-ls; then
+    ok "everything in guest/, instance.json and lock are read-only (files 0400, dirs 0500); no half-written instance.json"
+  else bad "not read-only: [$ro] [$(cat $L/modes)] [$(cat $L/instance-ls)]"; fi
   [ -f $L/boot/ca-certs/fixture.pem ] && ok "EXTRA_CA_CERTS lands on the share" || bad "no ca-certs on the share"
   [ "$(sqlite3 $L/boot/nix-db.sqlite 'SELECT path FROM ValidPaths')" = /nix/store/fixture ] \
     && ok "the nix DB snapshot lands on the share" || bad "no nix DB snapshot on the share"
