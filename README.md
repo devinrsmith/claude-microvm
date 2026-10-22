@@ -405,9 +405,11 @@ The VM provides strong isolation from the host:
 - **Network** — QEMU user-mode NAT; the VM can reach the internet but can't bind host ports. `EGRESS_POLICY=monitor|alert` records everything the guest talks to from the host side; `EGRESS_POLICY=shadow|enforce` seals the netdev behind a host-side proxy that holds the API keys — see [Egress policy](#egress-policy)
 
 Every launch prints a **session contract** before boot: project path and mount
-mode, whether the dev shell evaluated the project's Nix code on the host,
-workspace guard, egress mode, which env vars reach the guest (names only,
-never values), container state, and resources — so what a run can reach is
+mode, agent home, the [guest share](#per-launch-instance-directory) and what
+this launch put in it, whether the dev shell evaluated the project's Nix code
+on the host, workspace guard, egress mode, which env vars reach the guest
+(names only, never values), container state, resources, and the launch's ID
+with the command that stops it — so what a run can reach is
 visible while it is still cheap to stop. Each row carries a status dot (green:
 contained, yellow: worth knowing, red: the host is exposed) and a hint at the
 knob that changes it; colour is off without a terminal or with `NO_COLOR` set.

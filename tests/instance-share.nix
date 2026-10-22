@@ -261,6 +261,17 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   [ $props_ok = 1 ] && ok "every daemon is in the launch's slice, bound to its scope (BindsTo= + After=), tagged MICROVM_ID, and described" \
     || bad "daemons are not all in the launch's slice and bound to its scope"
 
+  # The session contract lists the guest share beside the other two, as it
+  # actually is for this launch, and gives the launch's handle and how to stop it.
+  if grep -qF "guest share ● this launch only → /run/microvm, read-only to the guest" $L/out \
+     && grep -qF "env, CA certs, nix DB snapshot; removed when the launch ends" $L/out; then
+    ok "the contract lists the guest share, read-only and per-launch, with what this launch put in it"
+  else bad "contract has no guest-share row, or the wrong contents:"; sed -n '/session contract/,$p' $L/out >&2; fi
+  if grep -qF "$LID · files under $XDG_RUNTIME_DIR/claude-microvm/" $L/out \
+     && grep -qF "stop: systemctl --user stop $SL" $L/out; then
+    ok "the contract gives the launch ID, where its files are, and the command that stops it"
+  else bad "contract has no launch row naming $LID and $SL"; sed -n '/session contract/,$p' $L/out >&2; fi
+
   # Where no scope can be had, the launch still runs — unbound, and saying so.
   launch unscoped STUB_NO_SCOPE=1
   U=$TMPDIR/unscoped; UJ=$U/instance.json; USL=claude_microvm-$(jq -r .id $UJ 2>/dev/null).slice
@@ -290,6 +301,10 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   grep -qx 'WHO=first' $TMPDIR/first/exit/env && ! grep -q 'WHO=second' $TMPDIR/first/exit/env \
     && ok "the second launch leaves the first one's env alone" || { bad "the first launch's env changed under it"; cat $TMPDIR/first/exit/env >&2; }
   grep -qx 'WHO=second' $TMPDIR/second/boot/env && ok "the second launch boots with its own env" || bad "second launch has the wrong env"
+  # No EXTRA_CA_CERTS here, so the contract must not claim any.
+  grep -qF "env, nix DB snapshot; removed when the launch ends" $TMPDIR/second/out \
+    && ok "...and its contract lists only what its guest share holds (no CA certs)" \
+    || { bad "second launch's guest-share row is wrong:"; grep -A1 'guest share' $TMPDIR/second/out >&2; }
   q1=$(grep -o -- '-qmp unix:[^,]*' $TMPDIR/first/qemu.sh); q2=$(grep -o -- '-qmp unix:[^,]*' $TMPDIR/second/qemu.sh)
   [ -n "$q1" ] && [ "$q1" != "$q2" ] && ok "...and its own QMP socket" || bad "concurrent launches share a QMP socket: $q1"
   gone && ok "after both exit, nothing is left" || bad "left after both: $(left)"

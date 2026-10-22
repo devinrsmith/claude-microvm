@@ -1080,6 +1080,13 @@ EOF
         fi
         _row "agent home" "" "$(_tilde "$AGENT_DIR") → /home/agent"
         _cont "persists across sessions"
+        # The third share, and the one API keys arrive by: what this launch
+        # hands the guest (see "Instance dir"). Listed as it actually is.
+        _GUEST_HOLDS="env"
+        if [ -d "$INSTANCE_GUEST/ca-certs" ]; then _GUEST_HOLDS="$_GUEST_HOLDS, CA certs"; fi
+        if [ -f "$INSTANCE_GUEST/nix-db.sqlite" ]; then _GUEST_HOLDS="$_GUEST_HOLDS, nix DB snapshot"; fi
+        _row "guest share" ok "this launch only → /run/microvm, read-only to the guest"
+        _cont "$_GUEST_HOLDS; removed when the launch ends"
         if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
           _row "dev shell" bad "loaded from the project — its Nix code is evaluated on the HOST"
         else
@@ -1143,6 +1150,10 @@ EOF
           _row containers "" "off"
         fi
         _row resources "" "''${VM_MEM} MiB RAM · $VM_VCPU vCPUs${lib.optionalString storeDiskBacked " · writable store \${VM_STORE_SIZE} MiB, fresh each boot"}"
+        # The handle on this launch from outside the VM: its units, its slice,
+        # its journal tag and its instance dir all carry the ID.
+        _row launch "" "$ID · files under $INSTANCE_ROOT/"
+        _hint "stop: systemctl --user stop $SLICE"
         echo "$_C_D────────────────────────────────────────────────────────────────────────────────$_C_0"
         # The contract is the last thing before the kernel's boot log scrolls
         # it away, so pause on it — but only with a terminal to read it and a
