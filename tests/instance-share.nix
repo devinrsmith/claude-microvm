@@ -10,7 +10,7 @@
 #     everything that reads these files — its own services, the agent's shell,
 #     microvm-policy — reads them there, after the mount, and nowhere else;
 #   - the built launcher, run for real with systemd-run, systemctl and QEMU
-#     stubbed: the instance dir is $XDG_RUNTIME_DIR/claude-microvm/<vm>-<id>,
+#     stubbed: the instance dir is $XDG_RUNTIME_DIR/claude-microvm/vms/<id>,
 #     sticky and owner-only; the guest's files land in its guest/ — the only
 #     part exported, by a --readonly virtiofsd QEMU is pointed at — and not in
 #     agent home; every socket, QMP's included, is inside it and nothing is
@@ -187,10 +187,9 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   L=$TMPDIR/one; G=$(cat $L/exported 2>/dev/null); D=$(dirname "$G")
   if [ "$(cat $L/rc)" = 0 ] && [ -e $L/started ]; then ok "a launch runs to the VM and exits cleanly"
   else bad "the launch did not reach the VM (rc $(cat $L/rc))"; cat $L/out >&2; fi
-  case "$G" in
-    $ROOT/*-claude-vm-*/guest) ok "the instance dir is \$XDG_RUNTIME_DIR/claude-microvm/<vm>-<id>, and only its guest/ is exported" ;;
-    *) bad "exported '$G', not $ROOT/<vm>-<id>/guest" ;;
-  esac
+  if [ "$G" = "$ROOT/vms/$(jq -r .id $L/instance.json 2>/dev/null)/guest" ]; then
+    ok "the instance dir is \$XDG_RUNTIME_DIR/claude-microvm/vms/<id>, and only its guest/ is exported"
+  else bad "exported '$G', not $ROOT/vms/<id>/guest"; fi
   [ "$(cat $L/instance-mode)" = 1700 ] && ok "the instance dir is owner-only and sticky" || bad "instance dir is $(cat $L/instance-mode)"
   [ "$(stat -c %a $L/boot)" = 1700 ] && ok "guest/ is owner-only and sticky" || bad "guest/ is $(stat -c %a $L/boot)"
   grep -qx 'WHO=one' $L/boot/env && grep -qx 'ANTHROPIC_API_KEY=sk-test' $L/boot/env \
@@ -246,11 +245,11 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   # and every daemon is in the slice, bound to the scope, tagged with the
   # launch's ID, and described.
   SC=$(jq -r .units.scope $J); LID=$(jq -r .id $J); SL=claude_microvm-$LID.slice
-  if [ "$SC" = "claude_microvm-$LID.scope" ] && [ "$(jq -r .slice $J)" = $SL ] && [ "$(basename $D)" = "$(jq -r .vmId $J)-$LID" ] \
+  if [ "$SC" = "claude_microvm-$LID.scope" ] && [ "$(jq -r .slice $J)" = $SL ] && [ "$D" = "$ROOT/vms/$LID" ] \
      && grep -qx -- --scope $L/$SC.opts && grep -qx -- --slice=$SL $L/$SC.opts \
      && grep -qx -- "--description=claude microvm $LID: the VM, for $WORK_DIR" $L/$SC.opts; then
     ok "the launcher runs in its own scope, $SC, in its own slice, $SL, under the instance dir's ID"
-  else bad "no launch scope: scope '$SC', slice '$(jq -r .slice $J)', id '$LID', dir $(basename $D)"; cat $L/$SC.opts >&2 2>/dev/null || true; fi
+  else bad "no launch scope: scope '$SC', slice '$(jq -r .slice $J)', id '$LID', dir $D"; cat $L/$SC.opts >&2 2>/dev/null || true; fi
   names=$(jq -r '[.units.work, .units.agentHome, .units.guest] | join(" ")' $J)
   [ "$names" = "claude_microvm-$LID-work claude_microvm-$LID-agent-home claude_microvm-$LID-guest" ] \
     && ok "the daemons are named claude_microvm-<id>-{work,agent-home,guest}" || bad "daemon names: $names"
@@ -270,7 +269,7 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
      && grep -qF "env, CA certs, nix DB snapshot; removed when the launch ends" $L/out; then
     ok "the contract lists the guest share, read-only and per-launch, with what this launch put in it"
   else bad "contract has no guest-share row, or the wrong contents:"; sed -n '/session contract/,$p' $L/out >&2; fi
-  if grep -qF "$LID · files under $XDG_RUNTIME_DIR/claude-microvm/" $L/out \
+  if grep -qF "$LID · $XDG_RUNTIME_DIR/claude-microvm/vms/$LID/" $L/out \
      && grep -qxF "                stop: ${launcher}/bin/microvm-stop $LID" $L/out; then
     ok "the contract gives the launch ID, where its files are, and microvm-stop, from beside the launcher, to stop it"
   else bad "contract has no launch row naming $LID and microvm-stop"; sed -n '/session contract/,$p' $L/out >&2; fi
@@ -302,8 +301,8 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   launch second EXTRA_ENV=WHO=second HOLD=$HOLD &
   for _ in $(seq 1 300); do [ -e $TMPDIR/second/started ] && break; sleep 0.1; done
   if [ -e $TMPDIR/first/started ] && [ -e $TMPDIR/second/started ]; then
-    [ "$(ls $ROOT | wc -l)" = 2 ] && ok "two concurrent launches have two instance dirs" \
-      || bad "concurrent launches share instance dirs: $(ls $ROOT)"
+    [ "$(ls $ROOT/vms | wc -l)" = 2 ] && ok "two concurrent launches have two instance dirs" \
+      || bad "concurrent launches share instance dirs: $(ls $ROOT/vms)"
   else bad "the two launches did not overlap"; cat $TMPDIR/first/out $TMPDIR/second/out >&2; fi
   touch $HOLD; wait
   grep -qx 'WHO=first' $TMPDIR/first/exit/env && ! grep -q 'WHO=second' $TMPDIR/first/exit/env \

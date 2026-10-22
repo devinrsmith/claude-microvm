@@ -291,7 +291,7 @@
         # and every path below is derived from it:
         #
         #   $XDG_RUNTIME_DIR/claude-microvm/     one root for every flavor
-        #     <basename>-<agent>-vm-<id>/        this launch; 0700, sticky
+        #     vms/<id>/                          this launch; 0700, sticky
         #       guest/                           its own --readonly virtiofsd → /run/microvm
         #         env  ca-certs/  nix-db.sqlite
         #       instance.json                    what this is, for tools that list VMs
@@ -313,10 +313,15 @@
           exit 1
         fi
         INSTANCE_ROOT="$RUNTIME/claude-microvm"
+        # Named by the launch ID alone, like every unit of the launch: a tool
+        # with an ID has the path, with nothing to search or match. What the
+        # launch is — project, flavor — is in its instance.json. vms/ leaves
+        # the root free for what is not one VM's.
+        INSTANCE_VMS="$INSTANCE_ROOT/vms"
         # Set only once this launch has created it, so cleanup removes exactly
         # what it made and never a directory it did not.
         INSTANCE_DIR=""
-        _INSTANCE_PATH="$INSTANCE_ROOT/$VM_ID-$ID"
+        _INSTANCE_PATH="$INSTANCE_VMS/$ID"
         INSTANCE_GUEST="$_INSTANCE_PATH/guest"
         INSTANCE_ENV="$INSTANCE_GUEST/env"
         QMP_SOCK="$_INSTANCE_PATH/qmp.sock"
@@ -328,9 +333,9 @@
         GUEST_SOCK="$_INSTANCE_PATH/guest.sock"
         GUEST_UNIT="$UNIT_STEM-guest"
         # sun_path is 108 bytes, NUL included. The longest default is
-        # /run/user/<uid>/claude-microvm/<12-char basename>-<agent>-vm-<id>/agent-home.sock,
-        # 81 bytes for a 4-digit uid, leaving room for longer uids and runtime
-        # dirs; tests/instance-share.nix launches with that worst case. A
+        # /run/user/<uid>/claude-microvm/vms/<id>/agent-home.sock, 62 bytes for
+        # a 4-digit uid, leaving room for longer uids and runtime dirs;
+        # tests/instance-share.nix checks a 7-digit uid's. A
         # runtime dir long enough to break it would otherwise surface as QEMU
         # or virtiofsd failing to bind, after the daemons before it had started.
         for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK"; do
@@ -374,11 +379,11 @@
           fi
           # This launch's instance dir goes with it: guest/ — env (API keys
           # included), CA certs, DB snapshot — and its sockets, lock and egress
-          # files. The root is shared by concurrent launches, so it goes only
-          # once the last of them has.
+          # files. vms/ and the root are shared by concurrent launches, so they
+          # go only once the last of them has.
           if [ -n "$INSTANCE_DIR" ]; then
             rm -rf "$INSTANCE_DIR"
-            rmdir "$INSTANCE_ROOT" 2>/dev/null || true
+            rmdir "$INSTANCE_VMS" 2>/dev/null && rmdir "$INSTANCE_ROOT" 2>/dev/null || true
           fi
         }
         trap cleanup EXIT
@@ -388,12 +393,12 @@
         # launch scope (see "Launch scope").
 
         # Created before the first daemon, whose socket lives in it. The root
-        # may already exist (another launch); this launch's dir must not, and
-        # mkdir without -p refuses if it does. Sticky, as the XDG spec asks of
-        # runtime files that must survive its periodic clean-up of anything
-        # untouched for six hours — a VM can run for days.
-        mkdir -p "$INSTANCE_ROOT"
-        chmod 700 "$INSTANCE_ROOT"
+        # and vms/ may already exist (another launch); this launch's dir must
+        # not, and mkdir without -p refuses if it does. Sticky, as the XDG spec
+        # asks of runtime files that must survive its periodic clean-up of
+        # anything untouched for six hours — a VM can run for days.
+        mkdir -p "$INSTANCE_VMS"
+        chmod 700 "$INSTANCE_ROOT" "$INSTANCE_VMS"
         mkdir -m 1700 "$_INSTANCE_PATH"
         INSTANCE_DIR="$_INSTANCE_PATH"
         mkdir -m 1700 "$INSTANCE_GUEST"
@@ -1162,7 +1167,7 @@ EOF
         _row resources "" "''${VM_MEM} MiB RAM · $VM_VCPU vCPUs${lib.optionalString storeDiskBacked " · writable store \${VM_STORE_SIZE} MiB, fresh each boot"}"
         # The handle on this launch from outside the VM: its units, its slice,
         # its journal tag and its instance dir all carry the ID.
-        _row launch "" "$ID · files under $INSTANCE_ROOT/"
+        _row launch "" "$ID · $INSTANCE_DIR/"
         # microvm-stop presses the VM's power button over QMP, so the guest
         # shuts down cleanly and this launcher cleans up — with or without a
         # scope. Stopping the slice is no substitute: it kills QEMU outright,

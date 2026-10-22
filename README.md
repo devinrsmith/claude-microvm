@@ -295,7 +295,7 @@ Each launch keeps what is its alone in one directory under the runtime dir:
 
 ```
 $XDG_RUNTIME_DIR/claude-microvm/          one root for every flavor
-  <basename>-<agent>-vm-<id>/             this launch; owner-only; <id> is 12 hex digits
+  vms/<id>/                               this launch; owner-only; <id> is 12 hex digits
     guest/                                exported read-only at /run/microvm
       env  ca-certs/  nix-db.sqlite
     instance.json                         what this launch is (see below)
@@ -324,11 +324,13 @@ at logout or reboot. Launchers before this kept the guest's three files in
 agent home as `.microvm-env`, `.microvm-ca-certs` and `.microvm-nix-db.sqlite`;
 the first launch that has this removes them.
 
-`instance.json` describes the launch for anything that wants to find running
-VMs — read it rather than parsing the directory name:
+A launch's directory is named by its ID alone, like its systemd units, so a
+tool with an ID has the path: `$XDG_RUNTIME_DIR/claude-microvm/vms/<id>/`.
+`instance.json` there says what the launch is — its project, flavor, sockets
+and units:
 
 ```sh
-jq . "$XDG_RUNTIME_DIR"/claude-microvm/*/instance.json
+jq . "$XDG_RUNTIME_DIR"/claude-microvm/vms/*/instance.json
 # {"version":1,"pid":…,"flavor":"claude","vmId":…,"id":…,"started":…,
 #  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
 #  "egressPolicy":"open",
@@ -879,7 +881,7 @@ and what you can do about each:
 |---|---|---|
 | `$AGENT_HOME-cri/cri-storage.img` | persistent, ~133 MiB minimum, grows to the cap | not created unless `ENABLE_CRI` is set; `CRI_STORAGE_SIZE=0` also detaches an existing one |
 | `$AGENT_HOME-store/nix-store-overlay.img` | per-run, ~69 MiB, deleted on exit along with its directory | build-time only: `claude-vm.store.diskBacked = false` |
-| `$XDG_RUNTIME_DIR/claude-microvm/<vm>-<id>/` (env file with API keys, CA certs, nix DB snapshot ~97 MiB; sockets) | per-run, on tmpfs, deleted on exit — or at logout/reboot if the launcher is killed | — |
+| `$XDG_RUNTIME_DIR/claude-microvm/vms/<id>/` (env file with API keys, CA certs, nix DB snapshot ~97 MiB; sockets) | per-run, on tmpfs, deleted on exit — or at logout/reboot if the launcher is killed | — |
 | `$AGENT_HOME` (agent state, dev-shell cache) | persistent | point `AGENT_HOME` somewhere disposable |
 
 The CRI disk used to be created on every launch whether or not `ENABLE_CRI` was

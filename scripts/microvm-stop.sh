@@ -7,10 +7,10 @@
 # Without an argument it stops the only running launch, and lists them if
 # there is more than one. `set -euo pipefail` comes from writeShellApplication.
 #
-# A launch is found by its instance dir under
-# $XDG_RUNTIME_DIR/claude-microvm/ (see "Instance dir" in flake.nix): its
-# instance.json names the QMP socket, and its lock, which the launcher and QEMU
-# hold until both have gone, says whether it is still running. The power
+# A launch's instance dir is $XDG_RUNTIME_DIR/claude-microvm/vms/<id> (see
+# "Instance dir" in flake.nix): its instance.json names the QMP socket, and its
+# lock, which the launcher and QEMU hold until both have gone, says whether it
+# is still running. The power
 # button is QMP's system_powerdown. --force sends QMP's quit instead: QEMU
 # exits at once, with no shutdown in the guest — as `systemctl --user stop` on
 # the launch's slice does, but working for launches without a scope too.
@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
 done
 [[ "$timeout" =~ ^[0-9]+$ ]] || { echo "microvm-stop: --timeout wants whole seconds, not '$timeout'" >&2; exit 2; }
 
-root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/claude-microvm"
+vms="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/claude-microvm/vms"
 
 # Whether a launch still holds its lock. The lock file is opened read-only
 # and never created: a dir mid-removal must not get a new file put back in it.
@@ -55,8 +55,8 @@ running() { # instance dir
 }
 
 live=()
-if [ -d "$root" ]; then
-  for d in "$root"/*/; do
+if [ -d "$vms" ]; then
+  for d in "$vms"/*/; do
     d="${d%/}"
     [ -f "$d/instance.json" ] && running "$d" && live+=("$d")
   done
@@ -64,7 +64,7 @@ fi
 
 if [ -z "$target" ]; then
   case "${#live[@]}" in
-    0) echo "microvm-stop: no running launches under $root" >&2; exit 1 ;;
+    0) echo "microvm-stop: no running launches under $vms" >&2; exit 1 ;;
     1) dir="${live[0]}" ;;
     *)
       echo "microvm-stop: ${#live[@]} launches are running; name one:" >&2
@@ -76,11 +76,8 @@ if [ -z "$target" ]; then
 elif [ -d "$target" ] && [ -f "$target/instance.json" ]; then
   dir="${target%/}"
 elif [[ "$target" =~ ^[0-9a-f]{12}$ ]]; then
-  dir=""
-  for d in "$root"/*-"$target"; do
-    [ -f "$d/instance.json" ] && [ "$(jq -r .id "$d/instance.json")" = "$target" ] && dir="$d"
-  done
-  [ -n "$dir" ] || { echo "microvm-stop: no launch $target under $root" >&2; exit 1; }
+  dir="$vms/$target"
+  [ -f "$dir/instance.json" ] || { echo "microvm-stop: no launch $target under $vms" >&2; exit 1; }
 else
   echo "microvm-stop: '$target' is neither a launch ID (12 hex digits) nor an instance dir" >&2
   exit 2

@@ -22,8 +22,8 @@ pkgs.runCommand "microvm-stop" { nativeBuildInputs = with pkgs; [ jq socat util-
   bad () { echo "FAIL: $1" >&2; fail=1; }
 
   export XDG_RUNTIME_DIR=$TMPDIR/rt
-  ROOT=$XDG_RUNTIME_DIR/claude-microvm
-  mkdir -p $ROOT
+  VMS=$XDG_RUNTIME_DIR/claude-microvm/vms
+  mkdir -p $VMS
   stop=${microvmStop}/bin/microvm-stop
 
   # The QMP stand-in, one per connection: greets, answers, logs each command
@@ -47,7 +47,7 @@ pkgs.runCommand "microvm-stop" { nativeBuildInputs = with pkgs; [ jq socat util-
   pids=()
   # fake <id> [never|refuse|noqmp|stale]: a launch, running unless stale.
   fake () {
-    local id=$1 how=''${2:-} d=$ROOT/proj-claude-vm-$1
+    local id=$1 how=''${2:-} d=$VMS/$1
     mkdir -p $d; : > $d/lock
     jq -n --arg id $id --arg work /home/u/$id --arg qmp $d/qmp.sock \
       '{version: 1, id: $id, work: $work, sockets: {qmp: $qmp}}' > $d/instance.json
@@ -70,7 +70,7 @@ pkgs.runCommand "microvm-stop" { nativeBuildInputs = with pkgs; [ jq socat util-
   # --- finding a launch, and stopping it ----------------------------------------
   fake aaaaaaaaaaaa
   run aaaaaaaaaaaa
-  if [ $rc = 0 ] && grep -q 'aaaaaaaaaaaa stopped' <<< "$msg" && [ ! -e $ROOT/proj-claude-vm-aaaaaaaaaaaa ]; then
+  if [ $rc = 0 ] && grep -q 'aaaaaaaaaaaa stopped' <<< "$msg" && [ ! -e $VMS/aaaaaaaaaaaa ]; then
     ok "by ID: powers the launch off and waits until it has gone"
   else bad "by ID: rc $rc: $msg"; fi
   if [ "$(cat $TMPDIR/aaaaaaaaaaaa.qmp 2>/dev/null)" = $'{"execute":"qmp_capabilities"}\n{"execute":"system_powerdown"}' ]; then
@@ -78,7 +78,7 @@ pkgs.runCommand "microvm-stop" { nativeBuildInputs = with pkgs; [ jq socat util-
   else bad "QMP got: $(cat $TMPDIR/aaaaaaaaaaaa.qmp 2>/dev/null)"; fi
 
   fake bbbbbbbbbbbb
-  run $ROOT/proj-claude-vm-bbbbbbbbbbbb/
+  run $VMS/bbbbbbbbbbbb/
   [ $rc = 0 ] && grep -q 'bbbbbbbbbbbb stopped' <<< "$msg" && ok "by instance dir" || bad "by dir: rc $rc: $msg"
 
   fake cccccccccccc
@@ -105,7 +105,7 @@ pkgs.runCommand "microvm-stop" { nativeBuildInputs = with pkgs; [ jq socat util-
   if [ $rc = 0 ] && grep -q 'not running' <<< "$msg" && [ ! -e $TMPDIR/ffffffffffff.qmp ]; then
     ok "a launch whose lock is free is reported as not running, and QMP is not touched"
   else bad "stale: rc $rc: $msg"; fi
-  rm -rf $ROOT/proj-claude-vm-ffffffffffff
+  rm -rf $VMS/ffffffffffff
 
   fake 111111111111 never
   start=$SECONDS; run --timeout 2 111111111111

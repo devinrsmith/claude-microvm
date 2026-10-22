@@ -91,9 +91,17 @@ pkgs.testers.runNixOSTest {
             f"FAKE_QEMU=${fakeQemu} FAKE_QEMU_PID=/tmp/qemu{n}.pid FAKE_QEMU_EXIT=/tmp/exit{n} NO_PAUSE=1 "
             f"setsid -f ${launcher} </dev/null >/tmp/launch{n}.log 2>&1"))
         machine.wait_until_succeeds(f"test -s /tmp/qemu{n}.pid", timeout=timedelta(seconds=120))
-        path = machine.succeed(f"ls -d {ROOT}/{project[:12]}-claude-vm-*/instance.json").strip()
-        inst = json.loads(machine.succeed(f"cat {path}"))
-        return inst, path.rsplit("/", 1)[0], machine.succeed(f"cat /tmp/qemu{n}.pid").strip()
+        # Found as a tool would: the instance.json under vms/ whose project is
+        # this one; its dir is then vms/<id>, from the ID alone.
+        for path in machine.succeed(f"ls {ROOT}/vms/*/instance.json").split():
+            inst = json.loads(machine.succeed(f"cat {path}"))
+            if inst["work"] == f"/home/alice/{project}":
+                break
+        else:
+            raise AssertionError(f"no instance.json under {ROOT}/vms for {project}")
+        d = f"{ROOT}/vms/{inst['id']}"
+        assert path == f"{d}/instance.json", path
+        return inst, d, machine.succeed(f"cat /tmp/qemu{n}.pid").strip()
 
     def units_named(pattern):
         out = machine.succeed(user(f"list-units --no-legend --plain --all '{pattern}'"))
