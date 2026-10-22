@@ -354,6 +354,23 @@ The launcher refuses to start without a runtime dir (`XDG_RUNTIME_DIR`, or
 `/run/user/<uid>`), or with one long enough to push a socket path past the
 107-byte limit.
 
+### Listing launches
+
+`microvm-list` ships beside `microvm-run` too (or `nix run .#microvm-list`):
+
+```
+$ microvm-list
+ID            STATE    FLAVOR  STARTED               PROJECT
+bbbbbbbbbbbb  running  gemini  2026-10-22T09:00:00Z  /srv/beta
+aaaaaaaaaaaa  running  claude  2026-10-22T10:00:00Z  ~/projects/alpha
+cccccccccccc  stale    claude  2026-10-22T08:00:00Z  ~/gamma
+```
+
+`stale` is an instance directory whose launcher has gone without cleaning up —
+killed outright — and whose VM is no longer running. `microvm-list --json`
+prints every launch's `instance.json` with `running` and `dir` added; tooling
+should read that rather than the table.
+
 ### Stopping a VM from outside
 
 `microvm-stop` ships beside `microvm-run` (`./result/bin/microvm-stop` after
