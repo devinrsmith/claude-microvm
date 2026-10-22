@@ -73,7 +73,7 @@ fi
 # not send us to the wrong VM: the ID is the dir's name, and the socket is
 # where the layout puts it, whatever the file says.
 id="$(basename "$dir")"
-if [ "$(jq -r .id "$dir/instance.json" 2>/dev/null)" != "$id" ]; then
+if ! own_instance "$dir"; then
   echo "microvm-stop: $dir/instance.json is not this launch's (its id is not $id); not acting on it" >&2
   exit 1
 fi

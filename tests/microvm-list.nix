@@ -44,6 +44,10 @@ pkgs.runCommand "microvm-list" { nativeBuildInputs = with pkgs; [ jq util-linux 
   fake bbbbbbbbbbbb gemini 2026-10-22T09:00:00Z /srv/beta
   fake cccccccccccc claude 2026-10-22T08:00:00Z $HOME/gamma stale
   mkdir -p $VMS/dddddddddddd        # no instance.json: not a launch
+  # Running, but its instance.json claims to be aaaaaaaaaaaa — copied from that
+  # launch's dir, say. It is not reported as that launch, nor as itself.
+  fake eeeeeeeeeeee claude 2026-10-22T07:00:00Z /srv/copy
+  jq '.id = "aaaaaaaaaaaa"' $VMS/eeeeeeeeeeee/instance.json > $TMPDIR/j && mv $TMPDIR/j $VMS/eeeeeeeeeeee/instance.json
 
   run
   expected=$(printf '%s\n' \
@@ -54,6 +58,9 @@ pkgs.runCommand "microvm-list" { nativeBuildInputs = with pkgs; [ jq util-linux 
   if [ $rc = 0 ] && [ "$msg" = "$expected" ]; then
     ok "the table: running first, oldest first, stale marked, ~ for \$HOME, the dir without instance.json skipped"
   else bad "table: rc $rc"; diff <(echo "$expected") <(echo "$msg") >&2 || true; fi
+  grep -q "skipping $VMS/eeeeeeeeeeee: its instance.json is not this launch's" $TMPDIR/err \
+    && ok "an instance.json whose id is not its dir's is skipped, with a warning" \
+    || bad "no warning for the mismatched instance.json: $(cat $TMPDIR/err)"
 
   run --json
   if [ $rc = 0 ] \

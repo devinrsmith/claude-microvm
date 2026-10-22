@@ -21,3 +21,10 @@ running() { # instance dir
   exec {fd}<&-
   return 0
 }
+
+# Whether a dir's instance.json is its own: its id is the dir's name. One that
+# is not — edited by hand, or copied from another launch's dir — describes
+# some other launch, and nothing here acts on it or reports it as this one.
+own_instance() { # instance dir
+  [ "$(jq -r .id "$1/instance.json" 2>/dev/null)" = "$(basename "$1")" ]
+}

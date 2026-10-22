@@ -3,7 +3,8 @@
 #   microvm-list [--json]
 #
 # One line per instance dir under $XDG_RUNTIME_DIR/claude-microvm/vms/ (see
-# microvm-instances.sh): its ID, whether it is still running or left over
+# microvm-instances.sh) — skipping, with a warning, one whose instance.json is
+# not its own (its id is not the dir's name): its ID, whether it is still running or left over
 # ("stale": its lock is free, so its launcher has gone without cleaning up),
 # the flavor, when it started, and the project. Running ones first, then the
 # oldest first. `set -euo pipefail` comes from writeShellApplication.
@@ -30,6 +31,10 @@ if [ -d "$vms" ]; then
   for d in "$vms"/*/; do
     d="${d%/}"
     [ -f "$d/instance.json" ] || continue
+    if ! own_instance "$d"; then
+      echo "microvm-list: skipping $d: its instance.json is not this launch's (its id is not $(basename "$d"))" >&2
+      continue
+    fi
     if running "$d"; then r=true; else r=false; fi
     # A dir being removed as we look may lose its instance.json under us.
     e="$(jq -c --argjson running "$r" --arg dir "$d" '. + {running: $running, dir: $dir}' "$d/instance.json" 2>/dev/null)" || continue

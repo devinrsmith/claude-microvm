@@ -379,7 +379,9 @@ cccccccccccc  stale    claude  2026-10-22T08:00:00Z  ~/gamma
 `stale` is an instance directory whose launcher has gone without cleaning up —
 killed outright — and whose VM is no longer running. `microvm-list --json`
 prints every launch's `instance.json` with `running` and `dir` added; tooling
-should read that rather than the table.
+should read that rather than the table. A directory whose `instance.json` is
+not its own — its `id` is not the directory's name — is skipped with a
+warning, as `microvm-stop` refuses it.
 
 ### Stopping a VM from outside
 
