@@ -81,17 +81,20 @@ let
 
   # The built launcher, with what touches the host's systemd and the VM itself
   # swapped for stubs. Matched by pattern rather than by store path, so the test
-  # does not depend on which systemd the launcher was built against.
+  # does not depend on which systemd the launcher was built against. Laid out
+  # as the package is, with microvm-stop beside it.
   launcher = pkgs.runCommand "microvm-run-stubbed" { } ''
+    mkdir -p $out/bin
+    ln -s ${runner}/bin/microvm-stop $out/bin/microvm-stop
     sed -E \
       -e 's|/nix/store/[^/ ]*-systemd-[^/ ]*/bin/systemd-run|"$STUBS/systemd-run"|g' \
       -e 's|/nix/store/[^/ ]*-systemd-[^/ ]*/bin/systemctl|"$STUBS/systemctl"|g' \
       -e 's|^( *)bash <\(|\1"$STUBS/qemu" <(|' \
       -e 's|/nix/var/nix/db/db\.sqlite|"$HOST_DB"|g' \
-      ${runner}/bin/microvm-run > $out
-    grep -q '"$STUBS/qemu" <(' $out || { echo "the QEMU invocation moved; update the stub pattern" >&2; exit 1; }
-    grep -q '"$STUBS/systemd-run"' $out || { echo "no systemd-run to stub" >&2; exit 1; }
-    chmod +x $out
+      ${runner}/bin/microvm-run > $out/bin/microvm-run
+    grep -q '"$STUBS/qemu" <(' $out/bin/microvm-run || { echo "the QEMU invocation moved; update the stub pattern" >&2; exit 1; }
+    grep -q '"$STUBS/systemd-run"' $out/bin/microvm-run || { echo "no systemd-run to stub" >&2; exit 1; }
+    chmod +x $out/bin/microvm-run
   '';
 in
 pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite pkgs.jq ]; } ''
@@ -168,7 +171,7 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
     export LOG=$TMPDIR/$1; mkdir -p $LOG; shift
     # From a directory of its own, to show the launcher writes nothing there.
     # `|| rc=$?`, not `; rc=$?`: the build shell runs with -e.
-    rc=0; (cd $TMPDIR/cwd && exec env "$@" ${launcher}) </dev/null >$LOG/out 2>&1 || rc=$?; echo $rc > $LOG/rc
+    rc=0; (cd $TMPDIR/cwd && exec env "$@" ${launcher}/bin/microvm-run) </dev/null >$LOG/out 2>&1 || rc=$?; echo $rc > $LOG/rc
   }
   sockets_left () { find $XDG_RUNTIME_DIR -name '*.sock*' | wc -l; }
   gone () { [ ! -e $ROOT ] && [ ! -e $AGENT_HOME-instance ] && [ "$(sockets_left)" = 0 ]; }
@@ -268,9 +271,9 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
     ok "the contract lists the guest share, read-only and per-launch, with what this launch put in it"
   else bad "contract has no guest-share row, or the wrong contents:"; sed -n '/session contract/,$p' $L/out >&2; fi
   if grep -qF "$LID · files under $XDG_RUNTIME_DIR/claude-microvm/" $L/out \
-     && grep -qF "stop: systemctl --user stop $SL" $L/out; then
-    ok "the contract gives the launch ID, where its files are, and the command that stops it"
-  else bad "contract has no launch row naming $LID and $SL"; sed -n '/session contract/,$p' $L/out >&2; fi
+     && grep -qxF "                stop: ${launcher}/bin/microvm-stop $LID" $L/out; then
+    ok "the contract gives the launch ID, where its files are, and microvm-stop, from beside the launcher, to stop it"
+  else bad "contract has no launch row naming $LID and microvm-stop"; sed -n '/session contract/,$p' $L/out >&2; fi
 
   # Where no scope can be had, the launch still runs — unbound, and saying so.
   launch unscoped STUB_NO_SCOPE=1
@@ -279,6 +282,11 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
      && [ "$(jq -r .units.scope $UJ)" = null ] && [ -z "$(find $U -name '*.scope.opts')" ]; then
     ok "without a scope to be had, the launch still runs, warns, and records no scope"
   else bad "unscoped launch: rc $(cat $U/rc)"; cat $U/out >&2; fi
+  # Stopping its slice would stop only its daemons and leave the VM running on
+  # shares that have gone, so its contract says microvm-stop, never that.
+  if grep -qxF "                stop: ${launcher}/bin/microvm-stop $(jq -r .id $UJ)" $U/out && ! grep -q 'systemctl --user stop' $U/out; then
+    ok "...and its contract says to stop it with microvm-stop, not by stopping its slice"
+  else bad "unscoped launch's stop hint:"; grep -A1 '^  launch' $U/out >&2; fi
   if ! grep -q '^BindsTo=\|^After=' $U/*.opts && grep -qx -- --slice=$USL $(ls $U/*-guest.opts); then
     ok "...and its daemons start unbound (BindsTo= a missing scope would stop them starting), still in their slice"
   else bad "unscoped launch's daemons are bound to a scope that does not exist, or not in $USL"; fi

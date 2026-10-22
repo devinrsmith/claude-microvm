@@ -343,13 +343,32 @@ jq . "$XDG_RUNTIME_DIR"/claude-microvm/*/instance.json
 `scope` is null if the launch could not have one.
 
 The QMP socket gives full control of the VM, e.g.
-`echo '{"execute":"qmp_capabilities"}{"execute":"query-status"}' | socat - UNIX:<qmp.sock>`.
+`echo '{"execute":"qmp_capabilities"}{"execute":"query-status"}' | socat - UNIX-CONNECT:<qmp.sock>`.
 microvm.nix's own `microvm-shutdown` and `microvm-balloon` helpers still look
-for a relative `claude-vm.sock`, so they do not work with this launcher.
+for a relative `claude-vm.sock`, so they do not work with this launcher; use
+`microvm-stop` (below) to stop a VM.
 
 The launcher refuses to start without a runtime dir (`XDG_RUNTIME_DIR`, or
 `/run/user/<uid>`), or with one long enough to push a socket path past the
 107-byte limit.
+
+### Stopping a VM from outside
+
+`microvm-stop` ships beside `microvm-run` (`./result/bin/microvm-stop` after
+`make`, or `nix run .#microvm-stop`), and the session contract names it with
+the launch's ID:
+
+```sh
+microvm-stop <id>              # press the VM's power button and wait for it to go
+microvm-stop                   # the same, for the only running launch
+microvm-stop --force <id>      # stop QEMU at once, with no shutdown in the guest
+```
+
+It presses the power button over the launch's QMP socket, so the guest shuts
+down cleanly and the launcher then cleans up as after any VM exit. It waits
+until the launch has gone (60 s by default, `--timeout` to change), and
+says so if the guest ignores the button — `--force` is for that case. It works
+the same for every launch, with a [launch scope](#launch-scope) or without.
 
 ### Launch scope
 
@@ -375,9 +394,14 @@ description says what it is and for which project, which is what
 ```sh
 systemctl --user status claude_microvm.slice          # every running VM and its daemons
 systemctl --user status claude_microvm-<id>.slice     # one launch
-systemctl --user stop claude_microvm-<id>.slice       # stop one VM; the launcher still cleans up
+systemctl --user stop claude_microvm-<id>.slice       # hard stop of a scoped launch; the launcher still cleans up
 journalctl MICROVM_ID=<id>                            # every daemon's log for one launch
 ```
+
+Stopping the slice kills QEMU outright, with no shutdown in the guest, like
+`microvm-stop --force`. Without a scope it would also go wrong: the launcher
+and QEMU are not in the slice then, so it would stop only the daemons and
+leave the VM running on shares that have gone. Prefer `microvm-stop`.
 
 A launch's slice is made on first use and, once empty, stays until logout —
 whether a launch is still running is for `instance.json` and its lock to say,
@@ -391,9 +415,11 @@ exited too, since a VM that outlives its launcher still needs its shares. Its
 instance directory is left in the runtime dir in that case, and goes at logout
 or reboot.
 
-A caller that cannot have a user scope — one running outside both a login
-session and the user manager, such as a system service — gets a warning and
-a launch without one, as before: its daemons are then not bound to anything.
+If systemd refuses the launcher a scope — systemd 261 grants one from a login
+session and even from a system service, but other versions and setups may
+not — the launch goes ahead without one, with a warning: its daemons are then
+in its slice but not bound to anything, and `microvm-stop` is the way to stop
+it.
 
 ### Sandboxing
 

@@ -20,16 +20,37 @@
 { pkgs, lib, runner }:
 
 let
-  # The built launcher with QEMU, and only QEMU, swapped for $FAKE_QEMU.
+  # The built launcher with QEMU, and only QEMU, swapped for $FAKE_QEMU — and
+  # its scope probe made to fail when FAKE_NO_SCOPE=false, since systemd here
+  # grants a scope even outside a session, and the unscoped path needs testing.
   launcher = pkgs.runCommand "microvm-run-fake-qemu" { } ''
-    sed -E 's|^( *)bash <\(|\1"$FAKE_QEMU" <(|' ${runner}/bin/microvm-run > $out
+    sed -E \
+      -e 's|^( *)bash <\(|\1"$FAKE_QEMU" <(|' \
+      -e 's|--scope --quiet --collect -- true 2>&1\)|--scope --quiet --collect -- "''${FAKE_NO_SCOPE:-true}" 2>\&1)|' \
+      ${runner}/bin/microvm-run > $out
     grep -q '"$FAKE_QEMU" <(' $out || { echo "the QEMU invocation moved; update the pattern" >&2; exit 1; }
+    grep -qF -- '-- "''${FAKE_NO_SCOPE:-true}" 2>&1)' $out || { echo "the scope probe moved; update the pattern" >&2; exit 1; }
     chmod +x $out
   '';
-  # Stays up, like a running VM, until $FAKE_QEMU_EXIT appears.
+  # Answers QMP on one connection; the power button, or quit, "powers off".
+  qmpResponder = pkgs.writeShellScript "fake-qmp" ''
+    echo '{"QMP": {"version": {}, "capabilities": []}}'
+    while IFS= read -r line; do
+      echo '{"return": {}}'
+      case "$line" in *system_powerdown*|*'"quit"'*) touch "$FAKE_QEMU_EXIT" ;; esac
+    done
+  '';
+  # Stays up, like a running VM, until $FAKE_QEMU_EXIT appears, serving QMP
+  # where the launcher told QEMU to (its -qmp, in the script it was handed).
+  # SIGTERM takes the QMP listener with it, as QEMU's own socket goes with it.
   fakeQemu = pkgs.writeShellScript "fake-qemu" ''
     echo $$ > "$FAKE_QEMU_PID"
+    qmp=$(grep -o -- '-qmp unix:[^,]*' "$1" | head -1); qmp="''${qmp#-qmp unix:}"
+    ${pkgs.socat}/bin/socat UNIX-LISTEN:"$qmp",fork EXEC:${qmpResponder} &
+    listener=$!
+    trap 'kill $listener 2>/dev/null; exit 143' TERM
     while [ ! -e "$FAKE_QEMU_EXIT" ]; do sleep 0.2; done
+    kill $listener 2>/dev/null || true
   '';
 in
 pkgs.testers.runNixOSTest {
@@ -59,13 +80,14 @@ pkgs.testers.runNixOSTest {
     def prop(unit, name):
         return machine.succeed(user(f"show -p {name} --value {unit}")).strip()
 
-    def launch(n):
+    def launch(n, unscoped=False):
         # A project name long enough that the launcher keeps only its first
         # 12 characters, so the instance dir's socket paths under the real
         # /run/user/1000 are as long as they get by default.
         project = f"{n}-a-long-project-name"
         machine.succeed(alice(
             f"mkdir -p ~/{project} && cd ~/{project} && "
+            + ("FAKE_NO_SCOPE=false " if unscoped else "") +
             f"FAKE_QEMU=${fakeQemu} FAKE_QEMU_PID=/tmp/qemu{n}.pid FAKE_QEMU_EXIT=/tmp/exit{n} NO_PAUSE=1 "
             f"setsid -f ${launcher} </dev/null >/tmp/launch{n}.log 2>&1"))
         machine.wait_until_succeeds(f"test -s /tmp/qemu{n}.pid", timeout=timedelta(seconds=120))
@@ -139,6 +161,27 @@ pkgs.testers.runNixOSTest {
         machine.succeed(user(f"stop {inst['slice']}"))
         machine.wait_until_fails(f"test -e {d}", timeout=timedelta(seconds=60))
         for u in daemons(inst) + [inst["units"]["scope"]]:
+            wait_stopped(u)
+
+    STOP = "${runner}/bin/microvm-stop"
+
+    with subtest("microvm-stop powers off a scoped launch, and the launcher cleans up"):
+        inst, d, qemu = launch(5)
+        assert inst["units"]["scope"], inst
+        out = machine.succeed(alice(f"{STOP} {inst['id']}"))
+        assert f"{inst['id']} stopped" in out, out
+        machine.succeed(f"test ! -e {d}")
+        for u in daemons(inst) + [inst["units"]["scope"]]:
+            wait_stopped(u)
+
+    with subtest("microvm-stop powers off an unscoped launch, and the launcher cleans up"):
+        inst, d, qemu = launch(6, unscoped=True)
+        assert inst["units"]["scope"] is None, f"the scope probe was meant to fail: {inst['units']}"
+        machine.succeed("grep -q 'cannot run this launch in a systemd --user scope' /tmp/launch6.log")
+        out = machine.succeed(alice(f"{STOP} {inst['id']}"))
+        assert f"{inst['id']} stopped" in out, out
+        machine.succeed(f"test ! -e {d}")
+        for u in daemons(inst):
             wait_stopped(u)
 
     with subtest("a VM that exits normally leaves nothing"):

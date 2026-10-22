@@ -70,6 +70,15 @@
       # launcher's env file.
       egressGuestAddr = "10.0.2.100:3128";
 
+      # Stops a running launch from outside the VM by pressing its power button
+      # over QMP; flavor-independent, since every launch's instance dir is
+      # under the same root. See scripts/microvm-stop.sh.
+      mkMicrovmStop = pkgs: pkgs.writeShellApplication {
+        name = "microvm-stop";
+        runtimeInputs = with pkgs; [ coreutils gnugrep jq socat util-linux ];
+        text = builtins.readFile ./scripts/microvm-stop.sh;
+      };
+
       mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints }:
         let
           virtiofsd = pkgs.virtiofsd;
@@ -98,7 +107,7 @@
               # and the real key never enters the guest.
               echo "${ep.keyVar}=egress-proxy-placeholder" >> "$INSTANCE_ENV"
             fi'') flavorEndpoints;
-        in pkgs.writeShellScriptBin "microvm-run" ''
+          launcher = pkgs.writeShellScriptBin "microvm-run" ''
         set -euo pipefail
         WORK="$(realpath "''${WORK_DIR:-$(pwd)}")"
         # Derive project basename for host-visible identifiers
@@ -138,11 +147,12 @@
         # terminal, the environment and the PID carry over; the ID is passed
         # along so the units and the instance dir share it.
         #
-        # Not every caller can have a scope: moving a process into the user
-        # manager's cgroups works from a login session or from under the user
-        # manager, but not from, say, a system service. A probe scope finds out
-        # first; without one the launch goes ahead unbound, and says so. Its
-        # daemons still get the slice.
+        # The scope can be refused: systemd-run has to move this process into
+        # the user manager's cgroups, which systemd 261 allows from a login
+        # session and even from a system service, but other versions and
+        # setups may not. A probe scope finds out first; without one the
+        # launch goes ahead unbound, and says so. Its daemons still get the
+        # slice.
         _DESCRIBE=${lib.escapeShellArg "${agentName} microvm"}
         if [ -z "''${_MICROVM_SCOPE:-}" ]; then
           # The launch ID: 12 hex digits, 48 random bits — unique enough among
@@ -1153,7 +1163,18 @@ EOF
         # The handle on this launch from outside the VM: its units, its slice,
         # its journal tag and its instance dir all carry the ID.
         _row launch "" "$ID · files under $INSTANCE_ROOT/"
-        _hint "stop: systemctl --user stop $SLICE"
+        # microvm-stop presses the VM's power button over QMP, so the guest
+        # shuts down cleanly and this launcher cleans up — with or without a
+        # scope. Stopping the slice is no substitute: it kills QEMU outright,
+        # and without a scope it would stop only the daemons, leaving the VM
+        # running on shares that have gone. Named as this launcher was run,
+        # since it ships beside it (./result/bin/microvm-stop after `make`).
+        case "$0" in
+          */*) _STOP_CMD="$(dirname -- "$0")/microvm-stop" ;;
+          *) _STOP_CMD=microvm-stop ;;
+        esac
+        [ -x "$_STOP_CMD" ] || _STOP_CMD=microvm-stop
+        _hint "stop: $_STOP_CMD $ID"
         echo "$_C_D────────────────────────────────────────────────────────────────────────────────$_C_0"
         # The contract is the last thing before the kernel's boot log scrolls
         # it away, so pause on it — but only with a terminal to read it and a
@@ -1215,6 +1236,13 @@ EOF
         esac
         exit "$_VM_RC"
       '';
+        # microvm-stop beside microvm-run, so a launch can name it in its
+        # contract and result/bin/ has both.
+        in pkgs.symlinkJoin {
+          name = "microvm-run";
+          paths = [ launcher (mkMicrovmStop pkgs) ];
+          meta.mainProgram = "microvm-run";
+        };
     in
     {
       nixosConfigurations = builtins.listToAttrs (lib.flatten (map (system:
@@ -1287,6 +1315,9 @@ EOF
           # Re-exported from microvm-policy so `nix run .#egress-report`
           # keeps working against this flake.
           inherit (policyPkgs) egress-report egress-proxy;
+          # Also in every flavor's package, beside microvm-run; on its own for
+          # whatever drives launches from outside (`nix run .#microvm-stop`).
+          microvm-stop = mkMicrovmStop pkgs;
         } //
         builtins.mapAttrs (name: flavor: let
           nixosCfg = self.nixosConfigurations."${name}${flavor.suffix}-${system}".config;
@@ -1329,6 +1360,10 @@ EOF
         env-file-data-only = import ./tests/env-file-data-only.nix {
           inherit pkgs lib;
           config = self.nixosConfigurations."claude-${system}".config;
+        };
+        microvm-stop = import ./tests/microvm-stop.nix {
+          inherit pkgs lib;
+          microvmStop = self.packages.${system}.microvm-stop;
         };
         launch-scope = import ./tests/launch-scope.nix {
           inherit pkgs lib;
