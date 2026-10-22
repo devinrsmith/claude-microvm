@@ -379,13 +379,14 @@
           fi
           # This launch's instance dir goes with it: guest/ — env (API keys
           # included), CA certs, DB snapshot — and its sockets, lock and egress
-          # files. vms/ and the root are shared by concurrent launches, so they
-          # go only once the last of them has. Its finished files are
-          # read-only (see the guest share), so they are made writable first.
+          # files. Its finished files are read-only (see the guest share), so
+          # they are made writable first. vms/ and the root stay, empty, until
+          # logout: they are shared by concurrent launches, and removing them
+          # here would race one that has just made sure they exist and is
+          # about to create its own dir in them.
           if [ -n "$INSTANCE_DIR" ]; then
             chmod -R u+w "$INSTANCE_DIR" 2>/dev/null || true
             rm -rf "$INSTANCE_DIR"
-            rmdir "$INSTANCE_VMS" 2>/dev/null && rmdir "$INSTANCE_ROOT" 2>/dev/null || true
           fi
         }
         trap cleanup EXIT

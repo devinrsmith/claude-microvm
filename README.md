@@ -320,7 +320,9 @@ can change these files, and two VMs on the same project each see only their
 own. The runtime dir is tmpfs, so the env file's API keys never reach a disk.
 The directory is removed when the launch exits, whether the VM shut down,
 failed or never started; if the launcher itself is killed, what is left goes
-at logout or reboot. Launchers before this kept the guest's three files in
+at logout or reboot. `claude-microvm/` and `vms/` themselves stay, empty,
+until then: launches share them, and one exiting must not remove them from
+under one starting. Launchers before this kept the guest's three files in
 agent home as `.microvm-env`, `.microvm-ca-certs` and `.microvm-nix-db.sqlite`;
 the first launch that has this removes them.
 
@@ -892,6 +894,7 @@ and what you can do about each:
 | `$AGENT_HOME-cri/cri-storage.img` | persistent, ~133 MiB minimum, grows to the cap | not created unless `ENABLE_CRI` is set; `CRI_STORAGE_SIZE=0` also detaches an existing one |
 | `$AGENT_HOME-store/nix-store-overlay.img` | per-run, ~69 MiB, deleted on exit along with its directory | build-time only: `claude-vm.store.diskBacked = false` |
 | `$XDG_RUNTIME_DIR/claude-microvm/vms/<id>/` (env file with API keys, CA certs, nix DB snapshot ~97 MiB; sockets) | per-run, on tmpfs, deleted on exit — or at logout/reboot if the launcher is killed | — |
+| `$XDG_RUNTIME_DIR/claude-microvm/` and its `vms/`, empty | on tmpfs, until logout/reboot | — |
 | `$AGENT_HOME` (agent state, dev-shell cache) | persistent | point `AGENT_HOME` somewhere disposable |
 
 The CRI disk used to be created on every launch whether or not `ENABLE_CRI` was
