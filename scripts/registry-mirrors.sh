@@ -31,6 +31,9 @@
 # root, so the file is read as data with microvm-env-get, never sourced, and
 # entries are checked again here before any of them becomes a path or a config
 # line.
+#
+# A registry listed twice keeps its first mirror, for every runtime alike; the
+# launcher refuses duplicates, so a later one is reported and skipped.
 
 env_file="${1:?usage: registry-mirrors <env-file> <root>}"
 root="${2:?usage: registry-mirrors <env-file> <root>}"
@@ -59,6 +62,7 @@ mkdir -p "$(dirname "$conf")" "$root/run"
 printf '# Written at boot by registry-mirrors from REGISTRY_MIRRORS.\n' > "$conf"
 docker_args=""
 written=""
+declare -A seen=()
 
 IFS=',' read -ra entries <<< "$REGISTRY_MIRRORS"
 for entry in "${entries[@]}"; do
@@ -67,8 +71,13 @@ for entry in "${entries[@]}"; do
     continue
   fi
   registry="${entry%%=*}"
+  if [ -n "${seen[$registry]:-}" ]; then
+    echo "registry-mirrors: skipping duplicate entry '$entry' ($registry already mirrors to ${seen[$registry]})" >&2
+    continue
+  fi
   url="${entry#*=}"
   url="${url%/}"
+  seen[$registry]="$url"
   scheme="${url%%://*}"
   hostport="${url#*://}"
 

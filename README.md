@@ -1084,7 +1084,8 @@ config before any daemon starts:
 | Docker | `--registry-mirror` on `dockerd` | `docker.io` only — dockerd has no mirror setting for any other registry |
 
 Every runtime tries the mirror first and falls back to the registry itself, so
-a mirror that is down costs only the cache. An `http://` mirror is marked
+a mirror that is down costs only the cache. Each registry may be listed once; the
+launcher refuses a value that names one twice. An `http://` mirror is marked
 insecure for Podman and CRI-O, and needs no extra setting elsewhere. `ctr`
 reads the same `hosts.toml` files when given `--hosts-dir
 /etc/containerd/certs.d`. The guest's `/etc` is on its tmpfs root, so none of

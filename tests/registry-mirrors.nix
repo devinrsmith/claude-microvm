@@ -83,6 +83,13 @@ pkgs.runCommand "registry-mirrors" { } ''
       bad "REGISTRY_MIRRORS='$v' failed, but not with the validation message:"; cat launch.err >&2
     fi
   done
+  if REGISTRY_MIRRORS='docker.io=http://h,ghcr.io=http://g,docker.io=http://g' WORK_DIR=$TMPDIR/w "$script" >/dev/null 2>launch.err; then
+    bad "a registry listed twice was accepted"
+  elif grep -q "REGISTRY_MIRRORS lists docker.io more than once" launch.err; then
+    ok "the launcher refuses a registry listed twice"
+  else
+    bad "a registry listed twice failed, but not with the duplicate message:"; cat launch.err >&2
+  fi
   # A good value gets past validation; the launch then fails for want of a
   # host, which is not what is under test.
   REGISTRY_MIRRORS='docker.io=http://10.0.2.2:5101,localhost:5000=https://m.example:8443/' \
@@ -168,6 +175,20 @@ REGISTRY_MIRRORS=ghcr.io=http://10.0.2.2:5102; touch $canary"
   if [ -z "$(find $TMPDIR/code/etc/containerd -type f 2>/dev/null)" ]; then
     ok "a hostile REGISTRY_MIRRORS line mirrors nothing"
   else bad "a hostile REGISTRY_MIRRORS line was mirrored: $(find $TMPDIR/code -type f)"; fi
+
+  # A registry listed twice keeps its first mirror, the same in every runtime.
+  run dup "$(q REGISTRY_MIRRORS 'docker.io=http://10.0.2.2:5101,ghcr.io=http://10.0.2.2:5102,docker.io=http://10.0.2.2:5999')"
+  R=$TMPDIR/dup
+  has $R/etc/containerd/certs.d/docker.io/hosts.toml '[host."http://10.0.2.2:5101"]' "duplicate: containerd keeps the first mirror"
+  if ! grep -q 5999 $R/etc/containerd/certs.d/docker.io/hosts.toml $R/run/cri-registry-mirrors.env $R/etc/containers/registries.conf.d/50-registry-mirrors.conf; then
+    ok "duplicate: the later mirror is written nowhere"
+  else bad "duplicate: the later mirror was written"; fi
+  has $R/run/cri-registry-mirrors.env 'DOCKERD_MIRROR_ARGS=--registry-mirror=http://10.0.2.2:5101' "duplicate: dockerd keeps the first mirror"
+  if [ "$(grep -c 'prefix = "docker.io"' $R/etc/containers/registries.conf.d/50-registry-mirrors.conf)" -eq 1 ]; then
+    ok "duplicate: podman/CRI-O get one docker.io entry"
+  else bad "duplicate: podman/CRI-O got docker.io more than once"; fi
+  has $R.out "skipping duplicate entry 'docker.io=http://10.0.2.2:5999'" "duplicate: the skipped entry is reported"
+  has $R.out 'mirroring docker.io ghcr.io' "duplicate: the rest is still mirrored"
 
   [ "$fail" -eq 0 ] || exit 1
   touch $out

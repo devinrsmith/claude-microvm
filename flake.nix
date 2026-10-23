@@ -247,11 +247,19 @@
         REGISTRY_MIRRORS="''${REGISTRY_MIRRORS:-}"
         if [ -n "$REGISTRY_MIRRORS" ]; then
           IFS=',' read -ra _MIRRORS <<< "$REGISTRY_MIRRORS"
+          _MIRROR_SEEN=","
           for _m in "''${_MIRRORS[@]}"; do
             if ! [[ "$_m" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?=https?://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?/?$ ]]; then
               echo "error: REGISTRY_MIRRORS entries must be <registry>=http[s]://<host>[:<port>] (got '$_m')" >&2
               exit 1
             fi
+            # One mirror per registry: the runtimes would not agree on which of
+            # two to use.
+            if [[ "$_MIRROR_SEEN" == *",''${_m%%=*},"* ]]; then
+              echo "error: REGISTRY_MIRRORS lists ''${_m%%=*} more than once" >&2
+              exit 1
+            fi
+            _MIRROR_SEEN="$_MIRROR_SEEN''${_m%%=*},"
           done
           case "$EGRESS_POLICY" in
             shadow|enforce)
