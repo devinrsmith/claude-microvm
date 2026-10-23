@@ -11,7 +11,6 @@ let
   };
   envGet = "${microvmEnvGet}/bin/microvm-env-get";
 
-
   registryMirrors = pkgs.writeShellApplication {
     name = "registry-mirrors";
     runtimeInputs = with pkgs; [ coreutils microvmEnvGet ];
