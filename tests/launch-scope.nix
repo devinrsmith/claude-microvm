@@ -103,6 +103,13 @@ pkgs.testers.runNixOSTest {
         assert path == f"{d}/instance.json", path
         return inst, d, machine.succeed(f"cat /tmp/qemu{n}.pid").strip()
 
+    def listed(lid):
+        # What microvm-list --json says about one launch.
+        entries = json.loads(machine.succeed(alice("${runner}/bin/microvm-list --json")))
+        matches = [e for e in entries if e["id"] == lid]
+        assert len(matches) == 1, f"microvm-list has {len(matches)} entries for {lid}: {entries}"
+        return matches[0]
+
     def units_named(pattern):
         out = machine.succeed(user(f"list-units --no-legend --plain --all '{pattern}'"))
         return {line.split()[0] for line in out.splitlines() if line.strip()}
@@ -141,6 +148,8 @@ pkgs.testers.runNixOSTest {
         members = units_named(f"claude_microvm-{lid}*")
         assert members == {scope, slice} | {f"{u}.service" for u in daemons(inst)}, members
         machine.succeed(f"journalctl MICROVM_ID={inst['id']} -o cat | grep -q .")
+        entry = listed(lid)
+        assert entry["running"] is True and entry["dir"] == d, f"microvm-list: {entry}"
 
     with subtest("SIGKILL of the launcher: the daemons outlive it while the VM runs, then stop"):
         machine.succeed(f"kill -KILL {inst['pid']}")
@@ -153,8 +162,11 @@ pkgs.testers.runNixOSTest {
         for u in daemons(inst):
             wait_stopped(u)
         wait_stopped(scope)
-        # No trap ran, so the instance dir is still there: removing it is the
-        # stale sweep's job, which has not been written yet.
+        # No trap ran, so the instance dir is still there, and microvm-list
+        # says so; removing it is the stale sweep's job, not written yet.
+        entry = listed(inst["id"])
+        assert entry["running"] is False, f"a killed launch is listed as running: {entry}"
+        machine.succeed(alice("${runner}/bin/microvm-list") + f" | grep -E '^{inst['id']} +stale '")
         machine.succeed(f"rm -rf {d}")
 
     with subtest("stopping the scope stops the VM, and the launcher still cleans up"):

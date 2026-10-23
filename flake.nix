@@ -70,14 +70,18 @@
       # launcher's env file.
       egressGuestAddr = "10.0.2.100:3128";
 
-      # Stops a running launch from outside the VM by pressing its power button
-      # over QMP; flavor-independent, since every launch's instance dir is
-      # under the same root. See scripts/microvm-stop.sh.
-      mkMicrovmStop = pkgs: pkgs.writeShellApplication {
-        name = "microvm-stop";
+      # Tools for launches from outside the VM, flavor-independent since every
+      # launch's instance dir is under the same root; each is its own script
+      # after scripts/microvm-instances.sh, which they share.
+      #   microvm-stop  presses a launch's power button over QMP
+      #   microvm-list  lists launches, running and left over
+      mkMicrovmTool = pkgs: name: pkgs.writeShellApplication {
+        inherit name;
         runtimeInputs = with pkgs; [ coreutils gnugrep jq socat util-linux ];
-        text = builtins.readFile ./scripts/microvm-stop.sh;
+        text = builtins.readFile ./scripts/microvm-instances.sh
+          + builtins.readFile ./scripts/${name}.sh;
       };
+      microvmTools = pkgs: map (mkMicrovmTool pkgs) [ "microvm-stop" "microvm-list" ];
 
       mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints }:
         let
@@ -1253,11 +1257,11 @@ EOF
         esac
         exit "$_VM_RC"
       '';
-        # microvm-stop beside microvm-run, so a launch can name it in its
-        # contract and result/bin/ has both.
+        # microvm-stop and microvm-list beside microvm-run, so a launch can
+        # name them in its contract and result/bin/ has all three.
         in pkgs.symlinkJoin {
           name = "microvm-run";
-          paths = [ launcher (mkMicrovmStop pkgs) ];
+          paths = [ launcher ] ++ microvmTools pkgs;
           meta.mainProgram = "microvm-run";
         };
     in
@@ -1332,9 +1336,10 @@ EOF
           # Re-exported from microvm-policy so `nix run .#egress-report`
           # keeps working against this flake.
           inherit (policyPkgs) egress-report egress-proxy;
-          # Also in every flavor's package, beside microvm-run; on its own for
-          # whatever drives launches from outside (`nix run .#microvm-stop`).
-          microvm-stop = mkMicrovmStop pkgs;
+          # Also in every flavor's package, beside microvm-run; on their own
+          # for whatever drives launches from outside (`nix run .#microvm-list`).
+          microvm-stop = mkMicrovmTool pkgs "microvm-stop";
+          microvm-list = mkMicrovmTool pkgs "microvm-list";
         } //
         builtins.mapAttrs (name: flavor: let
           nixosCfg = self.nixosConfigurations."${name}${flavor.suffix}-${system}".config;
@@ -1381,6 +1386,10 @@ EOF
         microvm-stop = import ./tests/microvm-stop.nix {
           inherit pkgs lib;
           microvmStop = self.packages.${system}.microvm-stop;
+        };
+        microvm-list = import ./tests/microvm-list.nix {
+          inherit pkgs lib;
+          microvmList = self.packages.${system}.microvm-list;
         };
         launch-scope = import ./tests/launch-scope.nix {
           inherit pkgs lib;
