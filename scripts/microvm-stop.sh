@@ -8,6 +8,9 @@
 # Without an argument it stops the only running launch, and lists them if
 # there is more than one; --list lists them, with what tells them apart.
 # `set -euo pipefail` comes from writeShellApplication.
+# An ID, or no argument, is looked up in one namespace: MICROVM_NAMESPACE, or
+# the default (see microvm-instances.sh). An instance dir given as a path is
+# used as it is, whatever namespace it is in.
 #
 # A launch's QMP socket is always qmp.sock in its instance dir — taken from the
 # layout, not from instance.json, which only describes the launch and whose id
@@ -43,10 +46,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 [[ "$timeout" =~ ^[0-9]+$ ]] || { echo "microvm-stop: --timeout wants whole seconds, not '$timeout'" >&2; exit 2; }
+use_namespace
 
-vms="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/claude-microvm/vms"
-
-# running() comes from microvm-instances.sh.
+# $vms (set by use_namespace) and running() come from microvm-instances.sh.
 live=()
 if [ -d "$vms" ]; then
   for d in "$vms"/*/; do

@@ -418,7 +418,7 @@ nothing to reuse either, so ephemeral homes go with an API key.
 Each launch keeps what is its alone in one directory under the runtime dir:
 
 ```
-$XDG_RUNTIME_DIR/claude-microvm/          one root for every flavor
+$XDG_RUNTIME_DIR/claude-microvm/          one root for every flavor; <ns>/ under MICROVM_NAMESPACE
   vms/<id>/                               this launch; owner-only; <id> is 12 hex digits
     guest/                                exported read-only at /run/microvm
       env  ca-certs/  nix-db.sqlite
@@ -469,7 +469,7 @@ and units:
 jq . "$XDG_RUNTIME_DIR"/claude-microvm/vms/*/instance.json
 # {"version":1,"pid":…,"flavor":"claude","vmId":…,"id":…,"started":…,
 #  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
-#  "egressPolicy":"open",
+#  "egressPolicy":"open","namespace":null,
 #  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…},
 #  "slice":"claude_microvm.slice",
 #  "units":{"scope":…,"work":…,"agentHome":…,"guest":…,"egress":null}}
@@ -653,6 +653,45 @@ session and even from a system service, but other versions and setups may
 not — the launch goes ahead without one, with a warning: its daemons are then
 in its slice but not bound to anything, and `microvm-stop` is the way to stop
 it.
+
+### Namespaces
+
+`MICROVM_NAMESPACE` gives a launch's units and runtime directory a prefix of
+their own, so a tool that launches VMs can keep them apart from everyone
+else's — and from each other's tools:
+
+```sh
+MICROVM_NAMESPACE=custom-namespace microvm-run
+```
+
+```
+custom.slice                                  made by systemd from the dash
+  custom-namespace.slice                      every launch in the namespace
+    custom-namespace-<id>.slice               one launch
+      custom-namespace-<id>.scope             the launcher and QEMU
+      custom-namespace-<id>-work.service      …and the rest, as above
+$XDG_RUNTIME_DIR/custom-namespace/vms/<id>/   its instance directory
+```
+
+One value names both, so they cannot disagree about which launches belong
+together. A dash in a slice name is a level of nesting, which is how
+`custom-namespace` lands inside `custom.slice` beside whatever else that tool
+runs there; a namespace is therefore lowercase words — letters, digits and
+underscores — joined by single dashes, starting with a letter. The launcher
+refuses anything else before starting anything. A namespace has no length
+limit of its own, but it replaces `claude-microvm` in every socket path, and a
+socket path must fit in 107 bytes: under `/run/user/<4-digit uid>`, that
+allows up to 59 characters, and the launcher refuses a longer one, again
+before any daemon starts.
+Unset, the names are the default ones above (`claude_microvm` for units,
+`claude-microvm` for the directory).
+
+The namespace is recorded in `instance.json` (`null` for the default).
+`microvm-stop` reads the same variable, and looks only in its
+namespace, or the default one when it is unset; the session contract's stop
+hint sets it. There is no flag for it: a namespace is for tools that run
+launches of their own, which set the variable for every call.
+`journalctl MICROVM_ID=<id>` works the same in every namespace.
 
 ### Sandboxing
 
@@ -1058,6 +1097,7 @@ Rebuild with `make claude`.
 | `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<hash>` |
 | `AGENT_HOME_MODE` | `persistent` (one agent home per project, kept) or `ephemeral` (a fresh one for the launch, removed with its CRI and store images when it ends; egress logs kept) — see [Home directory persistence](#home-directory-persistence) | `persistent` |
 | `SHARE_<NAME>` | Host directory for each share the guest declares in `claude-vm.shares` (flakes built with `lib.mkRunner`), the name upper-cased with `-` as `_`; required for every declared share — see [Extra shares](#extra-shares) | — |
+| `MICROVM_NAMESPACE` | Prefix for the launch's systemd units and runtime directory, e.g. `custom-namespace` → `custom-namespace-<id>.*` in `custom.slice`, `$XDG_RUNTIME_DIR/custom-namespace/vms/<id>/`. Lowercase words joined by single dashes; only the socket paths under it bound its length — see [Namespaces](#namespaces) | (`claude_microvm` / `claude-microvm`) |
 | `WORK_CACHE` | virtiofsd cache policy for `/work`: `auto`, `always`, `never` or `metadata` — see [Work share caching](#work-share-caching) | `auto` |
 | `AGENT_SETTINGS` | Host path to a settings file seeded into the agent home before boot (flavor-specific destination, e.g. `.claude/settings.json`) — see [Pre-seeding agent settings](#pre-seeding-agent-settings) | (none) |
 | `VM_MEM` | VM memory in MB | `8192` |
