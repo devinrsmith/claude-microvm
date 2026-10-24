@@ -70,15 +70,26 @@
       # launcher's env file.
       egressGuestAddr = "10.0.2.100:3128";
 
+      # What MICROVM_NAMESPACE may be (see "Namespace" in the launcher). It
+      # names systemd units and a directory, and a dash in a slice name is a
+      # level of nesting, so: lowercase words of letters, digits and
+      # underscores, joined by single dashes. The launcher and the tools
+      # check against this one pattern.
+      namespacePattern = "^[a-z][a-z0-9_]*(-[a-z0-9_]+)*$";
+      namespaceMaxLength = 32;
+
       # Tools for launches from outside the VM, flavor-independent since every
-      # launch's instance dir is under the same root; each is its own script
-      # after scripts/microvm-instances.sh, which they share.
+      # launch's instance dir is under the same root (per namespace); each is
+      # its own script after scripts/microvm-instances.sh, which they share.
       #   microvm-stop  presses a launch's power button over QMP
       #   microvm-list  lists launches, running and left over
       mkMicrovmTool = pkgs: name: pkgs.writeShellApplication {
         inherit name;
         runtimeInputs = with pkgs; [ coreutils gnugrep jq socat util-linux ];
-        text = builtins.readFile ./scripts/microvm-instances.sh
+        text = ''
+          ns_pattern=${lib.escapeShellArg namespacePattern}
+          ns_max=${toString namespaceMaxLength}
+        '' + builtins.readFile ./scripts/microvm-instances.sh
           + builtins.readFile ./scripts/${name}.sh;
       };
       microvmTools = pkgs: map (mkMicrovmTool pkgs) [ "microvm-stop" "microvm-list" ];
@@ -119,11 +130,38 @@
         [ -z "$WORK_BASENAME" ] && WORK_BASENAME="root"
         VM_ID="$WORK_BASENAME-${hostname}"
 
+        # --- Namespace ---
+        # MICROVM_NAMESPACE names this launch's systemd units and its runtime
+        # root, so a tool that launches VMs can keep its own apart from
+        # everyone else's: with MICROVM_NAMESPACE=airlock-vm the units are
+        # airlock-vm-<id>.*, in airlock-vm.slice — nested, by the dash, in
+        # airlock.slice — and the instance dir is
+        # $XDG_RUNTIME_DIR/airlock-vm/vms/<id>/. microvm-list and microvm-stop
+        # read the same variable, and only the variable: it is for tools that
+        # run launches of their own, not an everyday option. Unset, the names
+        # are the ones that predate it: claude_microvm for units,
+        # claude-microvm for the directory. One namespace for both, so the two can never
+        # disagree about which launches belong together.
+        NAMESPACE="''${MICROVM_NAMESPACE:-}"
+        if [ -n "$NAMESPACE" ]; then
+          _NS_PATTERN=${lib.escapeShellArg namespacePattern}
+          if ! [[ "$NAMESPACE" =~ $_NS_PATTERN ]] || [ "''${#NAMESPACE}" -gt ${toString namespaceMaxLength} ]; then
+            echo "error: MICROVM_NAMESPACE=$NAMESPACE is not a namespace: up to ${toString namespaceMaxLength} characters of" >&2
+            echo "       lowercase words (a-z, 0-9, _) joined by single dashes, starting with a letter" >&2
+            exit 1
+          fi
+          UNIT_NS="$NAMESPACE"
+          RUNTIME_NS="$NAMESPACE"
+        else
+          UNIT_NS="claude_microvm"
+          RUNTIME_NS="claude-microvm"
+        fi
+
         # --- Launch scope and slice ---
         # Every systemd --user unit of a launch shares one stem,
-        # claude_microvm-<id>, and sits in its own slice of that name, nested
-        # in claude_microvm.slice (a dash in a slice name is a level of
-        # nesting, hence the underscore before it):
+        # <ns>-<id>, and sits in its own slice of that name, nested in
+        # <ns>.slice. By default <ns> is claude_microvm (a dash in a slice name
+        # is a level of nesting, hence the underscore):
         #
         #   claude_microvm.slice
         #     claude_microvm-<id>.slice           this launch
@@ -167,10 +205,10 @@
           _MICROVM_ID="$(cat /proc/sys/kernel/random/uuid)"
           _MICROVM_ID="''${_MICROVM_ID//-/}"; _MICROVM_ID="''${_MICROVM_ID:0:12}"
           if _SCOPE_ERR=$(${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect -- true 2>&1); then
-            _MICROVM_SCOPE="claude_microvm-$_MICROVM_ID.scope"
+            _MICROVM_SCOPE="$UNIT_NS-$_MICROVM_ID.scope"
             export _MICROVM_ID _MICROVM_SCOPE
             exec ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect \
-              --unit="$_MICROVM_SCOPE" --slice="claude_microvm-$_MICROVM_ID.slice" \
+              --unit="$_MICROVM_SCOPE" --slice="$UNIT_NS-$_MICROVM_ID.slice" \
               --description="$_DESCRIBE $_MICROVM_ID: the VM, for $WORK" \
               -- "$0" "$@"
           fi
@@ -182,7 +220,7 @@
           exit 1
         fi
         ID="$_MICROVM_ID"
-        UNIT_STEM="claude_microvm-$ID"
+        UNIT_STEM="$UNIT_NS-$ID"
         SLICE="$UNIT_STEM.slice"
         # Every daemon this launch starts: in its slice, tagged so
         # `journalctl MICROVM_ID=<id>` finds all of their logs, and bound to
@@ -320,7 +358,7 @@
         # Everything this launch keeps for itself lives under one directory,
         # and every path below is derived from it:
         #
-        #   $XDG_RUNTIME_DIR/claude-microvm/     one root for every flavor
+        #   $XDG_RUNTIME_DIR/claude-microvm/     one root for every flavor (<ns>/ under a namespace)
         #     vms/<id>/                          this launch; 0700, sticky
         #       guest/                           its own --readonly virtiofsd → /run/microvm
         #         env  ca-certs/  nix-db.sqlite
@@ -342,7 +380,7 @@
           echo "error: no runtime directory: $RUNTIME does not exist (is XDG_RUNTIME_DIR set, with a user session?)" >&2
           exit 1
         fi
-        INSTANCE_ROOT="$RUNTIME/claude-microvm"
+        INSTANCE_ROOT="$RUNTIME/$RUNTIME_NS"
         # Named by the launch ID alone, like every unit of the launch: a tool
         # with an ID has the path, with nothing to search or match. What the
         # launch is — project, flavor — is in its instance.json. vms/ leaves
@@ -364,7 +402,8 @@
         GUEST_UNIT="$UNIT_STEM-guest"
         # sun_path is 108 bytes, NUL included. The longest default is
         # /run/user/<uid>/claude-microvm/vms/<id>/agent-home.sock, 62 bytes for
-        # a 4-digit uid, leaving room for longer uids and runtime dirs;
+        # a 4-digit uid, leaving room for longer uids, runtime dirs and namespaces
+        # (a namespace of the full ${toString namespaceMaxLength} characters adds 18 bytes);
         # tests/instance-share.nix checks a 7-digit uid's. A
         # runtime dir long enough to break it would otherwise surface as QEMU
         # or virtiofsd failing to bind, after the daemons before it had started.
@@ -493,13 +532,14 @@
           --argjson pid "$$" --arg flavor ${lib.escapeShellArg agentName} \
           --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg work "$WORK" --arg agentHome "$AGENT_DIR" --arg guest "$INSTANCE_GUEST" \
-          --arg egressPolicy "$EGRESS_POLICY" \
+          --arg egressPolicy "$EGRESS_POLICY" --arg namespace "$NAMESPACE" \
           --arg qmp "$QMP_SOCK" --arg workSock "$SOCK" --arg agentHomeSock "$AGENT_SOCK" --arg guestSock "$GUEST_SOCK" \
           --arg scopeUnit "$_MICROVM_SCOPE" --arg slice "$SLICE" \
           --arg workUnit "$UNIT" --arg agentHomeUnit "$AGENT_UNIT" --arg guestUnit "$GUEST_UNIT" --arg egressUnit "$_EGRESS_UNIT_NAME" \
           '{version: 1, pid: $pid, flavor: $flavor, vmId: $vmId, id: $id, started: $started,
             work: $work, agentHome: $agentHome, guest: $guest, guestMount: "/run/microvm",
             egressPolicy: $egressPolicy,
+            namespace: (if $namespace == "" then null else $namespace end),
             sockets: {qmp: $qmp, work: $workSock, agentHome: $agentHomeSock, guest: $guestSock},
             slice: $slice,
             units: {scope: (if $scopeUnit == "" then null else $scopeUnit end), work: $workUnit, agentHome: $agentHomeUnit, guest: $guestUnit,
@@ -1230,7 +1270,7 @@ EOF
           *) _STOP_CMD=microvm-stop ;;
         esac
         [ -x "$_STOP_CMD" ] || _STOP_CMD=microvm-stop
-        _hint "stop: $_STOP_CMD $ID"
+        _hint "stop: ''${NAMESPACE:+MICROVM_NAMESPACE=$NAMESPACE }$_STOP_CMD $ID"
         echo "$_C_D────────────────────────────────────────────────────────────────────────────────$_C_0"
         # The contract is the last thing before the kernel's boot log scrolls
         # it away, so pause on it — but only with a terminal to read it and a

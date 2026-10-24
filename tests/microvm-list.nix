@@ -72,6 +72,33 @@ pkgs.runCommand "microvm-list" { nativeBuildInputs = with pkgs; [ jq util-linux 
     ok "--json: each instance.json as it is, plus running and dir, in the table's order"
   else bad "--json: rc $rc: $msg"; fi
 
+  # --- namespaces --------------------------------------------------------------
+  # A launch with MICROVM_NAMESPACE=airlock-vm lives under airlock-vm/vms/, and
+  # is listed with the same variable, and nowhere else. There is no flag.
+  DEFAULT_VMS=$VMS; VMS=$XDG_RUNTIME_DIR/airlock-vm/vms
+  fake ffffffffffff claude 2026-10-22T11:00:00Z /srv/namespaced
+  VMS=$DEFAULT_VMS
+  MICROVM_NAMESPACE=airlock-vm run
+  if [ $rc = 0 ] && [ "$(tail -n +2 <<< "$msg" | awk '{ print $1 }')" = ffffffffffff ]; then
+    ok "MICROVM_NAMESPACE: the launches under <ns>/vms/, and only those"
+  else bad "MICROVM_NAMESPACE: rc $rc: $msg"; fi
+  MICROVM_NAMESPACE=airlock-vm run --json
+  [ $rc = 0 ] && [ "$(jq -r '[.[].id] | join(" ")' <<< "$msg")" = ffffffffffff ] \
+    && [ "$(jq -r '.[0].dir' <<< "$msg")" = "$XDG_RUNTIME_DIR/airlock-vm/vms/ffffffffffff" ] \
+    && ok "...and --json the same" || bad "MICROVM_NAMESPACE --json: rc $rc: $msg"
+  run
+  ! grep -q ffffffffffff <<< "$msg" && ok "the default namespace does not list a namespaced launch" \
+    || bad "default listed the namespaced launch: $msg"
+  refused=0
+  for ns in Airlock a--b -a a- 1a "a b" $(printf 'a%.0s' $(seq 1 33)); do
+    MICROVM_NAMESPACE="$ns" run
+    if [ $rc = 2 ] && grep -q 'is not a namespace' $TMPDIR/err; then refused=$((refused + 1))
+    else bad "namespace '$ns' accepted: rc $rc"; fi
+  done
+  [ $refused = 7 ] && ok "a MICROVM_NAMESPACE that breaks the rule is a usage error"
+  run --namespace airlock-vm
+  [ $rc = 2 ] && ok "there is no --namespace flag" || bad "--namespace accepted: rc $rc"
+
   run --bogus
   [ $rc = 2 ] && ok "an unknown argument is a usage error (exit 2)" || bad "bad arg: rc $rc"
 

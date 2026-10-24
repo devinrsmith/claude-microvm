@@ -294,7 +294,7 @@ This mounts the host directory at `/home/agent` inside the guest via a second vi
 Each launch keeps what is its alone in one directory under the runtime dir:
 
 ```
-$XDG_RUNTIME_DIR/claude-microvm/          one root for every flavor
+$XDG_RUNTIME_DIR/claude-microvm/          one root for every flavor; <ns>/ under MICROVM_NAMESPACE
   vms/<id>/                               this launch; owner-only; <id> is 12 hex digits
     guest/                                exported read-only at /run/microvm
       env  ca-certs/  nix-db.sqlite
@@ -345,7 +345,7 @@ and units:
 jq . "$XDG_RUNTIME_DIR"/claude-microvm/vms/*/instance.json
 # {"version":1,"pid":…,"flavor":"claude","vmId":…,"id":…,"started":…,
 #  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
-#  "egressPolicy":"open",
+#  "egressPolicy":"open","namespace":null,
 #  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…},
 #  "slice":"claude_microvm.slice",
 #  "units":{"scope":…,"work":…,"agentHome":…,"guest":…,"egress":null}}
@@ -383,7 +383,8 @@ killed outright — and whose VM is no longer running. `microvm-list --json`
 prints every launch's `instance.json` with `running` and `dir` added; tooling
 should read that rather than the table. A directory whose `instance.json` is
 not its own — its `id` is not the directory's name — is skipped with a
-warning, as `microvm-stop` refuses it.
+warning, as `microvm-stop` refuses it. It lists the default namespace, or
+`MICROVM_NAMESPACE`'s (see [Namespaces](#namespaces)).
 
 ### Stopping a VM from outside
 
@@ -453,6 +454,41 @@ session and even from a system service, but other versions and setups may
 not — the launch goes ahead without one, with a warning: its daemons are then
 in its slice but not bound to anything, and `microvm-stop` is the way to stop
 it.
+
+### Namespaces
+
+`MICROVM_NAMESPACE` gives a launch's units and runtime directory a prefix of
+their own, so a tool that launches VMs can keep them apart from everyone
+else's — and from each other's tools:
+
+```sh
+MICROVM_NAMESPACE=airlock-vm microvm-run
+```
+
+```
+airlock.slice                               made by systemd from the dash
+  airlock-vm.slice                          every launch in the namespace
+    airlock-vm-<id>.slice                   one launch
+      airlock-vm-<id>.scope                 the launcher and QEMU
+      airlock-vm-<id>-work.service          …and the rest, as above
+$XDG_RUNTIME_DIR/airlock-vm/vms/<id>/       its instance directory
+```
+
+One value names both, so they cannot disagree about which launches belong
+together. A dash in a slice name is a level of nesting, which is how
+`airlock-vm` lands inside `airlock.slice` beside whatever else that tool runs
+there; a namespace is therefore lowercase words — letters, digits and
+underscores — joined by single dashes, starting with a letter, at most 32
+characters. The launcher refuses anything else before starting anything.
+Unset, the names are the default ones above (`claude_microvm` for units,
+`claude-microvm` for the directory).
+
+The namespace is recorded in `instance.json` (`null` for the default).
+`microvm-list` and `microvm-stop` read the same variable, and look only in its
+namespace, or the default one when it is unset; the session contract's stop
+hint sets it. There is no flag for it: a namespace is for tools that run
+launches of their own, which set the variable for every call.
+`journalctl MICROVM_ID=<id>` works the same in every namespace.
 
 ### Sandboxing
 
@@ -773,6 +809,7 @@ Rebuild with `make claude`.
 |----------|-------------|---------|
 | `WORK_DIR` | Host directory to mount at `/work` | Current directory |
 | `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<hash>` |
+| `MICROVM_NAMESPACE` | Prefix for the launch's systemd units and runtime directory, e.g. `airlock-vm` → `airlock-vm-<id>.*` in `airlock.slice`, `$XDG_RUNTIME_DIR/airlock-vm/vms/<id>/`. Lowercase words joined by single dashes, at most 32 characters — see [Namespaces](#namespaces) | (`claude_microvm` / `claude-microvm`) |
 | `WORK_CACHE` | virtiofsd cache policy for `/work`: `auto`, `always`, `never` or `metadata` — see [Work share caching](#work-share-caching) | `auto` |
 | `AGENT_SETTINGS` | Host path to a settings file seeded into the agent home before boot (flavor-specific destination, e.g. `.claude/settings.json`) — see [Pre-seeding agent settings](#pre-seeding-agent-settings) | (none) |
 | `VM_MEM` | VM memory in MB | `8192` |
