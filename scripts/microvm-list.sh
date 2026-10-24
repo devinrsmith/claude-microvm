@@ -2,7 +2,8 @@
 #
 #   microvm-list [--json]
 #
-# One line per instance dir under $XDG_RUNTIME_DIR/claude-microvm/vms/ (see
+# One line per instance dir under $XDG_RUNTIME_DIR/claude-microvm/vms/, or
+# under <ns>/vms/ with MICROVM_NAMESPACE=<ns> (see
 # microvm-instances.sh): its ID, whether it is still running or left over
 # ("stale": its lock is free, so its launcher has gone without cleaning up),
 # the flavor, when it started, and the project. Running ones first, then the
@@ -25,8 +26,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+use_namespace
 
-# $vms and running() come from microvm-instances.sh.
+# $vms (set by use_namespace) and running() come from microvm-instances.sh.
 entries=()
 if [ -d "$vms" ]; then
   for d in "$vms"/*/; do

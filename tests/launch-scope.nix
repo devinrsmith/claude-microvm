@@ -80,26 +80,28 @@ pkgs.testers.runNixOSTest {
     def prop(unit, name):
         return machine.succeed(user(f"show -p {name} --value {unit}")).strip()
 
-    def launch(n, unscoped=False):
+    def launch(n, unscoped=False, ns=None):
         # A project name long enough that the launcher keeps only its first
         # 12 characters, so the instance dir's socket paths under the real
         # /run/user/1000 are as long as they get by default.
         project = f"{n}-a-long-project-name"
+        root = f"/run/user/1000/{ns}" if ns else ROOT
         machine.succeed(alice(
             f"mkdir -p ~/{project} && cd ~/{project} && "
-            + ("FAKE_NO_SCOPE=false " if unscoped else "") +
+            + ("FAKE_NO_SCOPE=false " if unscoped else "")
+            + (f"MICROVM_NAMESPACE={ns} " if ns else "") +
             f"FAKE_QEMU=${fakeQemu} FAKE_QEMU_PID=/tmp/qemu{n}.pid FAKE_QEMU_EXIT=/tmp/exit{n} NO_PAUSE=1 "
             f"setsid -f ${launcher} </dev/null >/tmp/launch{n}.log 2>&1"))
         machine.wait_until_succeeds(f"test -s /tmp/qemu{n}.pid", timeout=timedelta(seconds=120))
         # Found as a tool would: the instance.json under vms/ whose project is
         # this one; its dir is then vms/<id>, from the ID alone.
-        for path in machine.succeed(f"ls {ROOT}/vms/*/instance.json").split():
+        for path in machine.succeed(f"ls {root}/vms/*/instance.json").split():
             inst = json.loads(machine.succeed(f"cat {path}"))
             if inst["work"] == f"/home/alice/{project}":
                 break
         else:
-            raise AssertionError(f"no instance.json under {ROOT}/vms for {project}")
-        d = f"{ROOT}/vms/{inst['id']}"
+            raise AssertionError(f"no instance.json under {root}/vms for {project}")
+        d = f"{root}/vms/{inst['id']}"
         assert path == f"{d}/instance.json", path
         return inst, d, machine.succeed(f"cat /tmp/qemu{n}.pid").strip()
 
@@ -203,6 +205,49 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"test ! -e {d}")
         for u in daemons(inst):
             wait_stopped(u)
+
+    with subtest("MICROVM_NAMESPACE: units, slices and instance dir under the namespace"):
+        NS = "custom-namespace"
+        inst, d, qemu = launch(7, ns=NS)
+        scope, slice, lid = inst["units"]["scope"], inst["slice"], inst["id"]
+        assert d == f"/run/user/1000/{NS}/vms/{lid}", d
+        assert inst["namespace"] == NS, inst
+        assert scope == f"{NS}-{lid}.scope", f"scope is {scope!r}"
+        assert slice == f"{NS}-{lid}.slice", f"slice is {slice!r}"
+        assert [inst["units"][k] for k in ("work", "agentHome", "guest")] \
+            == [f"{NS}-{lid}-work", f"{NS}-{lid}-agent-home", f"{NS}-{lid}-guest"], inst["units"]
+        machine.succeed(user(f"is-active --quiet {scope}"))
+        # Nested by its dashes:
+        # custom.slice ⊃ custom-namespace.slice ⊃ custom-namespace-<id>.slice.
+        assert prop(scope, "Slice") == slice
+        assert prop(slice, "Slice") == f"{NS}.slice", f"{slice} is in {prop(slice, 'Slice')}"
+        assert prop(f"{NS}.slice", "Slice") == "custom.slice", f"{NS}.slice is in {prop(NS + '.slice', 'Slice')}"
+        for u in daemons(inst):
+            machine.succeed(user(f"is-active --quiet {u}"))
+            assert prop(u, "Slice") == slice, f"{u} is in {prop(u, 'Slice')}, not {slice}"
+        # Nothing of it in the default namespace's names or root.
+        assert not units_named(f"claude_microvm-{lid}*"), units_named(f"claude_microvm-{lid}*")
+        machine.fail(f"test -e {ROOT}/vms/{lid}")
+        machine.succeed(f"grep -qF 'stop: MICROVM_NAMESPACE={NS} ' /tmp/launch7.log && grep -qF 'microvm-stop {lid}' /tmp/launch7.log")
+
+    with subtest("microvm-list and microvm-stop find a namespaced launch in its namespace only"):
+        machine.fail(alice("${runner}/bin/microvm-list --json") + f" | grep -q {lid}")
+        entries = json.loads(machine.succeed(alice(f"MICROVM_NAMESPACE={NS} ${runner}/bin/microvm-list --json")))
+        assert [e["id"] for e in entries] == [lid], entries
+        machine.fail(alice(f"{STOP} {lid}"))
+        out = machine.succeed(alice(f"MICROVM_NAMESPACE={NS} {STOP} {lid}"))
+        assert f"{lid} stopped" in out, out
+        machine.succeed(f"test ! -e {d}")
+        for u in daemons(inst) + [scope]:
+            wait_stopped(u)
+
+    with subtest("a MICROVM_NAMESPACE that breaks the rule is refused before anything starts"):
+        out = machine.fail(alice(
+            "mkdir -p ~/badns && cd ~/badns && FAKE_QEMU=/bin/false NO_PAUSE=1 "
+            "MICROVM_NAMESPACE=Custom--Namespace ${launcher} </dev/null 2>&1"))
+        assert "is not a namespace" in out, out
+        machine.fail("ls -d /run/user/1000/Custom--Namespace")
+        assert not units_named("Custom*"), units_named("Custom*")
 
     with subtest("a VM that exits normally leaves nothing"):
         inst, d, qemu = launch(3)
