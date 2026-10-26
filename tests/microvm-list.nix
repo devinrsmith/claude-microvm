@@ -49,14 +49,18 @@ pkgs.runCommand "microvm-list" { nativeBuildInputs = with pkgs; [ jq util-linux 
   fake eeeeeeeeeeee claude 2026-10-22T07:00:00Z /srv/copy
   jq '.id = "aaaaaaaaaaaa"' $VMS/eeeeeeeeeeee/instance.json > $TMPDIR/j && mv $TMPDIR/j $VMS/eeeeeeeeeeee/instance.json
 
+  # Named as the launcher names it; the others, from before names were
+  # recorded, have none and show "-".
+  jq '.name = "alpha-named"' $VMS/aaaaaaaaaaaa/instance.json > $TMPDIR/j && mv $TMPDIR/j $VMS/aaaaaaaaaaaa/instance.json
+
   run
   expected=$(printf '%s\n' \
-    "ID            STATE    FLAVOR  STARTED               PROJECT" \
-    "bbbbbbbbbbbb  running  gemini  2026-10-22T09:00:00Z  /srv/beta" \
-    "aaaaaaaaaaaa  running  claude  2026-10-22T10:00:00Z  ~/projects/alpha" \
-    "cccccccccccc  stale    claude  2026-10-22T08:00:00Z  ~/gamma")
+    "ID            STATE    FLAVOR  NAME         STARTED               PROJECT" \
+    "bbbbbbbbbbbb  running  gemini  -            2026-10-22T09:00:00Z  /srv/beta" \
+    "aaaaaaaaaaaa  running  claude  alpha-named  2026-10-22T10:00:00Z  ~/projects/alpha" \
+    "cccccccccccc  stale    claude  -            2026-10-22T08:00:00Z  ~/gamma")
   if [ $rc = 0 ] && [ "$msg" = "$expected" ]; then
-    ok "the table: running first, oldest first, stale marked, ~ for \$HOME, the dir without instance.json skipped"
+    ok "the table: running first, oldest first, stale marked, the name or -, ~ for \$HOME, the dir without instance.json skipped"
   else bad "table: rc $rc"; diff <(echo "$expected") <(echo "$msg") >&2 || true; fi
   grep -q "skipping $VMS/eeeeeeeeeeee: its instance.json is not this launch's" $TMPDIR/err \
     && ok "an instance.json whose id is not its dir's is skipped, with a warning" \

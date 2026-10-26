@@ -6,9 +6,10 @@
 # under <ns>/vms/ with MICROVM_NAMESPACE=<ns> (see
 # microvm-instances.sh): its ID, whether it is still running or left over
 # ("stale": its lock is free, so its launcher has gone without cleaning up),
-# the flavor, when it started, and the project. Running ones first, then the
-# oldest first. A dir whose instance.json is not its own (its id is not the
-# dir's name) is skipped with a warning. `set -euo pipefail` comes from
+# the flavor, its name (MICROVM_NAME, or its project's basename; "-" for a
+# launch from before names were recorded), when it started, and the project.
+# Running ones first, then the oldest first. A dir whose instance.json is not
+# its own (its id is not the dir's name) is skipped with a warning. `set -euo pipefail` comes from
 # writeShellApplication.
 #
 # --json prints instead one array of every launch's instance.json, each with
@@ -59,7 +60,7 @@ fi
 
 # The project with $HOME as ~, as the session contract shows it.
 jq -r --arg home "${HOME:-}" '
-  ["ID", "STATE", "FLAVOR", "STARTED", "PROJECT"],
-  (.[] | [.id, (if .running then "running" else "stale" end), .flavor, .started,
+  ["ID", "STATE", "FLAVOR", "NAME", "STARTED", "PROJECT"],
+  (.[] | [.id, (if .running then "running" else "stale" end), .flavor, (.name // "-"), .started,
           (if $home != "" and (.work | startswith($home + "/")) then "~" + (.work | ltrimstr($home)) else .work end)])
   | @tsv' <<< "$all" | column -t -s $'\t'

@@ -281,7 +281,7 @@ Two cases call for something other than the default:
 
 ### Home directory persistence
 
-Agent state (sessions, credentials, settings) is stored in `$XDG_DATA_HOME/<agent>-microvm/<basename>-<hash>` (defaulting to `~/.local/share/<agent>-microvm/<basename>-<hash>`), where `<agent>` is the flavor name, `<basename>` is the first 12 chars of the project directory name, and `<hash>` is derived from the `WORK_DIR` path. Each agent has its own isolated home directory. All instances of the same agent on the same project share this directory automatically. To use a different directory, set `AGENT_HOME` explicitly:
+Agent state (sessions, credentials, settings) is stored in `$XDG_DATA_HOME/<agent>-microvm/<name>-<hash>` (defaulting to `~/.local/share/<agent>-microvm/<name>-<hash>`), where `<agent>` is the flavor name, `<name>` is the launch's [name](#naming-a-launch) — by default the first 12 chars of the project directory name — and `<hash>` is derived from the `WORK_DIR` path. Giving a launch a different `MICROVM_NAME` therefore gives it a different agent home. Each agent has its own isolated home directory. All instances of the same agent on the same project share this directory automatically. To use a different directory, set `AGENT_HOME` explicitly:
 
 ```sh
 AGENT_HOME=~/.my-agent-home make claude.run
@@ -343,7 +343,7 @@ and units:
 
 ```sh
 jq . "$XDG_RUNTIME_DIR"/claude-microvm/vms/*/instance.json
-# {"version":1,"pid":…,"flavor":"claude","vmId":…,"id":…,"started":…,
+# {"version":1,"pid":…,"flavor":"claude","name":…,"vmId":…,"id":…,"started":…,
 #  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
 #  "egressPolicy":"open","namespace":null,
 #  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…},
@@ -372,10 +372,10 @@ The launcher refuses to start without a runtime dir (`XDG_RUNTIME_DIR`, or
 
 ```
 $ microvm-list
-ID            STATE    FLAVOR  STARTED               PROJECT
-bbbbbbbbbbbb  running  gemini  2026-10-22T09:00:00Z  /srv/beta
-aaaaaaaaaaaa  running  claude  2026-10-22T10:00:00Z  ~/projects/alpha
-cccccccccccc  stale    claude  2026-10-22T08:00:00Z  ~/gamma
+ID            STATE    FLAVOR  NAME   STARTED               PROJECT
+bbbbbbbbbbbb  running  gemini  beta   2026-10-22T09:00:00Z  /srv/beta
+aaaaaaaaaaaa  running  claude  alpha  2026-10-22T10:00:00Z  ~/projects/alpha
+cccccccccccc  stale    claude  gamma  2026-10-22T08:00:00Z  ~/gamma
 ```
 
 `stale` is an instance directory whose launcher has gone without cleaning up —
@@ -493,6 +493,33 @@ namespace, or the default one when it is unset; the session contract's stop
 hint sets it. There is no flag for it: a namespace is for tools that run
 launches of their own, which set the variable for every call.
 `journalctl MICROVM_ID=<id>` works the same in every namespace.
+
+### Naming a launch
+
+A launch's name is what it is called where you see it: QEMU's `-name` and
+the process title (`microvm@<name>-<agent>-vm` in `ps`), `instance.json`'s
+`name` and `vmId`, the NAME column of `microvm-list`, the session contract's
+launch row, and every unit's description. It is also the first part of the
+default agent home, `<agent>-microvm/<name>-<hash>`.
+
+By default it is the project directory's name, cut to 12 characters. When
+that says little — a tool whose work directories all have the same name, say —
+`MICROVM_NAME` sets it:
+
+```sh
+MICROVM_NAME=widget-review microvm-run
+# ps:       microvm@widget-review-claude-vm
+# units:    claude microvm <id>: the VM, for widget-review (/path/to/project)
+```
+
+A name is letters, digits, `_`, `.` and `-`, starting with a letter or digit;
+the launcher refuses anything else before starting anything, rather than
+quietly changing it. A given name is used whole, at any length — only the
+default from the directory is cut to 12 characters — though with `AGENT_HOME`
+unset, `<name>-<hash>` must still fit the filesystem's 255-byte limit on a
+directory name. Names need not be unique — the launch ID is what
+keeps launches apart — but a different name means a different default agent
+home, so set `AGENT_HOME` to keep one across names.
 
 ### Sandboxing
 
@@ -803,7 +830,7 @@ Rebuild with `make claude`.
 | vCPUs    | 4       |
 | Network  | User-mode (SLiRP) |
 | Work dir | Host directory via virtiofs (read-write) |
-| Home dir | `~/.local/share/<agent>-microvm/<basename>-<hash>` (shared across instances) or custom via `AGENT_HOME` |
+| Home dir | `~/.local/share/<agent>-microvm/<name>-<hash>` (shared across instances) or custom via `AGENT_HOME` |
 | Root fs  | RAM-backed tmpfs (50% of `VM_MEM`) |
 | Nix store | Host store read-only over 9p, plus a 10 GiB sparse disk for what the VM writes — see [Writable Nix store disk](#writable-nix-store-disk) |
 
@@ -812,7 +839,8 @@ Rebuild with `make claude`.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `WORK_DIR` | Host directory to mount at `/work` | Current directory |
-| `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<hash>` |
+| `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<name>-<hash>` |
+| `MICROVM_NAME` | What the launch is called: QEMU's name and process title (`microvm@<name>-<agent>-vm`), `instance.json`, `microvm-list`, unit descriptions, the session contract, and the default agent home. Letters, digits, `_`, `.` and `-`, starting with a letter or digit, used whole — see [Naming a launch](#naming-a-launch) | the first 12 characters of the project directory's name |
 | `MICROVM_NAMESPACE` | Prefix for the launch's systemd units and runtime directory, e.g. `custom-namespace` → `custom-namespace-<id>.*` in `custom.slice`, `$XDG_RUNTIME_DIR/custom-namespace/vms/<id>/`. Lowercase words joined by single dashes; only the socket paths under it bound its length — see [Namespaces](#namespaces) | (`claude_microvm` / `claude-microvm`) |
 | `WORK_CACHE` | virtiofsd cache policy for `/work`: `auto`, `always`, `never` or `metadata` — see [Work share caching](#work-share-caching) | `auto` |
 | `AGENT_SETTINGS` | Host path to a settings file seeded into the agent home before boot (flavor-specific destination, e.g. `.claude/settings.json`) — see [Pre-seeding agent settings](#pre-seeding-agent-settings) | (none) |

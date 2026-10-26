@@ -368,6 +368,49 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
     ok "...and one character longer is refused, naming the namespace, before any daemon starts, leaving nothing"
   else bad "too-long namespace: rc $(cat $TMPDIR/toolongns/rc)"; cat $TMPDIR/toolongns/out >&2; fi
 
+  # --- the launch's name ------------------------------------------------------------
+  # Unset, it is WORK_DIR's basename, as the QEMU name always was.
+  [ "$(jq -r .name $TMPDIR/one/instance.json)" = w ] && [ "$(jq -r .vmId $TMPDIR/one/instance.json)" = w-claude-vm ] \
+    && ok "without MICROVM_NAME, the name is the work dir's basename" \
+    || bad "default name: $(jq -c '{name, vmId}' $TMPDIR/one/instance.json)"
+  # MICROVM_NAME replaces it everywhere it is shown, and in the default agent
+  # home; with AGENT_HOME unset here, that is where the agent's state goes.
+  launch named MICROVM_NAME=my-proj.v2 AGENT_HOME= XDG_DATA_HOME=$TMPDIR/data
+  L=$TMPDIR/named; NJ=$L/instance.json; NID=$(jq -r .id $NJ 2>/dev/null || true)
+  HASH=$(echo -n "$(realpath $WORK_DIR)" | sha256sum | cut -c1-12)
+  if [ "$(cat $L/rc)" = 0 ] && [ -e $L/started ] && [ "$(jq -r .name $NJ)" = my-proj.v2 ] \
+     && [ "$(jq -r .vmId $NJ)" = my-proj.v2-claude-vm ] \
+     && grep -qF -- "-name my-proj.v2-claude-vm" $L/qemu.sh && grep -qF "microvm@my-proj.v2-claude-vm" $L/qemu.sh; then
+    ok "MICROVM_NAME: instance.json's name and vmId, QEMU's -name and the process title"
+  else bad "named launch: rc $(cat $L/rc): $(jq -c '{name, vmId}' $NJ 2>/dev/null)"; cat $L/out >&2; fi
+  [ "$(jq -r .agentHome $NJ)" = "$TMPDIR/data/claude-microvm/my-proj.v2-$HASH" ] \
+    && ok "...the default agent home, <name>-<hash of the work dir>" || bad "named agent home: $(jq -r .agentHome $NJ)"
+  SC=$(jq -r .units.scope $NJ)
+  grep -qx -- "--description=claude microvm $NID: the VM, for my-proj.v2 ($WORK_DIR)" $L/$SC.opts \
+    && grep -qx -- "--description=claude microvm $NID: virtiofsd for /work, for my-proj.v2 ($WORK_DIR)" $L/$(jq -r .units.work $NJ).opts \
+    && ok "...the units' descriptions, with the project beside it" \
+    || { bad "named descriptions:"; grep -h -- --description $L/*.opts >&2 || true; }
+  grep -qF "my-proj.v2 · $NID · " $L/out && ok "...and the contract's launch row" \
+    || { bad "named contract row:"; grep launch $L/out >&2 || true; }
+  refused=0
+  for n in 'a,b' -lead .lead 'a b' 'a|b'; do
+    launch badname "MICROVM_NAME=$n"
+    if [ "$(cat $TMPDIR/badname/rc)" = 0 ] || [ -e $TMPDIR/badname/started ] || ! grep -q 'is not a name' $TMPDIR/badname/out; then
+      bad "MICROVM_NAME='$n' was not refused"; cat $TMPDIR/badname/out >&2
+    else refused=$((refused + 1)); fi
+    rm -rf $TMPDIR/badname
+  done
+  [ $refused = 5 ] && ok "a MICROVM_NAME with a comma, a space, a | or a leading - or . is refused before the VM starts"
+  # Only the name taken from the directory is cut to 12 characters; a given
+  # one is used whole, however long.
+  LONG=$(printf 'n%.0s' $(seq 1 100))
+  launch longname MICROVM_NAME=$LONG
+  L=$TMPDIR/longname
+  if [ "$(cat $L/rc)" = 0 ] && [ -e $L/started ] && [ "$(jq -r .name $L/instance.json)" = $LONG ] \
+     && grep -qF -- "-name $LONG-claude-vm" $L/qemu.sh; then
+    ok "a 100-character MICROVM_NAME is used whole, with no cut"
+  else bad "long name: rc $(cat $L/rc): $(jq -r .name $L/instance.json 2>/dev/null)"; cat $L/out >&2; fi
+
   # --- failure paths ----------------------------------------------------------------
   launch crash QEMU_RC=3
   [ "$(cat $TMPDIR/crash/rc)" = 3 ] && gone \

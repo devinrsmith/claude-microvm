@@ -124,10 +124,35 @@
           launcher = pkgs.writeShellScriptBin "microvm-run" ''
         set -euo pipefail
         WORK="$(realpath "''${WORK_DIR:-$(pwd)}")"
-        # Derive project basename for host-visible identifiers
-        WORK_BASENAME="$(basename "$WORK" | tr -cd 'a-zA-Z0-9_-' | head -c 12)"
-        [ -z "$WORK_BASENAME" ] && WORK_BASENAME="root"
-        VM_ID="$WORK_BASENAME-${hostname}"
+        # --- Name ---
+        # What this launch is called where people see it: QEMU's -name and the
+        # process title (microvm@<name>-${hostname}), instance.json, microvm-list,
+        # unit descriptions and the session contract; and the default agent
+        # home, <name>-<hash of WORK>. MICROVM_NAME sets it, for a launcher
+        # whose WORK_DIR basename says little (every one the same, say); else
+        # it is that basename, cleaned and cut to 12 characters, as before:
+        # the cut keeps a long directory name from swamping ps, and existing
+        # default agent homes where they are. A name that is given is used
+        # whole, and checked, not cleaned: it lands in QEMU's options, where a
+        # comma separates them, and in sed replacements. Its length is
+        # unlimited here; nothing takes it but free text and, with AGENT_HOME
+        # unset, the agent home's directory name, which the filesystem caps.
+        if [ -n "''${MICROVM_NAME:-}" ]; then
+          if ! [[ "$MICROVM_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+            echo "error: MICROVM_NAME=$MICROVM_NAME is not a name: letters, digits, '_', '.' and '-'," >&2
+            echo "       starting with a letter or digit" >&2
+            exit 1
+          fi
+          NAME="$MICROVM_NAME"
+        else
+          NAME="$(basename "$WORK" | tr -cd 'a-zA-Z0-9_-' | head -c 12)"
+          [ -z "$NAME" ] && NAME="root"
+        fi
+        VM_ID="$NAME-${hostname}"
+        # What units are described as being for: the project, and the name too
+        # when one was given, since it is then not the project's basename.
+        _FOR="$WORK"
+        [ -z "''${MICROVM_NAME:-}" ] || _FOR="$NAME ($WORK)"
 
         # --- Namespace ---
         # MICROVM_NAMESPACE names this launch's systemd units and its runtime
@@ -208,7 +233,7 @@
             export _MICROVM_ID _MICROVM_SCOPE
             exec ${pkgs.systemd}/bin/systemd-run --user --scope --quiet --collect \
               --unit="$_MICROVM_SCOPE" --slice="$UNIT_NS-$_MICROVM_ID.slice" \
-              --description="$_DESCRIBE $_MICROVM_ID: the VM, for $WORK" \
+              --description="$_DESCRIBE $_MICROVM_ID: the VM, for $_FOR" \
               -- "$0" "$@"
           fi
           echo "warning: cannot run this launch in a systemd --user scope: ''${_SCOPE_ERR:-systemd-run failed}" >&2
@@ -230,7 +255,7 @@
         if [ -n "$_MICROVM_SCOPE" ]; then
           _UNIT_PROPS+=(-p "BindsTo=$_MICROVM_SCOPE" -p "After=$_MICROVM_SCOPE")
         fi
-        describe () { printf -- '--description=%s %s: %s, for %s' "$_DESCRIBE" "$ID" "$1" "$WORK"; }
+        describe () { printf -- '--description=%s %s: %s, for %s' "$_DESCRIBE" "$ID" "$1" "$_FOR"; }
 
         VM_MEM="''${VM_MEM:-${toString defaultMem}}"
         VM_VCPU="''${VM_VCPU:-${toString defaultVcpu}}"
@@ -515,7 +540,7 @@
         if [ -z "''${AGENT_HOME:-}" ]; then
           DATA_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}"
           WORK_HASH="$(echo -n "$WORK" | sha256sum | cut -c1-12)"
-          AGENT_HOME="$DATA_HOME/${dataDirName}/$WORK_BASENAME-$WORK_HASH"
+          AGENT_HOME="$DATA_HOME/${dataDirName}/$NAME-$WORK_HASH"
         fi
         AGENT_DIR="$(realpath "$AGENT_HOME" 2>/dev/null || echo "$AGENT_HOME")"
         if [ ! -d "$AGENT_DIR" ]; then
@@ -531,13 +556,13 @@
         case "$EGRESS_POLICY" in alert|shadow|enforce) _EGRESS_UNIT_NAME="$UNIT_STEM-egress" ;; esac
         ${pkgs.jq}/bin/jq -n \
           --argjson pid "$$" --arg flavor ${lib.escapeShellArg agentName} \
-          --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          --arg name "$NAME" --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg work "$WORK" --arg agentHome "$AGENT_DIR" --arg guest "$INSTANCE_GUEST" \
           --arg egressPolicy "$EGRESS_POLICY" --arg namespace "$NAMESPACE" \
           --arg qmp "$QMP_SOCK" --arg workSock "$SOCK" --arg agentHomeSock "$AGENT_SOCK" --arg guestSock "$GUEST_SOCK" \
           --arg scopeUnit "$_MICROVM_SCOPE" --arg slice "$SLICE" \
           --arg workUnit "$UNIT" --arg agentHomeUnit "$AGENT_UNIT" --arg guestUnit "$GUEST_UNIT" --arg egressUnit "$_EGRESS_UNIT_NAME" \
-          '{version: 1, pid: $pid, flavor: $flavor, vmId: $vmId, id: $id, started: $started,
+          '{version: 1, pid: $pid, flavor: $flavor, name: $name, vmId: $vmId, id: $id, started: $started,
             work: $work, agentHome: $agentHome, guest: $guest, guestMount: "/run/microvm",
             egressPolicy: $egressPolicy,
             namespace: (if $namespace == "" then null else $namespace end),
@@ -1259,7 +1284,7 @@ EOF
         _row resources "" "''${VM_MEM} MiB RAM · $VM_VCPU vCPUs${lib.optionalString storeDiskBacked " · writable store \${VM_STORE_SIZE} MiB, fresh each boot"}"
         # The handle on this launch from outside the VM: its units, its slice,
         # its journal tag and its instance dir all carry the ID.
-        _row launch "" "$ID · $INSTANCE_DIR/"
+        _row launch "" "$NAME · $ID · $INSTANCE_DIR/"
         # microvm-stop presses the VM's power button over QMP, so the guest
         # shuts down cleanly and this launcher cleans up — with or without a
         # scope. Stopping the slice is no substitute: it kills QEMU outright,
