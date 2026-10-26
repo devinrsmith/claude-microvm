@@ -9,8 +9,8 @@
 # whether it is still running — a dir whose lock is free is one a killed
 # launcher left.
 #
-# $ns_pattern and $ns_max come first, from flake.nix, so the tools and the
-# launcher check a namespace against the same rule.
+# $ns_pattern comes first, from flake.nix, so the tools and the launcher
+# check a namespace against the same rule.
 
 # Sets $vms for MICROVM_NAMESPACE, as the launcher reads it, else the default.
 # A tool looks in one namespace at a time, as a launch lives in one. Only the
@@ -20,10 +20,10 @@ use_namespace() {
   local ns="${MICROVM_NAMESPACE:-}" root
   if [ -z "$ns" ]; then
     root=claude-microvm
-  elif [[ "$ns" =~ $ns_pattern ]] && [ "${#ns}" -le "$ns_max" ]; then
+  elif [[ "$ns" =~ $ns_pattern ]]; then
     root="$ns"
   else
-    echo "$(basename "$0"): MICROVM_NAMESPACE=$ns is not a namespace: up to $ns_max characters of lowercase words (a-z, 0-9, _) joined by single dashes, starting with a letter" >&2
+    echo "$(basename "$0"): MICROVM_NAMESPACE=$ns is not a namespace: lowercase words (a-z, 0-9, _) joined by single dashes, starting with a letter" >&2
     exit 2
   fi
   vms="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$root/vms"
