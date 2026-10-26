@@ -140,6 +140,32 @@ pkgs.runCommand "microvm-stop" { nativeBuildInputs = with pkgs; [ jq socat util-
   else bad "mismatched id: rc $rc: $msg"; fi
   touch $TMPDIR/666666666666.off
 
+  # --- namespaces ---------------------------------------------------------------
+  # A launch with MICROVM_NAMESPACE=custom-namespace lives under
+  # custom-namespace/vms/: an ID is looked up there with the same variable,
+  # and only there. No flag.
+  DEFAULT_VMS=$VMS; VMS=$XDG_RUNTIME_DIR/custom-namespace/vms
+  fake 888888888888
+  VMS=$DEFAULT_VMS
+  run 888888888888
+  [ $rc = 1 ] && grep -q 'no launch 888888888888' <<< "$msg" && [ ! -e $TMPDIR/888888888888.qmp ] \
+    && ok "a namespaced launch is not found in the default namespace" || bad "found outside its namespace: rc $rc: $msg"
+  MICROVM_NAMESPACE=custom-namespace run 888888888888
+  if [ $rc = 0 ] && grep -q '888888888888 stopped' <<< "$msg" && [ ! -e $XDG_RUNTIME_DIR/custom-namespace/vms/888888888888 ]; then
+    ok "MICROVM_NAMESPACE: stops the launch by ID in its namespace"
+  else bad "MICROVM_NAMESPACE: rc $rc: $msg"; fi
+  rm -f $TMPDIR/888888888888.off
+  VMS=$XDG_RUNTIME_DIR/custom-namespace/vms; fake 888888888888; VMS=$DEFAULT_VMS
+  MICROVM_NAMESPACE=custom-namespace run
+  [ $rc = 0 ] && grep -q '888888888888 stopped' <<< "$msg" \
+    && ok "...and with no argument: the only running launch in that namespace" \
+    || bad "MICROVM_NAMESPACE, no argument: rc $rc: $msg"
+  MICROVM_NAMESPACE=a--b run 888888888888
+  [ $rc = 2 ] && grep -q 'is not a namespace' <<< "$msg" && ok "a MICROVM_NAMESPACE that breaks the rule is a usage error" \
+    || bad "bad namespace: rc $rc: $msg"
+  run --namespace custom-namespace 888888888888
+  [ $rc = 2 ] && ok "there is no --namespace flag" || bad "--namespace accepted: rc $rc: $msg"
+
   run 999999999999
   [ $rc = 1 ] && grep -q 'no launch 999999999999' <<< "$msg" && ok "an unknown ID is reported (exit 1)" || bad "unknown: rc $rc: $msg"
   run not-an-id
