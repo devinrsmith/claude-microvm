@@ -128,7 +128,7 @@
         # What this launch is called where people see it: QEMU's -name and the
         # process title (microvm@<name>-${hostname}), instance.json, microvm-list,
         # unit descriptions and the session contract; and the default agent
-        # home, <name>-<hash of WORK>. MICROVM_NAME sets it, for a launcher
+        # home (see "Agent home share"). MICROVM_NAME sets it, for a launcher
         # whose WORK_DIR basename says little (every one the same, say); else
         # it is that basename, cleaned and cut to 12 characters, as before:
         # the cut keeps a long directory name from swamping ps, and existing
@@ -537,10 +537,20 @@
         [ -S "$SOCK" ] || { echo "error: virtiofsd socket did not appear"; exit 1; }
 
         # --- Agent home share (virtiofsd) ---
+        # The default is per project: <basename>-<hash of WORK>, the hash
+        # keeping apart two directories that share a basename (or its first 12
+        # characters). A name that was given is a handle someone chose, and is
+        # the key by itself: launches with the same MICROVM_NAME share an agent
+        # home, whatever their WORK_DIR — and with it everything derived from
+        # its path below (-cri, -store, -egress).
         if [ -z "''${AGENT_HOME:-}" ]; then
           DATA_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}"
-          WORK_HASH="$(echo -n "$WORK" | sha256sum | cut -c1-12)"
-          AGENT_HOME="$DATA_HOME/${dataDirName}/$NAME-$WORK_HASH"
+          if [ -n "''${MICROVM_NAME:-}" ]; then
+            AGENT_HOME="$DATA_HOME/${dataDirName}/$NAME"
+          else
+            WORK_HASH="$(echo -n "$WORK" | sha256sum | cut -c1-12)"
+            AGENT_HOME="$DATA_HOME/${dataDirName}/$NAME-$WORK_HASH"
+          fi
         fi
         AGENT_DIR="$(realpath "$AGENT_HOME" 2>/dev/null || echo "$AGENT_HOME")"
         if [ ! -d "$AGENT_DIR" ]; then

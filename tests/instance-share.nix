@@ -373,7 +373,7 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   [ "$(jq -r .name $TMPDIR/one/instance.json)" = w ] && [ "$(jq -r .vmId $TMPDIR/one/instance.json)" = w-claude-vm ] \
     && ok "without MICROVM_NAME, the name is the work dir's basename" \
     || bad "default name: $(jq -c '{name, vmId}' $TMPDIR/one/instance.json)"
-  # MICROVM_NAME replaces it everywhere it is shown, and in the default agent
+  # MICROVM_NAME replaces it everywhere it is shown, and keys the default agent
   # home; with AGENT_HOME unset here, that is where the agent's state goes.
   launch named MICROVM_NAME=my-proj.v2 AGENT_HOME= XDG_DATA_HOME=$TMPDIR/data
   L=$TMPDIR/named; NJ=$L/instance.json; NID=$(jq -r .id $NJ 2>/dev/null || true)
@@ -383,8 +383,19 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
      && grep -qF -- "-name my-proj.v2-claude-vm" $L/qemu.sh && grep -qF "microvm@my-proj.v2-claude-vm" $L/qemu.sh; then
     ok "MICROVM_NAME: instance.json's name and vmId, QEMU's -name and the process title"
   else bad "named launch: rc $(cat $L/rc): $(jq -c '{name, vmId}' $NJ 2>/dev/null)"; cat $L/out >&2; fi
-  [ "$(jq -r .agentHome $NJ)" = "$TMPDIR/data/claude-microvm/my-proj.v2-$HASH" ] \
-    && ok "...the default agent home, <name>-<hash of the work dir>" || bad "named agent home: $(jq -r .agentHome $NJ)"
+  [ "$(jq -r .agentHome $NJ)" = "$TMPDIR/data/claude-microvm/my-proj.v2" ] \
+    && ok "...the default agent home, <name> alone, with no hash" || bad "named agent home: $(jq -r .agentHome $NJ)"
+  # The name is the agent home's key: another project under the same name gets
+  # the same one. Without a name, the default is still per project.
+  mkdir -p $TMPDIR/elsewhere
+  launch named2 MICROVM_NAME=my-proj.v2 AGENT_HOME= XDG_DATA_HOME=$TMPDIR/data WORK_DIR=$TMPDIR/elsewhere
+  [ "$(jq -r .agentHome $TMPDIR/named2/instance.json)" = "$TMPDIR/data/claude-microvm/my-proj.v2" ] \
+    && ok "...shared by a launch with the same name on another project" \
+    || bad "same name, other project: $(jq -r .agentHome $TMPDIR/named2/instance.json)"
+  launch unnamed AGENT_HOME= XDG_DATA_HOME=$TMPDIR/data
+  [ "$(jq -r .agentHome $TMPDIR/unnamed/instance.json)" = "$TMPDIR/data/claude-microvm/w-$HASH" ] \
+    && ok "without MICROVM_NAME, the default agent home is still <basename>-<hash of the work dir>" \
+    || bad "unnamed agent home: $(jq -r .agentHome $TMPDIR/unnamed/instance.json)"
   SC=$(jq -r .units.scope $NJ)
   grep -qx -- "--description=claude microvm $NID: the VM, for my-proj.v2 ($WORK_DIR)" $L/$SC.opts \
     && grep -qx -- "--description=claude microvm $NID: virtiofsd for /work, for my-proj.v2 ($WORK_DIR)" $L/$(jq -r .units.work $NJ).opts \

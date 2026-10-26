@@ -281,7 +281,7 @@ Two cases call for something other than the default:
 
 ### Home directory persistence
 
-Agent state (sessions, credentials, settings) is stored in `$XDG_DATA_HOME/<agent>-microvm/<name>-<hash>` (defaulting to `~/.local/share/<agent>-microvm/<name>-<hash>`), where `<agent>` is the flavor name, `<name>` is the launch's [name](#naming-a-launch) — by default the first 12 chars of the project directory name — and `<hash>` is derived from the `WORK_DIR` path. Giving a launch a different `MICROVM_NAME` therefore gives it a different agent home. Each agent has its own isolated home directory. All instances of the same agent on the same project share this directory automatically. To use a different directory, set `AGENT_HOME` explicitly:
+Agent state (sessions, credentials, settings) is stored in `$XDG_DATA_HOME/<agent>-microvm/<basename>-<hash>` (defaulting to `~/.local/share/<agent>-microvm/<basename>-<hash>`), where `<agent>` is the flavor name, `<basename>` is the first 12 chars of the project directory name, and `<hash>` is derived from the `WORK_DIR` path. Each agent has its own isolated home directory. All instances of the same agent on the same project share this directory automatically. A launch given a [`MICROVM_NAME`](#naming-a-launch) uses `<agent>-microvm/<name>` instead — no hash — so launches that share a name share a home, whatever their project. To use a different directory, set `AGENT_HOME` explicitly:
 
 ```sh
 AGENT_HOME=~/.my-agent-home make claude.run
@@ -499,8 +499,7 @@ launches of their own, which set the variable for every call.
 A launch's name is what it is called where you see it: QEMU's `-name` and
 the process title (`microvm@<name>-<agent>-vm` in `ps`), `instance.json`'s
 `name` and `vmId`, the NAME column of `microvm-list`, the session contract's
-launch row, and every unit's description. It is also the first part of the
-default agent home, `<agent>-microvm/<name>-<hash>`.
+launch row, and every unit's description.
 
 By default it is the project directory's name, cut to 12 characters. When
 that says little — a tool whose work directories all have the same name, say —
@@ -516,10 +515,27 @@ A name is letters, digits, `_`, `.` and `-`, starting with a letter or digit;
 the launcher refuses anything else before starting anything, rather than
 quietly changing it. A given name is used whole, at any length — only the
 default from the directory is cut to 12 characters — though with `AGENT_HOME`
-unset, `<name>-<hash>` must still fit the filesystem's 255-byte limit on a
-directory name. Names need not be unique — the launch ID is what
-keeps launches apart — but a different name means a different default agent
-home, so set `AGENT_HOME` to keep one across names.
+unset it is also a directory name, so it must fit the filesystem's 255-byte
+limit on one.
+
+A given name is also the agent home's identity. With `AGENT_HOME` unset, the
+default is `<agent>-microvm/<name>` — not the per-project
+`<basename>-<hash>` — so the name decides whose state a launch sees:
+
+- **Reuse a name to share state.** Two checkouts or worktrees of one project
+  launched as `widget-review` share credentials, settings and sessions.
+- **Use distinct names to keep projects apart.** The agent's per-project state
+  is keyed by its working directory, which in the guest is always `/work`, so
+  two different projects under one name see each other's sessions and memory
+  (for Claude Code, `~/.claude/projects/-work/`). `AGENT_HOME` sets a home
+  outright, whatever the name.
+- **Don't run two VMs with one name at once if they use containers.** The
+  container storage disk (`<agent home>-cri/`) belongs to the agent home, and
+  two running VMs would both write to it — as two concurrent launches of one
+  project without a name already would.
+
+Names need not be unique otherwise: the launch ID is what keeps launches
+apart.
 
 ### Sandboxing
 
@@ -830,7 +846,7 @@ Rebuild with `make claude`.
 | vCPUs    | 4       |
 | Network  | User-mode (SLiRP) |
 | Work dir | Host directory via virtiofs (read-write) |
-| Home dir | `~/.local/share/<agent>-microvm/<name>-<hash>` (shared across instances) or custom via `AGENT_HOME` |
+| Home dir | `~/.local/share/<agent>-microvm/<basename>-<hash>`, or `<name>` under `MICROVM_NAME` (shared across instances) or custom via `AGENT_HOME` |
 | Root fs  | RAM-backed tmpfs (50% of `VM_MEM`) |
 | Nix store | Host store read-only over 9p, plus a 10 GiB sparse disk for what the VM writes — see [Writable Nix store disk](#writable-nix-store-disk) |
 
@@ -839,8 +855,8 @@ Rebuild with `make claude`.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `WORK_DIR` | Host directory to mount at `/work` | Current directory |
-| `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<name>-<hash>` |
-| `MICROVM_NAME` | What the launch is called: QEMU's name and process title (`microvm@<name>-<agent>-vm`), `instance.json`, `microvm-list`, unit descriptions, the session contract, and the default agent home. Letters, digits, `_`, `.` and `-`, starting with a letter or digit, used whole — see [Naming a launch](#naming-a-launch) | the first 12 characters of the project directory's name |
+| `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<basename>-<hash>`; `…/<name>` under `MICROVM_NAME` |
+| `MICROVM_NAME` | What the launch is called: QEMU's name and process title (`microvm@<name>-<agent>-vm`), `instance.json`, `microvm-list`, unit descriptions, the session contract, and the default agent home (`<agent>-microvm/<name>`, shared by every launch with that name). Letters, digits, `_`, `.` and `-`, starting with a letter or digit, used whole — see [Naming a launch](#naming-a-launch) | the first 12 characters of the project directory's name |
 | `MICROVM_NAMESPACE` | Prefix for the launch's systemd units and runtime directory, e.g. `custom-namespace` → `custom-namespace-<id>.*` in `custom.slice`, `$XDG_RUNTIME_DIR/custom-namespace/vms/<id>/`. Lowercase words joined by single dashes; only the socket paths under it bound its length — see [Namespaces](#namespaces) | (`claude_microvm` / `claude-microvm`) |
 | `WORK_CACHE` | virtiofsd cache policy for `/work`: `auto`, `always`, `never` or `metadata` — see [Work share caching](#work-share-caching) | `auto` |
 | `AGENT_SETTINGS` | Host path to a settings file seeded into the agent home before boot (flavor-specific destination, e.g. `.claude/settings.json`) — see [Pre-seeding agent settings](#pre-seeding-agent-settings) | (none) |
