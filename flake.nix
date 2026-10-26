@@ -198,7 +198,7 @@
         # What this launch is called where people see it: QEMU's -name and the
         # process title (microvm@<name>-${hostname}), instance.json,
         # unit descriptions and the session contract; and the default agent
-        # home, <name>-<hash of WORK>. MICROVM_NAME sets it, for a launcher
+        # home (see "Agent home share"). MICROVM_NAME sets it, for a launcher
         # whose WORK_DIR basename says little (every one the same, say); else
         # it is that basename, cleaned and cut to 12 characters, as before:
         # the cut keeps a long directory name from swamping ps, and existing
@@ -775,11 +775,22 @@
 
         # --- Agent home share (virtiofsd) ---
         DATA_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}"
-        WORK_HASH="$(echo -n "$WORK" | sha256sum | cut -c1-12)"
-        # The project's own agent home. An ephemeral launch does not use it,
-        # but its egress logs still go beside it (EGRESS_DIR below): they are
-        # the record of what the launch did, and outlive it on purpose.
-        PROJECT_HOME="$DATA_HOME/${dataDirName}/$NAME-$WORK_HASH"
+        # The project's own agent home, which a launch uses unless it is
+        # ephemeral or AGENT_HOME says otherwise. The default is per project:
+        # <name>-<hash of WORK>, the hash keeping apart two directories that
+        # share a basename (or its first 12 characters). A name that was given
+        # is a handle someone chose, and is the key by itself: launches with
+        # the same MICROVM_NAME share an agent home, whatever their WORK_DIR —
+        # and with it everything derived from its path below (-cri, -store,
+        # -egress). An ephemeral launch does not use it, but its egress logs
+        # still go beside it (EGRESS_DIR below): they are the record of what
+        # the launch did, and outlive it on purpose.
+        if [ -n "''${MICROVM_NAME:-}" ]; then
+          PROJECT_HOME="$DATA_HOME/${dataDirName}/$NAME"
+        else
+          WORK_HASH="$(echo -n "$WORK" | sha256sum | cut -c1-12)"
+          PROJECT_HOME="$DATA_HOME/${dataDirName}/$NAME-$WORK_HASH"
+        fi
         if [ "$AGENT_HOME_MODE" = ephemeral ]; then
           # On disk, not in the runtime dir: an agent home holds caches that
           # run to gigabytes. Named by the launch ID, like the instance dir,
