@@ -73,10 +73,10 @@
       # What MICROVM_NAMESPACE may be (see "Namespace" in the launcher). It
       # names systemd units and a directory, and a dash in a slice name is a
       # level of nesting, so: lowercase words of letters, digits and
-      # underscores, joined by single dashes. The launcher and the tools
-      # check against this one pattern.
+      # underscores, joined by single dashes. No length of its own: what
+      # bounds it is the launcher's check on the socket paths under it. The
+      # launcher and the tools check against this one pattern.
       namespacePattern = "^[a-z][a-z0-9_]*(-[a-z0-9_]+)*$";
-      namespaceMaxLength = 32;
 
       # Tools for launches from outside the VM, flavor-independent since every
       # launch's instance dir is under the same root (per namespace); each is
@@ -88,7 +88,6 @@
         runtimeInputs = with pkgs; [ coreutils gnugrep jq socat util-linux ];
         text = ''
           ns_pattern=${lib.escapeShellArg namespacePattern}
-          ns_max=${toString namespaceMaxLength}
         '' + builtins.readFile ./scripts/microvm-instances.sh
           + builtins.readFile ./scripts/${name}.sh;
       };
@@ -145,9 +144,9 @@
         NAMESPACE="''${MICROVM_NAMESPACE:-}"
         if [ -n "$NAMESPACE" ]; then
           _NS_PATTERN=${lib.escapeShellArg namespacePattern}
-          if ! [[ "$NAMESPACE" =~ $_NS_PATTERN ]] || [ "''${#NAMESPACE}" -gt ${toString namespaceMaxLength} ]; then
-            echo "error: MICROVM_NAMESPACE=$NAMESPACE is not a namespace: up to ${toString namespaceMaxLength} characters of" >&2
-            echo "       lowercase words (a-z, 0-9, _) joined by single dashes, starting with a letter" >&2
+          if ! [[ "$NAMESPACE" =~ $_NS_PATTERN ]]; then
+            echo "error: MICROVM_NAMESPACE=$NAMESPACE is not a namespace: lowercase words (a-z, 0-9, _)" >&2
+            echo "       joined by single dashes, starting with a letter" >&2
             exit 1
           fi
           UNIT_NS="$NAMESPACE"
@@ -402,15 +401,17 @@
         GUEST_UNIT="$UNIT_STEM-guest"
         # sun_path is 108 bytes, NUL included. The longest default is
         # /run/user/<uid>/claude-microvm/vms/<id>/agent-home.sock, 62 bytes for
-        # a 4-digit uid, leaving room for longer uids, runtime dirs and namespaces
-        # (a namespace of the full ${toString namespaceMaxLength} characters adds 18 bytes);
-        # tests/instance-share.nix checks a 7-digit uid's. A
-        # runtime dir long enough to break it would otherwise surface as QEMU
-        # or virtiofsd failing to bind, after the daemons before it had started.
+        # a 4-digit uid, leaving room for longer uids and runtime dirs;
+        # tests/instance-share.nix checks a 7-digit uid's. A namespace takes
+        # the place of claude-microvm/ and has no length limit of its own, so
+        # this is also what bounds it: 59 characters under /run/user/<4-digit
+        # uid>. A runtime dir or namespace long enough to break it
+        # would otherwise surface as QEMU or virtiofsd failing to bind, after
+        # the daemons before it had started.
         for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK"; do
           if [ "''${#_s}" -gt 107 ]; then
             echo "error: socket path too long (''${#_s} bytes, the limit is 107): $_s" >&2
-            echo "       it is under XDG_RUNTIME_DIR=$RUNTIME; a shorter one avoids this" >&2
+            echo "       it is under XDG_RUNTIME_DIR=$RUNTIME''${NAMESPACE:+ and MICROVM_NAMESPACE=$NAMESPACE}; a shorter one avoids this" >&2
             exit 1
           fi
         done

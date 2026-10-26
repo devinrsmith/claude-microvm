@@ -91,12 +91,16 @@ pkgs.runCommand "microvm-list" { nativeBuildInputs = with pkgs; [ jq util-linux 
   ! grep -q ffffffffffff <<< "$msg" && ok "the default namespace does not list a namespaced launch" \
     || bad "default listed the namespaced launch: $msg"
   refused=0
-  for ns in Custom a--b -a a- 1a "a b" $(printf 'a%.0s' $(seq 1 33)); do
+  for ns in Custom a--b -a a- 1a "a b"; do
     MICROVM_NAMESPACE="$ns" run
     if [ $rc = 2 ] && grep -q 'is not a namespace' $TMPDIR/err; then refused=$((refused + 1))
     else bad "namespace '$ns' accepted: rc $rc"; fi
   done
-  [ $refused = 7 ] && ok "a MICROVM_NAMESPACE that breaks the rule is a usage error"
+  [ $refused = 6 ] && ok "a MICROVM_NAMESPACE that breaks the rule is a usage error"
+  # No length limit of its own: only the launcher's socket paths bound it.
+  MICROVM_NAMESPACE=$(printf 'a%.0s' $(seq 1 80)) run
+  [ $rc = 0 ] && grep -q 'no launches' $TMPDIR/err && ok "a long MICROVM_NAMESPACE is not refused for its length" \
+    || bad "long namespace: rc $rc: $(cat $TMPDIR/err)"
   run --namespace custom-namespace
   [ $rc = 2 ] && ok "there is no --namespace flag" || bad "--namespace accepted: rc $rc"
 

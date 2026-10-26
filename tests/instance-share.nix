@@ -345,17 +345,28 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
   [[ "$(jq -r .id $LJ)" =~ ^[0-9a-f]{12}$ ]] && ok "the launch ID is 12 hex digits" || bad "launch ID is '$(jq -r .id $LJ)'"
   [ -z "$(ls -A $RT/claude-microvm/vms 2>/dev/null)" ] || bad "longest-path launch left: $(ls -R $RT)"
 
-  # The same, under the longest namespace the launcher accepts: it replaces
-  # claude-microvm/ in every socket path, 18 bytes longer.
-  NS=$(printf 'n%.0s' $(seq 1 32))
+  # The same, under the longest namespace that fits. A namespace has no length
+  # limit of its own; it replaces claude-microvm/ in every socket path, so the
+  # 107-byte limit on those is what bounds it: $RT/<ns>/vms/<id>/agent-home.sock
+  # is 34 bytes plus $RT and the namespace.
+  NS=$(printf 'n%.0s' $(seq 1 $((107 - 34 - ''${#RT}))))
   launch longestns XDG_RUNTIME_DIR=$RT WORK_DIR=$TMPDIR/longprojectname MICROVM_NAMESPACE=$NS
   LJ=$TMPDIR/longestns/instance.json
   longest=$({ jq -r '.sockets[]' $LJ 2>/dev/null || true; } | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
   if [ "$(cat $TMPDIR/longestns/rc)" = 0 ] && [ -e $TMPDIR/longestns/started ] && [ "$longest" -le 107 ] \
      && [ "$(jq -r .namespace $LJ)" = $NS ] && [ "$(jq -r .sockets.qmp $LJ)" = "$RT/$NS/vms/$(jq -r .id $LJ)/qmp.sock" ]; then
-    ok "...and under a 32-character MICROVM_NAMESPACE, in <ns>/vms/<id>: longest socket path $longest bytes, of 107"
+    ok "...and under the longest MICROVM_NAMESPACE that fits (''${#NS} characters), in <ns>/vms/<id>: longest socket path $longest bytes, of 107"
   else bad "longest namespaced paths: rc $(cat $TMPDIR/longestns/rc), longest socket $longest"; cat $TMPDIR/longestns/out >&2; fi
   [ -z "$(ls -A $RT/$NS/vms 2>/dev/null)" ] || bad "longest namespaced launch left: $(ls -R $RT)"
+  # One character more and a socket path is past the limit: refused, naming
+  # the namespace, before any daemon starts.
+  NS="''${NS}n"
+  launch toolongns XDG_RUNTIME_DIR=$RT WORK_DIR=$TMPDIR/longprojectname MICROVM_NAMESPACE=$NS
+  if [ "$(cat $TMPDIR/toolongns/rc)" != 0 ] && grep -q 'socket path too long (108 bytes' $TMPDIR/toolongns/out \
+     && grep -qF "MICROVM_NAMESPACE=$NS" $TMPDIR/toolongns/out \
+     && [ -z "$(find $TMPDIR/toolongns -name '*.args')" ] && [ -z "$(ls -A $RT/$NS/vms 2>/dev/null)" ]; then
+    ok "...and one character longer is refused, naming the namespace, before any daemon starts, leaving nothing"
+  else bad "too-long namespace: rc $(cat $TMPDIR/toolongns/rc)"; cat $TMPDIR/toolongns/out >&2; fi
 
   # --- failure paths ----------------------------------------------------------------
   launch crash QEMU_RC=3

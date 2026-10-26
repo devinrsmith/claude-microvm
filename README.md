@@ -478,8 +478,12 @@ One value names both, so they cannot disagree about which launches belong
 together. A dash in a slice name is a level of nesting, which is how
 `custom-namespace` lands inside `custom.slice` beside whatever else that tool
 runs there; a namespace is therefore lowercase words — letters, digits and
-underscores — joined by single dashes, starting with a letter, at most 32
-characters. The launcher refuses anything else before starting anything.
+underscores — joined by single dashes, starting with a letter. The launcher
+refuses anything else before starting anything. A namespace has no length
+limit of its own, but it replaces `claude-microvm` in every socket path, and a
+socket path must fit in 107 bytes: under `/run/user/<4-digit uid>`, that
+allows up to 59 characters, and the launcher refuses a longer one, again
+before any daemon starts.
 Unset, the names are the default ones above (`claude_microvm` for units,
 `claude-microvm` for the directory).
 
@@ -809,7 +813,7 @@ Rebuild with `make claude`.
 |----------|-------------|---------|
 | `WORK_DIR` | Host directory to mount at `/work` | Current directory |
 | `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<hash>` |
-| `MICROVM_NAMESPACE` | Prefix for the launch's systemd units and runtime directory, e.g. `custom-namespace` → `custom-namespace-<id>.*` in `custom.slice`, `$XDG_RUNTIME_DIR/custom-namespace/vms/<id>/`. Lowercase words joined by single dashes, at most 32 characters — see [Namespaces](#namespaces) | (`claude_microvm` / `claude-microvm`) |
+| `MICROVM_NAMESPACE` | Prefix for the launch's systemd units and runtime directory, e.g. `custom-namespace` → `custom-namespace-<id>.*` in `custom.slice`, `$XDG_RUNTIME_DIR/custom-namespace/vms/<id>/`. Lowercase words joined by single dashes; only the socket paths under it bound its length — see [Namespaces](#namespaces) | (`claude_microvm` / `claude-microvm`) |
 | `WORK_CACHE` | virtiofsd cache policy for `/work`: `auto`, `always`, `never` or `metadata` — see [Work share caching](#work-share-caching) | `auto` |
 | `AGENT_SETTINGS` | Host path to a settings file seeded into the agent home before boot (flavor-specific destination, e.g. `.claude/settings.json`) — see [Pre-seeding agent settings](#pre-seeding-agent-settings) | (none) |
 | `VM_MEM` | VM memory in MB | `8192` |
