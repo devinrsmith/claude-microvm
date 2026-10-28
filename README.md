@@ -297,7 +297,7 @@ Each launch keeps what is its alone in one directory under the runtime dir:
 $XDG_RUNTIME_DIR/claude-microvm/          one root for every flavor; <ns>/ under MICROVM_NAMESPACE
   vms/<id>/                               this launch; owner-only; <id> is 12 hex digits
     guest/                                exported read-only at /run/microvm
-      env  ca-certs/  nix-db.sqlite
+      env  ca-certs/  nix-db.sqlite  context/
     instance.json                         what this launch is (see below)
     lock                                  held while the launch runs
     qmp.sock                              QEMU's QMP control socket
@@ -314,6 +314,7 @@ project and writable from each guest:
 | `/run/microvm/env` | the values the launcher passes in — API keys, `EXTRA_ENV`, `ENABLE_CRI`, the egress settings — sourced by the agent's shell and read as data by the guest's services |
 | `/run/microvm/ca-certs/` | `EXTRA_CA_CERTS` |
 | `/run/microvm/nix-db.sqlite` | the snapshot of the host's Nix database the guest imports at boot |
+| `/run/microvm/context/` | `MICROVM_CONTEXT`, when given: data for this launch alone — see [Per-launch context](#per-launch-context) |
 
 Its virtiofsd runs with `--readonly`, so nothing in the guest — root included —
 can change these files, and two VMs on the same project each see only their
@@ -345,7 +346,7 @@ and units:
 jq . "$XDG_RUNTIME_DIR"/claude-microvm/vms/*/instance.json
 # {"version":1,"pid":…,"flavor":"claude","name":…,"vmId":…,"id":…,"started":…,
 #  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
-#  "egressPolicy":"open","namespace":null,
+#  "egressPolicy":"open","context":null,"namespace":null,
 #  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…},
 #  "slice":"claude_microvm.slice",
 #  "units":{"scope":…,"work":…,"agentHome":…,"guest":…,"egress":null}}
@@ -536,6 +537,66 @@ default is `<agent>-microvm/<name>` — not the per-project
 
 Names need not be unique otherwise: the launch ID is what keeps launches
 apart.
+
+### Per-launch context
+
+`MICROVM_CONTEXT` hands one launch data of its own — a prompt, a task
+description, structured input — that the guest finds at
+`/run/microvm/context/`. It is what sets apart launches that share everything
+else: several VMs on one project and one agent home, at once, each given a
+different job.
+
+```sh
+# A directory: its contents, as they are
+mkdir -p ctx-a ctx-b
+echo 'Review the parser for error handling.' > ctx-a/prompt.md
+echo '{"role": "reviewer", "paths": ["src/parser"]}' > ctx-a/task.json
+echo 'Write the missing docs for src/parser.' > ctx-b/prompt.md
+MICROVM_CONTEXT=ctx-a NO_PAUSE=1 microvm-run &
+MICROVM_CONTEXT=ctx-b NO_PAUSE=1 microvm-run &
+
+# A file: under its own name
+MICROVM_CONTEXT=./prompt.md microvm-run      # → /run/microvm/context/prompt.md
+```
+
+In the guest:
+
+```sh
+$ echo "$MICROVM_CONTEXT_DIR"
+/run/microvm/context
+$ ls "$MICROVM_CONTEXT_DIR"
+prompt.md  task.json
+```
+
+- **What the guest gets.** A directory's contents, hidden files and
+  subdirectories included, land in `context/` as they are; a file lands there
+  under its own name. `MICROVM_CONTEXT_DIR` is in the agent's environment
+  (from `/run/microvm/env`) only when the launch was given a context, so its
+  presence says whether there is one. The guest's NixOS modules can name the
+  path as `config.claude-vm.instance.contextDir`.
+- **Read-only, and this launch's alone.** It is on the
+  [guest share](#per-launch-instance-directory), so nothing in the guest can
+  change it, and no other launch sees it — unlike agent home or `/work`, which
+  every launch on the project shares.
+- **A copy, taken at launch.** Changing the host's files afterwards does not
+  reach a running guest, and the copy goes with the instance directory when
+  the launch ends. It lives in the runtime dir, which is tmpfs: it costs host
+  memory for as long as the VM runs, so it is for prompts and task data, not
+  datasets — put those in the project.
+- **Refused, not skipped.** A path that does not exist or cannot be read, or a
+  directory holding anything but regular files and directories — a symlink, a
+  FIFO, a socket, a device — stops the launch before anything starts. A
+  launch without its context is not the launch that was asked for. (A symlink
+  would also mean something else in the guest, which resolves it against its
+  own filesystem.) The path itself may be a symlink; it is resolved.
+- **Visible.** The session contract lists it on the guest-share row — from
+  where, how many files, how big — and `instance.json` records the host path
+  as `context` (`null` without one).
+
+How the agent is told to use the context is up to whoever launches it: point
+it there from `AGENTS_ARGS` (`-p "Your task is in /run/microvm/context/prompt.md"`),
+from an instruction file in the project or agent home, or from a tool the
+agent runs.
 
 ### Sandboxing
 
@@ -858,6 +919,7 @@ Rebuild with `make claude`.
 | `AGENT_HOME` | Host directory for agent state (mounted at `/home/agent`) | `$XDG_DATA_HOME/<agent>-microvm/<basename>-<hash>`; `…/<name>` under `MICROVM_NAME` |
 | `MICROVM_NAME` | What the launch is called: QEMU's name and process title (`microvm@<name>-<agent>-vm`), `instance.json`, `microvm-list`, unit descriptions, the session contract, and the default agent home (`<agent>-microvm/<name>`, shared by every launch with that name). Letters, digits, `_`, `.` and `-`, starting with a letter or digit, used whole — see [Naming a launch](#naming-a-launch) | the first 12 characters of the project directory's name |
 | `MICROVM_NAMESPACE` | Prefix for the launch's systemd units and runtime directory, e.g. `custom-namespace` → `custom-namespace-<id>.*` in `custom.slice`, `$XDG_RUNTIME_DIR/custom-namespace/vms/<id>/`. Lowercase words joined by single dashes; only the socket paths under it bound its length — see [Namespaces](#namespaces) | (`claude_microvm` / `claude-microvm`) |
+| `MICROVM_CONTEXT` | Host file or directory copied, at launch, to `/run/microvm/context/` for this launch alone (read-only; `MICROVM_CONTEXT_DIR` in the guest names it). Regular files and directories only — see [Per-launch context](#per-launch-context) | (none) |
 | `WORK_CACHE` | virtiofsd cache policy for `/work`: `auto`, `always`, `never` or `metadata` — see [Work share caching](#work-share-caching) | `auto` |
 | `AGENT_SETTINGS` | Host path to a settings file seeded into the agent home before boot (flavor-specific destination, e.g. `.claude/settings.json`) — see [Pre-seeding agent settings](#pre-seeding-agent-settings) | (none) |
 | `VM_MEM` | VM memory in MB | `8192` |

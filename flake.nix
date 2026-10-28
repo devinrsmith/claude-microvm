@@ -181,6 +181,53 @@
           RUNTIME_NS="claude-microvm"
         fi
 
+        # --- Context ---
+        # MICROVM_CONTEXT is data the host hands this one launch — a prompt, a
+        # task description, structured input — for its guest alone to find,
+        # read-only, at /run/microvm/context. It is what tells apart launches
+        # that share everything else: the same project, the same agent home,
+        # the same image. A file lands there under its own name; a
+        # directory's contents land there as they are. Copied into the guest
+        # share just before it is exported (see "Guest share"), so the guest
+        # sees it as it was at launch.
+        #
+        # Checked here, before anything starts: a launch whose context is
+        # missing is not the launch that was asked for, so it is refused
+        # rather than run without. Only regular files and directories are
+        # taken. A symlink would mean one thing on the host and another in
+        # the guest, which resolves it against its own filesystem; anything
+        # else (a FIFO, a socket, a device) is not data that can be copied.
+        CONTEXT=""
+        if [ -n "''${MICROVM_CONTEXT:-}" ]; then
+          if ! CONTEXT="$(realpath -e -- "$MICROVM_CONTEXT" 2>/dev/null)"; then
+            echo "error: MICROVM_CONTEXT=$MICROVM_CONTEXT does not exist" >&2
+            exit 1
+          fi
+          if [ -d "$CONTEXT" ]; then
+            # head ends each listing early; `|| true` keeps find's SIGPIPE from
+            # failing the assignment under pipefail.
+            _CONTEXT_ODD="$(find "$CONTEXT" -mindepth 1 ! -type f ! -type d -printf '  %P\n' 2>/dev/null | head -n 5 || true)"
+            if [ -n "$_CONTEXT_ODD" ]; then
+              echo "error: MICROVM_CONTEXT=$MICROVM_CONTEXT holds something other than regular files and" >&2
+              echo "       directories (symlinks, FIFOs, sockets, devices are not copied), e.g.:" >&2
+              printf '%s\n' "$_CONTEXT_ODD" >&2
+              exit 1
+            fi
+            _CONTEXT_UNREADABLE="$(find "$CONTEXT" \( -type f ! -readable -o -type d ! \( -readable -executable \) \) -printf '  %p\n' 2>/dev/null | head -n 5 || true)"
+            if [ -n "$_CONTEXT_UNREADABLE" ]; then
+              echo "error: MICROVM_CONTEXT=$MICROVM_CONTEXT has entries this user cannot read, e.g.:" >&2
+              printf '%s\n' "$_CONTEXT_UNREADABLE" >&2
+              exit 1
+            fi
+          elif [ ! -f "$CONTEXT" ]; then
+            echo "error: MICROVM_CONTEXT=$MICROVM_CONTEXT is not a regular file or a directory" >&2
+            exit 1
+          elif [ ! -r "$CONTEXT" ]; then
+            echo "error: MICROVM_CONTEXT=$MICROVM_CONTEXT is not readable" >&2
+            exit 1
+          fi
+        fi
+
         # --- Launch scope and slice ---
         # Every systemd --user unit of a launch shares one stem,
         # <ns>-<id>, and sits in its own slice of that name, nested in
@@ -385,7 +432,7 @@
         #   $XDG_RUNTIME_DIR/claude-microvm/     one root for every flavor (<ns>/ under a namespace)
         #     vms/<id>/                          this launch; 0700, sticky
         #       guest/                           its own --readonly virtiofsd → /run/microvm
-        #         env  ca-certs/  nix-db.sqlite
+        #         env  ca-certs/  nix-db.sqlite  context/
         #       instance.json                    what this is, for tools that list VMs
         #       lock                             held for the launch's lifetime
         #       qmp.sock                         QEMU's control socket
@@ -568,13 +615,14 @@
           --argjson pid "$$" --arg flavor ${lib.escapeShellArg agentName} \
           --arg name "$NAME" --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg work "$WORK" --arg agentHome "$AGENT_DIR" --arg guest "$INSTANCE_GUEST" \
-          --arg egressPolicy "$EGRESS_POLICY" --arg namespace "$NAMESPACE" \
+          --arg egressPolicy "$EGRESS_POLICY" --arg namespace "$NAMESPACE" --arg context "$CONTEXT" \
           --arg qmp "$QMP_SOCK" --arg workSock "$SOCK" --arg agentHomeSock "$AGENT_SOCK" --arg guestSock "$GUEST_SOCK" \
           --arg scopeUnit "$_MICROVM_SCOPE" --arg slice "$SLICE" \
           --arg workUnit "$UNIT" --arg agentHomeUnit "$AGENT_UNIT" --arg guestUnit "$GUEST_UNIT" --arg egressUnit "$_EGRESS_UNIT_NAME" \
           '{version: 1, pid: $pid, flavor: $flavor, name: $name, vmId: $vmId, id: $id, started: $started,
             work: $work, agentHome: $agentHome, guest: $guest, guestMount: "/run/microvm",
             egressPolicy: $egressPolicy,
+            context: (if $context == "" then null else $context end),
             namespace: (if $namespace == "" then null else $namespace end),
             sockets: {qmp: $qmp, work: $workSock, agentHome: $agentHomeSock, guest: $guestSock},
             slice: $slice,
@@ -862,6 +910,11 @@ EOF
         # overlay.
         echo "WORKSPACE_GUARD=''${WORKSPACE_GUARD:-}" >> "$INSTANCE_ENV"
         echo "WORKSPACE_MODE=$WORKSPACE_MODE" >> "$INSTANCE_ENV"
+        # Where MICROVM_CONTEXT is in the guest, set only when there is one,
+        # so its presence alone says whether this launch was given any.
+        if [ -n "$CONTEXT" ]; then
+          echo "MICROVM_CONTEXT_DIR=/run/microvm/context" >> "$INSTANCE_ENV"
+        fi
         case "$EGRESS_POLICY" in
           shadow|enforce)
             # The key never enters the guest: the agent talks plaintext HTTP
@@ -1053,6 +1106,19 @@ EOF
             || rm -f "$INSTANCE_GUEST/nix-db.sqlite"
         fi
 
+        # MICROVM_CONTEXT (checked at the top): a copy, not a link to the host
+        # path, so what the guest reads is what was there at launch, and
+        # stays this launch's alone while it runs; it goes with the instance
+        # dir. The runtime dir is tmpfs, so it costs the host memory.
+        if [ -n "$CONTEXT" ]; then
+          mkdir -m 700 "$INSTANCE_GUEST/context"
+          if [ -d "$CONTEXT" ]; then
+            cp -R -- "$CONTEXT/." "$INSTANCE_GUEST/context/"
+          else
+            cp -- "$CONTEXT" "$INSTANCE_GUEST/context/"
+          fi
+        fi
+
         # --- Guest share (virtiofsd, read-only) ---
         # Exports guest/ only, never the instance dir around it. Started last,
         # once everything above has written its file: from here on guest/ is
@@ -1221,8 +1287,18 @@ EOF
         _GUEST_HOLDS="env"
         if [ -d "$INSTANCE_GUEST/ca-certs" ]; then _GUEST_HOLDS="$_GUEST_HOLDS, CA certs"; fi
         if [ -f "$INSTANCE_GUEST/nix-db.sqlite" ]; then _GUEST_HOLDS="$_GUEST_HOLDS, nix DB snapshot"; fi
+        if [ -n "$CONTEXT" ]; then _GUEST_HOLDS="$_GUEST_HOLDS, context"; fi
         _row "guest share" ok "this launch only → /run/microvm, read-only to the guest"
         _cont "$_GUEST_HOLDS; removed when the launch ends"
+        # The context is what sets this launch apart from others like it, so
+        # where it came from and how much of it there is are shown.
+        if [ -n "$CONTEXT" ]; then
+          _CONTEXT_FILES="$(find "$INSTANCE_GUEST/context" -type f | wc -l)"
+          _CONTEXT_SIZE="$(du -sh "$INSTANCE_GUEST/context" | cut -f1)"
+          _cont "context: $(_tilde "$CONTEXT") → /run/microvm/context ($_CONTEXT_FILES file$([ "$_CONTEXT_FILES" = 1 ] || echo s), $_CONTEXT_SIZE)"
+        else
+          _hint "MICROVM_CONTEXT=<file or dir> hands this launch data of its own"
+        fi
         if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
           _row "dev shell" bad "loaded from the project — its Nix code is evaluated on the HOST"
         else

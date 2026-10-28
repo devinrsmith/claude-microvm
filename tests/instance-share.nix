@@ -18,7 +18,11 @@
 #     describes it; two concurrent launches on one agent home keep their own;
 #     and it is gone after a normal exit, a failed VM, and a refusal before the
 #     VM starts. A missing runtime dir, or one too long for a socket path, is
-#     refused before any daemon starts.
+#     refused before any daemon starts;
+#   - MICROVM_CONTEXT, a file or directory, is copied to guest/context/ as it
+#     was at launch, read-only, with MICROVM_CONTEXT_DIR in the env file; two
+#     concurrent launches each get their own; anything but regular files and
+#     directories is refused before any daemon starts.
 #
 # What this cannot show is virtiofsd's --readonly holding against a guest: that
 # needs a guest kernel on the other end of the socket. The flag is checked on
@@ -59,6 +63,11 @@ let
     {
       name = "the agent's shell sources ${envFile}";
       ok = lib.hasInfix "source ${envFile}" config.programs.bash.interactiveShellInit;
+    }
+    {
+      # The launcher writes this path into the env file and its contract.
+      name = "instance.contextDir is /run/microvm/context, where the launcher puts MICROVM_CONTEXT";
+      ok = instance.contextDir == "/run/microvm/context" && instance.dir == "/run/microvm";
     }
     {
       name = "the CA and nix DB imports read the share";
@@ -421,6 +430,85 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
      && grep -qF -- "-name $LONG-claude-vm" $L/qemu.sh; then
     ok "a 100-character MICROVM_NAME is used whole, with no cut"
   else bad "long name: rc $(cat $L/rc): $(jq -r .name $L/instance.json 2>/dev/null)"; cat $L/out >&2; fi
+
+  # --- MICROVM_CONTEXT ----------------------------------------------------------------
+  # Data the host hands one launch, copied onto its guest share as context/: a
+  # directory's contents as they are, hidden files and subdirectories
+  # included; a file under its own name.
+  C=$TMPDIR/ctx; mkdir -p $C/data/deep
+  echo 'review the parser' > $C/prompt.md
+  echo '{"task": 7}' > $C/data/task.json
+  echo nested > $C/data/deep/n.txt
+  echo hidden > $C/.hidden
+  launch ctxdir MICROVM_CONTEXT=$C
+  L=$TMPDIR/ctxdir
+  if [ "$(cat $L/rc)" = 0 ] && [ -e $L/started ] && diff -r $C $L/boot/context >&2; then
+    ok "MICROVM_CONTEXT=<dir>: its contents, hidden files and subdirectories included, are the guest share's context/"
+  else bad "context dir: rc $(cat $L/rc)"; cat $L/out >&2; ls -laR $L/boot >&2 || true; fi
+  ro=$(cd $L/boot/context && find . \( -type d ! -perm 1500 -o -type f ! -perm 1400 \) -printf '%p %m\n')
+  [ -z "$ro" ] && ok "...read-only like the rest of guest/ (files 0400, dirs 0500)" || bad "context not read-only: $ro"
+  grep -qx 'MICROVM_CONTEXT_DIR=/run/microvm/context' $L/boot/env \
+    && ok "...and the env file says where: MICROVM_CONTEXT_DIR=${instance.contextDir}" || { bad "no MICROVM_CONTEXT_DIR in env"; cat $L/boot/env >&2; }
+  [ "$(jq -r .context $L/instance.json)" = $C ] && ok "...and instance.json records the host path" \
+    || bad "instance.json context: $(jq -r .context $L/instance.json)"
+  grep -qF "env, nix DB snapshot, context; removed when the launch ends" $L/out \
+     && grep -qF "context: $C → /run/microvm/context (4 files, " $L/out \
+    && ok "...and the contract lists it, from where, and how much" || { bad "contract context row:"; grep -A3 'guest share' $L/out >&2; }
+  gone && ok "...and it goes with the instance dir" || bad "context launch left: $(left)"
+
+  launch ctxfile MICROVM_CONTEXT=$C/data/task.json
+  L=$TMPDIR/ctxfile
+  if [ "$(cat $L/rc)" = 0 ] && [ "$(ls -A $L/boot/context)" = task.json ] && cmp -s $C/data/task.json $L/boot/context/task.json; then
+    ok "MICROVM_CONTEXT=<file> lands as context/<its name>"
+  else bad "context file: rc $(cat $L/rc), context/ has: $(ls -A $L/boot/context 2>&1)"; cat $L/out >&2; fi
+  # A relative path is the launcher's working directory's.
+  launch ctxrel MICROVM_CONTEXT=../ctx/prompt.md
+  [ "$(cat $TMPDIR/ctxrel/rc)" = 0 ] && [ "$(jq -r .context $TMPDIR/ctxrel/instance.json)" = $C/prompt.md ] \
+    && [ -f $TMPDIR/ctxrel/boot/context/prompt.md ] \
+    && ok "...a relative path is taken from where the launcher runs" || { bad "relative context: rc $(cat $TMPDIR/ctxrel/rc)"; cat $TMPDIR/ctxrel/out >&2; }
+
+  # Without one, there is no context/, no MICROVM_CONTEXT_DIR, and instance.json says null.
+  if [ ! -e $TMPDIR/one/boot/context ] && ! grep -q MICROVM_CONTEXT_DIR $TMPDIR/one/boot/env \
+     && [ "$(jq -r .context $TMPDIR/one/instance.json)" = null ] && grep -qF 'MICROVM_CONTEXT=<file or dir>' $TMPDIR/one/out; then
+    ok "without MICROVM_CONTEXT: no context/, no MICROVM_CONTEXT_DIR, context null, and the contract says how"
+  else bad "a launch without context has some"; fi
+
+  # What the context is for: launches alike in everything else — one project,
+  # one agent home, at once — each with its own. And copied, not linked: the
+  # host changing its copy mid-launch changes nothing in the guest.
+  HOLD=$TMPDIR/ctx-release
+  cp -r $C $TMPDIR/ctx-live
+  mkdir $TMPDIR/ctx-other; echo 'write the docs' > $TMPDIR/ctx-other/prompt.md
+  launch ctxlive MICROVM_CONTEXT=$TMPDIR/ctx-live HOLD=$HOLD &
+  for _ in $(seq 1 300); do [ -e $TMPDIR/ctxlive/started ] && break; sleep 0.1; done
+  launch ctxother MICROVM_CONTEXT=$TMPDIR/ctx-other HOLD=$HOLD &
+  for _ in $(seq 1 300); do [ -e $TMPDIR/ctxother/started ] && break; sleep 0.1; done
+  echo 'something else' > $TMPDIR/ctx-live/prompt.md; touch $TMPDIR/ctx-live/added
+  touch $HOLD; wait
+  if [ -e $TMPDIR/ctxlive/started ] && [ -e $TMPDIR/ctxother/started ] \
+     && [ "$(cat $TMPDIR/ctxlive/exit/context/prompt.md)" = 'review the parser' ] \
+     && [ "$(cat $TMPDIR/ctxother/exit/context/prompt.md)" = 'write the docs' ] && [ ! -e $TMPDIR/ctxother/exit/context/data ]; then
+    ok "two concurrent launches on one project and agent home each read their own context"
+  else bad "concurrent contexts crossed, or the launches did not overlap"; cat $TMPDIR/ctxlive/out $TMPDIR/ctxother/out >&2; fi
+  [ ! -e $TMPDIR/ctxlive/exit/context/added ] \
+    && ok "...a snapshot: what the host changes after launch does not reach the guest" || bad "the context followed the host's changes"
+  gone || bad "concurrent context launches left: $(left)"
+
+  # What cannot be data is refused before anything starts.
+  mkdir -p $TMPDIR/ctx-link $TMPDIR/ctx-fifo
+  ln -s /etc/passwd $TMPDIR/ctx-link/passwd
+  mkfifo $TMPDIR/ctx-fifo/pipe
+  refused=0
+  for case in "$TMPDIR/absent:does not exist" "$TMPDIR/ctx-link:passwd" "$TMPDIR/ctx-fifo:pipe" "$TMPDIR/ctx-fifo/pipe:not a regular file"; do
+    p=''${case%%:*}; want=''${case#*:}
+    launch ctxbad MICROVM_CONTEXT=$p
+    if [ "$(cat $TMPDIR/ctxbad/rc)" != 0 ] && grep -qF "$want" $TMPDIR/ctxbad/out && grep -q '^error: MICROVM_CONTEXT=' $TMPDIR/ctxbad/out \
+       && [ -z "$(find $TMPDIR/ctxbad -name '*.args')" ] && gone; then
+      refused=$((refused + 1))
+    else bad "MICROVM_CONTEXT=$p was not refused before any daemon"; cat $TMPDIR/ctxbad/out >&2; fi
+    chmod -R u+w $TMPDIR/ctxbad; rm -rf $TMPDIR/ctxbad
+  done
+  [ $refused = 4 ] && ok "a missing context, or one holding a symlink or a FIFO, or a FIFO itself, is refused before any daemon starts"
 
   # --- failure paths ----------------------------------------------------------------
   launch crash QEMU_RC=3
