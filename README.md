@@ -346,7 +346,7 @@ and units:
 jq . "$XDG_RUNTIME_DIR"/claude-microvm/vms/*/instance.json
 # {"version":1,"pid":…,"flavor":"claude","name":…,"vmId":…,"id":…,"started":…,
 #  "work":…,"agentHome":…,"guest":…,"guestMount":"/run/microvm",
-#  "egressPolicy":"open","context":null,"namespace":null,
+#  "egressPolicy":"open","context":null,"startDir":null,"namespace":null,
 #  "sockets":{"qmp":…,"work":…,"agentHome":…,"guest":…},
 #  "slice":"claude_microvm.slice",
 #  "units":{"scope":…,"work":…,"agentHome":…,"guest":…,"egress":null}}
@@ -597,6 +597,43 @@ How the agent is told to use the context is up to whoever launches it: point
 it there from `AGENTS_ARGS` (`-p "Your task is in /run/microvm/context/prompt.md"`),
 from an instruction file in the project or agent home, or from a tool the
 agent runs.
+
+### Start directory
+
+The agent starts in `/work`. `MICROVM_START_DIR` starts it somewhere else in
+the guest — a subdirectory of the project, or a git worktree kept under it:
+
+```sh
+git -C "$PROJECT" worktree add --relative-paths -b fix-parser tasks/fix-parser
+WORK_DIR="$PROJECT" MICROVM_START_DIR=/work/tasks/fix-parser microvm-run
+```
+
+This matters because agents key per-project state on the directory they start
+in. Claude Code, for one, files its sessions — what `--continue` and
+`--resume` find — under that directory, loads `CLAUDE.md` from it and every
+directory above it, reads the project's `.claude/settings.json` from it, and
+asks whether to trust it. Launches that share a project and an agent home but
+work on different things each get their own sessions by starting in their own
+directory, while still loading instructions from the directories above it.
+
+- **A guest path, absolute and plain.** No `.`, `..` or empty components and
+  no trailing `/`: the spelling is the agent's key, so two spellings of one
+  directory would be two keys. Anything else is refused before anything
+  starts.
+- **Checked where it can be.** One under `/work` must be a directory in
+  `WORK_DIR` at launch, or the launcher refuses before starting anything.
+  Elsewhere (`/home/agent/…`, `/run/microvm/context`) only the guest can
+  tell; if it cannot enter the directory, it refuses to start the agent and
+  powers off, rather than starting it in `/work` where it would pick up
+  another launch's state.
+- **Visible.** It is in `/run/microvm/env` as `MICROVM_START_DIR`, in the
+  session contract under the project, and in `instance.json` as `startDir`
+  (`null` when unset).
+
+A worktree whose links git wrote with host paths does not work in the guest,
+which sees the project at `/work`; `--relative-paths` (git 2.48 or later)
+writes links that work from both sides. A worktree outside `WORK_DIR` is not
+in the guest at all.
 
 ### Sandboxing
 
@@ -920,6 +957,7 @@ Rebuild with `make claude`.
 | `MICROVM_NAME` | What the launch is called: QEMU's name and process title (`microvm@<name>-<agent>-vm`), `instance.json`, `microvm-list`, unit descriptions, the session contract, and the default agent home (`<agent>-microvm/<name>`, shared by every launch with that name). Letters, digits, `_`, `.` and `-`, starting with a letter or digit, used whole — see [Naming a launch](#naming-a-launch) | the first 12 characters of the project directory's name |
 | `MICROVM_NAMESPACE` | Prefix for the launch's systemd units and runtime directory, e.g. `custom-namespace` → `custom-namespace-<id>.*` in `custom.slice`, `$XDG_RUNTIME_DIR/custom-namespace/vms/<id>/`. Lowercase words joined by single dashes; only the socket paths under it bound its length — see [Namespaces](#namespaces) | (`claude_microvm` / `claude-microvm`) |
 | `MICROVM_CONTEXT` | Host file or directory copied, at launch, to `/run/microvm/context/` for this launch alone (read-only; `MICROVM_CONTEXT_DIR` in the guest names it). Regular files and directories only — see [Per-launch context](#per-launch-context) | (none) |
+| `MICROVM_START_DIR` | Guest directory the agent starts in, e.g. `/work/tasks/fix-parser`. Absolute, with no `.`, `..` or empty components; one under `/work` must exist in `WORK_DIR` — see [Start directory](#start-directory) | `/work` |
 | `WORK_CACHE` | virtiofsd cache policy for `/work`: `auto`, `always`, `never` or `metadata` — see [Work share caching](#work-share-caching) | `auto` |
 | `AGENT_SETTINGS` | Host path to a settings file seeded into the agent home before boot (flavor-specific destination, e.g. `.claude/settings.json`) — see [Pre-seeding agent settings](#pre-seeding-agent-settings) | (none) |
 | `VM_MEM` | VM memory in MB | `8192` |

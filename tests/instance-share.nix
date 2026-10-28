@@ -51,7 +51,24 @@ let
          (lib.toList (s.unitConfig.RequiresMountsFor or [ ]));
   unordered = lib.filterAttrs (_: s: !ordered s) readers;
 
+  # The agent's shell from where it picks its start directory up to where it
+  # starts the agent: run below with sudo and sleep stubbed, to see where it
+  # would start and what it refuses. Whatever follows the agent's start
+  # (the command itself, the poweroff) is left out.
+  shellInit = config.programs.bash.interactiveShellInit;
+  startMarker = "# Where the agent starts: MICROVM_START_DIR";
+  startRegion = pkgs.writeText "start-dir-region.sh"
+    ("#" + lib.head (lib.splitString "echo \"starting " (lib.last (lib.splitString startMarker shellInit))));
+  # Where the env file is sourced, and where the start directory is entered:
+  # the one has to come first, since the variable arrives in it.
+  sourceAt = lib.stringLength (lib.head (lib.splitString "source ${envFile}" shellInit));
+  startAt = lib.stringLength (lib.head (lib.splitString startMarker shellInit));
+
   structural = [
+    {
+      name = "the agent's shell reads MICROVM_START_DIR after sourcing ${envFile}";
+      ok = lib.hasInfix startMarker shellInit && lib.hasInfix ''cd "$MICROVM_START_DIR"'' shellInit && sourceAt < startAt;
+    }
     {
       name = "the guest has an instance share at ${instance.dir}, virtiofs, readOnly";
       ok = share != null && share.proto == "virtiofs" && share.mountPoint == instance.dir && share.readOnly;
@@ -509,6 +526,64 @@ pkgs.runCommand "instance-share" { nativeBuildInputs = [ pkgs.socat pkgs.sqlite 
     chmod -R u+w $TMPDIR/ctxbad; rm -rf $TMPDIR/ctxbad
   done
   [ $refused = 4 ] && ok "a missing context, or one holding a symlink or a FIFO, or a FIFO itself, is refused before any daemon starts"
+
+  # --- MICROVM_START_DIR ---------------------------------------------------------------
+  # The guest directory the agent starts in. The launcher checks it and hands
+  # it on in the env file; the guest's shell enters it (checked further down).
+  mkdir -p "$WORK_DIR/tasks/fix one"
+  launch startdir "MICROVM_START_DIR=/work/tasks/fix one"
+  L=$TMPDIR/startdir
+  if [ "$(cat $L/rc)" = 0 ] && [ -e $L/started ] \
+     && [ "$(set -a; . $L/boot/env; printf %s "$MICROVM_START_DIR")" = "/work/tasks/fix one" ]; then
+    ok "MICROVM_START_DIR under /work reaches the env file, and survives being sourced (a space and all)"
+  else bad "start dir: rc $(cat $L/rc)"; cat $L/out >&2; cat $L/boot/env >&2 2>/dev/null || true; fi
+  [ "$(jq -r .startDir $L/instance.json)" = "/work/tasks/fix one" ] && grep -qF "the agent starts in /work/tasks/fix one" $L/out \
+    && ok "...and instance.json and the contract say where" || bad "start dir: instance.json $(jq -r .startDir $L/instance.json), contract: $(grep -c 'agent starts in' $L/out)"
+  # Elsewhere than /work it cannot be checked on the host; the guest does.
+  launch startelse MICROVM_START_DIR=/home/agent/notes
+  [ "$(cat $TMPDIR/startelse/rc)" = 0 ] && grep -qx 'MICROVM_START_DIR=/home/agent/notes' $TMPDIR/startelse/boot/env \
+    && ok "...one outside /work is passed on for the guest to check" || { bad "start dir outside /work: rc $(cat $TMPDIR/startelse/rc)"; cat $TMPDIR/startelse/out >&2; }
+  if ! grep -q MICROVM_START_DIR $TMPDIR/one/boot/env && [ "$(jq -r .startDir $TMPDIR/one/instance.json)" = null ] \
+     && ! grep -q 'agent starts in' $TMPDIR/one/out; then
+    ok "without MICROVM_START_DIR: nothing in the env file, startDir null, nothing in the contract"
+  else bad "a launch without a start dir has one"; fi
+  refused=0
+  for p in /work/missing work relative/x /work/ /work//tasks /work/./tasks /work/tasks/.. /work/../etc; do
+    launch startbad "MICROVM_START_DIR=$p"
+    if [ "$(cat $TMPDIR/startbad/rc)" != 0 ] && grep -q '^error: MICROVM_START_DIR=' $TMPDIR/startbad/out \
+       && [ -z "$(find $TMPDIR/startbad -name '*.args')" ] && gone; then
+      refused=$((refused + 1))
+    else bad "MICROVM_START_DIR=$p was not refused before any daemon"; cat $TMPDIR/startbad/out >&2; fi
+    chmod -R u+w $TMPDIR/startbad; rm -rf $TMPDIR/startbad
+  done
+  [ $refused = 8 ] && ok "a start dir that is missing under /work, relative, or not plain (//, ., .., a trailing /) is refused before any daemon starts"
+
+  # The guest's side: its shell, from the env file to the agent's start, with
+  # sudo and sleep stubbed. WORKSPACE_MODE and the egress seal file are unset
+  # and absent here, so the checks between pass.
+  mkdir -p $TMPDIR/guest/bin $TMPDIR/guest/there
+  printf '#!${pkgs.bash}/bin/bash\necho "sudo $*" >> %s\n' $TMPDIR/guest/log > $TMPDIR/guest/bin/sudo
+  printf '#!${pkgs.bash}/bin/bash\necho "sleep $*" >> %s\n' $TMPDIR/guest/log > $TMPDIR/guest/bin/sleep
+  chmod +x $TMPDIR/guest/bin/*
+  # The build has no /work, so the region's /work is a stand-in directory:
+  # a guest that fell back to it would then be seen doing so.
+  mkdir -p $TMPDIR/guest/work
+  sed "s|/work|$TMPDIR/guest/work|g" ${startRegion} > $TMPDIR/guest/region.sh
+  guest_start () { # MICROVM_START_DIR, or nothing; prints where the agent would start
+    ( cd $TMPDIR/guest && rm -f log && PATH=$TMPDIR/guest/bin:$PATH MICROVM_START_DIR="$1" \
+        ${pkgs.bash}/bin/bash -c ". $TMPDIR/guest/region.sh; echo \"agent starts in \$PWD\"" 2>&1 )
+  }
+  got=$(guest_start $TMPDIR/guest/there)
+  [ "$got" = "agent starts in $TMPDIR/guest/there" ] && [ ! -e $TMPDIR/guest/log ] \
+    && ok "the guest starts the agent in MICROVM_START_DIR" || bad "guest start dir: $got"
+  got=$(guest_start $TMPDIR/guest/absent)
+  if grep -q 'refusing to start' <<< "$got" && ! grep -q 'agent starts in' <<< "$got" \
+     && [ "$(cat $TMPDIR/guest/log 2>/dev/null)" = $'sudo poweroff\nsleep infinity' ]; then
+    ok "...and one it cannot enter powers the VM off without starting the agent anywhere else"
+  else bad "guest with a missing start dir: $got / $(cat $TMPDIR/guest/log 2>/dev/null)"; fi
+  got=$(guest_start "")
+  [ ! -e $TMPDIR/guest/log ] && [ "$got" = "agent starts in $TMPDIR/guest/work" ] \
+    && ok "...and without one it goes on to the agent, from /work" || bad "guest without a start dir: $got"
 
   # --- failure paths ----------------------------------------------------------------
   launch crash QEMU_RC=3

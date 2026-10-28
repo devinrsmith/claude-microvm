@@ -412,7 +412,6 @@ SHAREEOF
 
       exec 9>&-
 
-      cd /work 2>/dev/null || true
       # `set -a` so these are exported, not just set as shell variables: the
       # agent runs as a child process below and would not otherwise inherit
       # API keys or anything forwarded via EXTRA_ENV. The file is this launch's
@@ -421,6 +420,24 @@ SHAREEOF
         set -a
         source ${instance.dir}/env
         set +a
+      fi
+      # Where the agent starts: MICROVM_START_DIR from the env file, else
+      # /work. After the env file, which is where it arrives. Agents key their
+      # per-project state on this directory, so a launch that asked for one
+      # and cannot have it is refused rather than started in /work, where it
+      # would pick up another launch's sessions. The launcher has already
+      # checked one under /work; this catches the rest.
+      if [ -n "''${MICROVM_START_DIR:-}" ]; then
+        if ! cd "$MICROVM_START_DIR" 2>/dev/null; then
+          echo "refusing to start ${cfg.name}: MICROVM_START_DIR=$MICROVM_START_DIR is not a"
+          echo "directory this guest can enter."
+          # poweroff returns before the shutdown takes this shell; without the
+          # sleep the agent would start meanwhile, wherever the shell is.
+          sudo poweroff
+          exec sleep infinity
+        fi
+      else
+        cd /work 2>/dev/null || true
       fi
       if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
         if [ -f ~/.microvm-devshell ] && [ -s ~/.microvm-devshell ]; then

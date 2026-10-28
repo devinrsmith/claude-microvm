@@ -228,6 +228,45 @@
           fi
         fi
 
+        # --- Start directory ---
+        # MICROVM_START_DIR is the guest directory the agent starts in, /work
+        # when unset. Agents key per-project state on the directory they start
+        # in — sessions, what "continue" resumes, which instruction files load
+        # — so launches that share a project but work in different parts of
+        # it (a subdirectory, a git worktree under /work) each want their own.
+        #
+        # A guest path, absolute and plain: no `.` or `..` components, no
+        # empty ones, no trailing slash — the spelling is the agent's key, so
+        # two spellings of one directory would be two keys. One under /work is
+        # checked against WORK_DIR here, before anything starts, since a
+        # mistyped one would otherwise surface only in the guest. Anywhere
+        # else — /home/agent, the guest share — the guest checks when it
+        # starts the agent, and refuses there.
+        START_DIR=""
+        if [ -n "''${MICROVM_START_DIR:-}" ]; then
+          START_DIR="$MICROVM_START_DIR"
+          _START_PLAIN=1
+          case "$START_DIR" in
+            /) ;;
+            /*/|*//*|*/./*|*/.|*/../*|*/..) _START_PLAIN=0 ;;
+            /*) ;;
+            *) _START_PLAIN=0 ;;
+          esac
+          if [ "$_START_PLAIN" = 0 ] || [[ "$START_DIR" == *$'\n'* ]]; then
+            echo "error: MICROVM_START_DIR=$START_DIR is not a plain absolute guest path:" >&2
+            echo "       it must start with /, with no '.', '..' or empty components and no trailing /" >&2
+            exit 1
+          fi
+          case "$START_DIR" in
+            /work|/work/*)
+              if [ ! -d "$WORK''${START_DIR#/work}" ]; then
+                echo "error: MICROVM_START_DIR=$START_DIR is not a directory in WORK_DIR ($WORK''${START_DIR#/work})" >&2
+                exit 1
+              fi
+              ;;
+          esac
+        fi
+
         # --- Launch scope and slice ---
         # Every systemd --user unit of a launch shares one stem,
         # <ns>-<id>, and sits in its own slice of that name, nested in
@@ -615,7 +654,7 @@
           --argjson pid "$$" --arg flavor ${lib.escapeShellArg agentName} \
           --arg name "$NAME" --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg work "$WORK" --arg agentHome "$AGENT_DIR" --arg guest "$INSTANCE_GUEST" \
-          --arg egressPolicy "$EGRESS_POLICY" --arg namespace "$NAMESPACE" --arg context "$CONTEXT" \
+          --arg egressPolicy "$EGRESS_POLICY" --arg namespace "$NAMESPACE" --arg context "$CONTEXT" --arg startDir "$START_DIR" \
           --arg qmp "$QMP_SOCK" --arg workSock "$SOCK" --arg agentHomeSock "$AGENT_SOCK" --arg guestSock "$GUEST_SOCK" \
           --arg scopeUnit "$_MICROVM_SCOPE" --arg slice "$SLICE" \
           --arg workUnit "$UNIT" --arg agentHomeUnit "$AGENT_UNIT" --arg guestUnit "$GUEST_UNIT" --arg egressUnit "$_EGRESS_UNIT_NAME" \
@@ -623,6 +662,7 @@
             work: $work, agentHome: $agentHome, guest: $guest, guestMount: "/run/microvm",
             egressPolicy: $egressPolicy,
             context: (if $context == "" then null else $context end),
+            startDir: (if $startDir == "" then null else $startDir end),
             namespace: (if $namespace == "" then null else $namespace end),
             sockets: {qmp: $qmp, work: $workSock, agentHome: $agentHomeSock, guest: $guestSock},
             slice: $slice,
@@ -914,6 +954,12 @@ EOF
         # so its presence alone says whether this launch was given any.
         if [ -n "$CONTEXT" ]; then
           echo "MICROVM_CONTEXT_DIR=/run/microvm/context" >> "$INSTANCE_ENV"
+        fi
+        # Where the guest starts the agent (checked at the top), set only when
+        # given, so the guest's default stays its own. %q: the guest sources
+        # this file, and a path may hold anything but a newline.
+        if [ -n "$START_DIR" ]; then
+          printf 'MICROVM_START_DIR=%q\n' "$START_DIR" >> "$INSTANCE_ENV"
         fi
         case "$EGRESS_POLICY" in
           shadow|enforce)
@@ -1279,6 +1325,9 @@ EOF
         fi
         if [ "$WORK_CACHE" != "auto" ]; then
           _cont "virtiofs cache: $WORK_CACHE"
+        fi
+        if [ -n "$START_DIR" ]; then
+          _cont "the agent starts in $START_DIR"
         fi
         _row "agent home" "" "$(_tilde "$AGENT_DIR") → /home/agent"
         _cont "persists across sessions"
