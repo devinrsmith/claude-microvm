@@ -156,8 +156,9 @@ in
       readOnly = true;
       description = ''
         Guest mount point of the per-launch, read-only instance share: `env`
-        (what the launcher passes the guest), `ca-certs/` (EXTRA_CA_CERTS) and
-        `nix-db.sqlite` (the host's nix DB snapshot).
+        (what the launcher passes the guest), `ca-certs/` (EXTRA_CA_CERTS),
+        `nix-db.sqlite` (the host's nix DB snapshot) and `context/`
+        (MICROVM_CONTEXT; see `contextDir`).
       '';
     };
     mountUnit = lib.mkOption {
@@ -166,6 +167,19 @@ in
       defaultText = lib.literalExpression ''"run-microvm.mount"'';
       readOnly = true;
       description = "The systemd mount unit for `dir`; readers of the share are ordered after it.";
+    };
+    contextDir = lib.mkOption {
+      type = lib.types.str;
+      default = "${config.claude-vm.instance.dir}/context";
+      defaultText = lib.literalExpression ''"/run/microvm/context"'';
+      readOnly = true;
+      description = ''
+        Where a launch's MICROVM_CONTEXT appears in the guest: data the host
+        hands that one launch (a prompt, a task, structured input), copied at
+        launch, read-only. Absent when the launch was given none; the agent's
+        environment then has no MICROVM_CONTEXT_DIR either. The launcher
+        writes this path into the env file, so it is fixed here.
+      '';
     };
   };
 
