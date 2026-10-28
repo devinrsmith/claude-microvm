@@ -1518,6 +1518,7 @@ EOF
                 microvmPolicy.stateFile = "${config.claude-vm.instance.dir}/env";
                 microvmPolicy.stateAfter = [ config.claude-vm.instance.mountUnit ];
               })
+              ./modules/login-ordering.nix
               { claude-vm.cri.enable = true; }
               flavor.agentModule
             ];
@@ -1641,6 +1642,10 @@ EOF
           config = self.nixosConfigurations."claude-${system}".config;
         };
         seed-idempotence = import ./tests/seed-idempotence.nix {
+          inherit pkgs lib;
+          config = self.nixosConfigurations."claude-${system}".config;
+        };
+        login-ordering = import ./tests/login-ordering.nix {
           inherit pkgs lib;
           config = self.nixosConfigurations."claude-${system}".config;
         };
