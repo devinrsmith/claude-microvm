@@ -1004,6 +1004,7 @@ EOF
               ./modules/cri.nix
               # microvmPolicy.* defaults match this repo's layout.
               microvm-policy.nixosModules.default
+              ./modules/login-ordering.nix
               { claude-vm.cri.enable = true; }
               flavor.agentModule
             ];
@@ -1102,6 +1103,10 @@ EOF
           config = self.nixosConfigurations."claude-${system}".config;
         };
         seed-idempotence = import ./tests/seed-idempotence.nix {
+          inherit pkgs lib;
+          config = self.nixosConfigurations."claude-${system}".config;
+        };
+        login-ordering = import ./tests/login-ordering.nix {
           inherit pkgs lib;
           config = self.nixosConfigurations."claude-${system}".config;
         };
