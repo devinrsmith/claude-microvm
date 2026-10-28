@@ -1607,6 +1607,10 @@ EOF
       # is not reachable from in there at all.
       checks = forSystems (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
         module-hardening = import ./tests/module-hardening.nix { inherit pkgs; };
+      } // lib.optionalAttrs (system == "x86_64-linux") {
+        # Gives its VM a second ISA UART for the console, which only x86 has.
+        single-console = import ./tests/single-console.nix { inherit pkgs; };
+      } // {
         store-overlay-disk = import ./tests/store-overlay-disk.nix {
           inherit pkgs lib;
           config = self.nixosConfigurations."claude-${system}".config;
