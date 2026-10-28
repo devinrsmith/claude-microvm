@@ -301,6 +301,7 @@ in
     environment.systemPackages = with pkgs; [
       devenv
       git
+      git-lfs
       openssh
       cacert
       vmStorePrune
