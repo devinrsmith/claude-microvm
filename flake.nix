@@ -750,7 +750,7 @@
         # uid>. A runtime dir or namespace long enough to break it
         # would otherwise surface as QEMU or virtiofsd failing to bind, after
         # the daemons before it had started.
-        for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK" "${_SHARE_SOCK[@]}"; do
+        for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK" "''${_SHARE_SOCK[@]}"; do
           if [ "''${#_s}" -gt 107 ]; then
             echo "error: socket path too long (''${#_s} bytes, the limit is 107): $_s" >&2
             echo "       it is under XDG_RUNTIME_DIR=$RUNTIME''${NAMESPACE:+ and MICROVM_NAMESPACE=$NAMESPACE}; a shorter one avoids this" >&2

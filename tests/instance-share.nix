@@ -53,12 +53,13 @@ let
 
   # The agent's shell from where it picks its start directory up to where it
   # starts the agent: run below with sudo and sleep stubbed, to see where it
-  # would start and what it refuses. Whatever follows the agent's start
-  # (the command itself, the poweroff) is left out.
+  # would start and what it refuses. Whatever follows is left out: the
+  # console's guard, with the agent's start and the poweroff.
   shellInit = config.programs.bash.interactiveShellInit;
   startMarker = "# Where the agent starts: MICROVM_START_DIR";
+  endMarker = "# The agent runs once per VM";
   startRegion = pkgs.writeText "start-dir-region.sh"
-    ("#" + lib.head (lib.splitString "echo \"starting " (lib.last (lib.splitString startMarker shellInit))));
+    ("#" + lib.head (lib.splitString endMarker (lib.last (lib.splitString startMarker shellInit))));
   # Where the env file is sourced, and where the start directory is entered:
   # the one has to come first, since the variable arrives in it.
   sourceAt = lib.stringLength (lib.head (lib.splitString "source ${envFile}" shellInit));
