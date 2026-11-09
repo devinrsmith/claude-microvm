@@ -11,10 +11,14 @@
   # prompts) unless you are a trusted user.
   nixConfig = {
     extra-substituters = [
+      "https://nix-gizmos.cachix.org"
+      "https://microvm-tools.cachix.org"
       "https://systemstart.cachix.org"
       "https://microvm.cachix.org"
     ];
     extra-trusted-public-keys = [
+      "nix-gizmos.cachix.org-1:a8qWp7lYufNBEKQEpJf54r0WVE0ksypqnFxOyemSlX4="
+      "microvm-tools.cachix.org-1:OmNkdhRACxrceImh52cuegLuzJCj5hZFwFA8scRBk7A="
       "systemstart.cachix.org-1:hSTfDlXstyuVVukogR0sEmt8wJsaplp7NvisgUugNpE="
       "microvm.cachix.org-1:oXnBc6hRE3eX5rSYdRyMYXnfzcCxC7yKPTbZXALsqys="
     ];
@@ -31,7 +35,7 @@
     # egress-report, and the generic allowlist. This flake keeps only the
     # consumer glue — the launcher and the agent-specific allowlists.
     microvm-policy = {
-      url = "github:systemstart/microvm-policy/v0.3.0";
+      url = "github:nix-gizmos/microvm-policy/v0.6.1";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -54,10 +58,14 @@
       # <prefix> on the proxy, which strips client-supplied credentials and
       # injects $<keyVar> as <header> upstream — or passes the client's own
       # token through when the var is unset on the host (OAuth mode).
-      # allowedPaths is a per-host capability grant; shadow mode's audit log
+      # allowedPaths is a per-host capability grant (an entry covers its
+      # subtree; a trailing $ only that exact path); shadow mode's audit log
       # is how it gets extended when a client needs more.
+      # usage names the proxy's token parser for the endpoint's responses
+      # (only "anthropic" exists): set, the session's tokens are counted, and
+      # API_BUDGET_TOKENS can cap them; unset, only requests are.
       egressEndpoints = rec {
-        claude = [ { prefix = "/anthropic"; upstream = "https://api.anthropic.com"; keyVar = "ANTHROPIC_API_KEY"; header = "x-api-key"; baseUrlVar = "ANTHROPIC_BASE_URL"; allowedPaths = [ "/v1/messages" ]; } ];
+        claude = [ { prefix = "/anthropic"; upstream = "https://api.anthropic.com"; keyVar = "ANTHROPIC_API_KEY"; header = "x-api-key"; baseUrlVar = "ANTHROPIC_BASE_URL"; allowedPaths = [ "/v1/messages$" "/v1/messages/count_tokens$" ]; usage = "anthropic"; } ];
         gemini = [ { prefix = "/gemini"; upstream = "https://generativelanguage.googleapis.com"; keyVar = "GEMINI_API_KEY"; header = "x-goog-api-key"; baseUrlVar = "GOOGLE_GEMINI_BASE_URL"; allowedPaths = [ "/v1beta/models" "/v1/models" ]; } ];
         codex  = [ { prefix = "/openai"; upstream = "https://api.openai.com"; keyVar = "OPENAI_API_KEY"; header = "authorization"; baseUrlVar = "OPENAI_BASE_URL"; allowedPaths = [ "/v1/responses" "/v1/chat/completions" "/v1/models" ]; } ];
         pi = claude ++ gemini ++ codex;
@@ -85,7 +93,7 @@
       #   microvm-list  lists launches, running and left over
       mkMicrovmTool = pkgs: name: pkgs.writeShellApplication {
         inherit name;
-        runtimeInputs = with pkgs; [ coreutils gnugrep jq socat util-linux ];
+        runtimeInputs = with pkgs; [ coreutils gnugrep jq procps socat util-linux ];
         text = ''
           ns_pattern=${lib.escapeShellArg namespacePattern}
         '' + builtins.readFile ./scripts/microvm-instances.sh
@@ -93,7 +101,7 @@
       };
       microvmTools = pkgs: map (mkMicrovmTool pkgs) [ "microvm-stop" "microvm-list" ];
 
-      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints }:
+      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints, shares ? { } }:
         let
           virtiofsd = pkgs.virtiofsd;
           hostname = "${agentName}-vm";
@@ -103,16 +111,33 @@
           # Bash fragments for the shadow/enforce wiring, one per endpoint.
           # keyEnv is decided at launch: the var's presence on the host picks
           # between injection and OAuth passthrough.
+          # "<host> <path>,<path>" per endpoint, ";"-joined, for the contract's
+          # note on a deny that covers one (scripts/egress-rules.awk).
+          egressEndpointHosts = lib.concatMapStringsSep ";" (ep:
+            "${lib.head (lib.splitString "/" (lib.removePrefix "https://" ep.upstream))} ${lib.concatStringsSep "," ep.allowedPaths}") flavorEndpoints;
           egressEndpointJson = lib.concatMapStringsSep "\n" (ep: ''
             _EGRESS_EP_KEYENV=""
             if [ -n "''${${ep.keyVar}:-}" ]; then _EGRESS_EP_KEYENV="${ep.keyVar}"; fi
-            _EGRESS_EPS="$_EGRESS_EPS,{\"prefix\":\"${ep.prefix}\",\"upstream\":\"${ep.upstream}\",\"keyEnv\":\"$_EGRESS_EP_KEYENV\",\"header\":\"${ep.header}\",\"allowedPaths\":${lib.replaceStrings [ "\"" ] [ "\\\"" ] (builtins.toJSON ep.allowedPaths)}}"'') flavorEndpoints;
+            # The budget is per endpoint; its token cap only where the proxy
+            # can count tokens. Both limits are digits, checked up front.
+            _EGRESS_EP_BUDGET=""
+            _EGRESS_EP_TOKENS=${if ep ? usage then ''"$_EGRESS_BUDGET_TOKENS"'' else ''""''}
+            if [ -n "$_EGRESS_BUDGET_REQUESTS$_EGRESS_EP_TOKENS" ]; then
+              _EGRESS_EP_BUDGET=",\"budget\":{\"maxRequests\":''${_EGRESS_BUDGET_REQUESTS:-0},\"maxTokens\":''${_EGRESS_EP_TOKENS:-0}}"
+            fi
+            _EGRESS_EPS="$_EGRESS_EPS,{\"prefix\":\"${ep.prefix}\",\"upstream\":\"${ep.upstream}\",\"keyEnv\":\"$_EGRESS_EP_KEYENV\",\"header\":\"${ep.header}\",\"allowedPaths\":${lib.replaceStrings [ "\"" ] [ "\\\"" ] (builtins.toJSON ep.allowedPaths)}${lib.optionalString (ep ? usage) ",\\\"usage\\\":\\\"${ep.usage}\\\""}$_EGRESS_EP_BUDGET}"'') flavorEndpoints;
+          # The endpoints whose tokens the proxy can count.
+          egressMetered = lib.filter (ep: ep ? usage) flavorEndpoints;
           egressProxySetenv = lib.concatMapStringsSep "\n" (ep: ''
             if [ -n "''${${ep.keyVar}:-}" ]; then _EGRESS_SETENV+=("--setenv=${ep.keyVar}"); fi'') flavorEndpoints;
           # Session-contract fragment: which credential vars the host holds,
           # names only — values never appear anywhere near a terminal.
           contractKeyChecks = lib.concatStringsSep "\n" (map (var: ''
             if [ -n "''${${var}:-}" ]; then _CONTRACT_KEYS="$_CONTRACT_KEYS ${var}"; fi'') apiKeyVars);
+          # claude-vm.shares, in a fixed order the bash arrays below share.
+          sharesList = lib.imap0 (i: s: s // { idx = i; var = "SHARE_" + lib.toUpper (lib.replaceStrings [ "-" ] [ "_" ] s.name); })
+            (lib.mapAttrsToList (name: s: s // { inherit name; }) shares);
+          shareArray = f: "(${lib.concatMapStringsSep " " (s: lib.escapeShellArg (f s)) sharesList})";
           egressGuestEnv = lib.concatMapStringsSep "\n" (ep: ''
             echo "${ep.baseUrlVar}=http://${egressGuestAddr}${ep.prefix}" >> "$INSTANCE_ENV"
             if [ -n "''${${ep.keyVar}:-}" ]; then
@@ -123,6 +148,52 @@
             fi'') flavorEndpoints;
           launcher = pkgs.writeShellScriptBin "microvm-run" ''
         set -euo pipefail
+        # --- Launch record (LAUNCH_RECORD): where it may go ---
+        # What this launch ran with, as JSON, for whatever drove it — written
+        # just before boot, completed at exit; see README "Launch record".
+        # Checked first of all, before anything else can refuse to start,
+        # because an earlier launch's record at the path is removed here: a
+        # launch that never boots must not leave the last one's standing for
+        # its own. And checked before that removal, so a path that is refused
+        # loses nothing. Paths are compared canonical (-m: nothing need exist
+        # yet), so a symlinked parent is followed to where the file would be.
+        #
+        # Evidence, so nowhere the guest can write — the work share, this
+        # launcher's state, agent home, a writable share — and in a directory
+        # only this user can write, so no one else can swap the file or plant
+        # one in its place.
+        _RECORD=""
+        if [ -n "''${LAUNCH_RECORD:-}" ]; then
+          _RECORD="$(realpath -m "$LAUNCH_RECORD")"
+          _GUEST_WRITES=("$(realpath -m "''${WORK_DIR:-$(pwd)}")" "$(realpath -m "''${XDG_DATA_HOME:-$HOME/.local/share}/${dataDirName}")")
+          if [ -n "''${AGENT_HOME:-}" ]; then _GUEST_WRITES+=("$(realpath -m "$AGENT_HOME")"); fi
+          for _v in ${lib.concatMapStringsSep " " (s: s.var) (lib.filter (s: !s.readOnly) sharesList)}; do
+            if [ -n "''${!_v:-}" ]; then _GUEST_WRITES+=("$(realpath -m "''${!_v}")"); fi
+          done
+          for _g in "''${_GUEST_WRITES[@]}"; do
+            case "$_RECORD" in "''${_g%/}"/*)
+              echo "error: LAUNCH_RECORD=$LAUNCH_RECORD is inside $_g, which the guest can write" >&2
+              exit 1 ;;
+            esac
+          done
+          _RECORD_DIR="$(dirname "$_RECORD")"
+          if [ ! -d "$_RECORD_DIR" ]; then
+            echo "error: LAUNCH_RECORD=$LAUNCH_RECORD: $_RECORD_DIR is not a directory" >&2
+            exit 1
+          fi
+          if [ -z "$(find "$_RECORD_DIR" -maxdepth 0 -user "$(id -u)" ! -perm /022)" ]; then
+            echo "error: LAUNCH_RECORD=$LAUNCH_RECORD: $_RECORD_DIR must be yours and writable by no one else" >&2
+            exit 1
+          fi
+          if [ -L "$LAUNCH_RECORD" ] || { [ -e "$_RECORD" ] && [ ! -f "$_RECORD" ]; }; then
+            echo "error: LAUNCH_RECORD=$LAUNCH_RECORD is not a regular file" >&2
+            exit 1
+          fi
+          if ! rm -f "$_RECORD" 2>/dev/null; then
+            echo "error: cannot write LAUNCH_RECORD=$LAUNCH_RECORD: the earlier record cannot be removed" >&2
+            exit 1
+          fi
+        fi
         WORK="$(realpath "''${WORK_DIR:-$(pwd)}")"
         # --- Name ---
         # What this launch is called where people see it: QEMU's -name and the
@@ -345,6 +416,20 @@
 
         VM_MEM="''${VM_MEM:-${toString defaultMem}}"
         VM_VCPU="''${VM_VCPU:-${toString defaultVcpu}}"
+        # A wall-clock limit on the VM: when it is up, the power button, and
+        # QEMU's quit if the guest has not gone VM_TIMEOUT_GRACE later — see
+        # "Wall-clock limit" below. Seconds, or with an s/m/h suffix; 0 is none.
+        VM_TIMEOUT="''${VM_TIMEOUT:-0}"
+        VM_TIMEOUT_GRACE="''${VM_TIMEOUT_GRACE:-60}"
+        _seconds () { case "$1" in *h) echo $(( 10#''${1%h} * 3600 )) ;; *m) echo $(( 10#''${1%m} * 60 )) ;; *s) echo $(( 10#''${1%s} )) ;; *) echo $(( 10#$1 )) ;; esac; }
+        for _v in VM_TIMEOUT VM_TIMEOUT_GRACE; do
+          if ! [[ "''${!_v}" =~ ^[0-9]+[smh]?$ ]]; then
+            echo "error: $_v must be seconds, or a number with s, m or h (got '$(printf '%s' "''${!_v}")')" >&2
+            exit 1
+          fi
+        done
+        _TIMEOUT_S="$(_seconds "$VM_TIMEOUT")"
+        _GRACE_S="$(_seconds "$VM_TIMEOUT_GRACE")"
         CRI_STORAGE_SIZE="''${CRI_STORAGE_SIZE:-${toString defaultCriSize}}"
         ${lib.optionalString storeDiskBacked ''VM_STORE_SIZE="''${VM_STORE_SIZE:-${toString defaultStoreSize}}"''}
         RUNTIME="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -368,6 +453,47 @@
               echo "warning: EGRESS_ALLOW / EGRESS_ALLOWLIST / EGRESS_DENY are only read by EGRESS_POLICY=alert|shadow|enforce — ignored" >&2
             fi ;;
         esac
+        # EGRESS_BUILTIN=0 drops the built-in allowlists (microvm-policy's
+        # common.txt and the flavor's own), leaving only EGRESS_ALLOWLIST and
+        # EGRESS_ALLOW. The agent's model endpoints are on no allowlist — the
+        # proxy reverse-proxies them under their own path grant — so they stay
+        # reachable.
+        EGRESS_BUILTIN="''${EGRESS_BUILTIN:-1}"
+        case "$EGRESS_BUILTIN" in
+          0|1) ;;
+          *)
+            echo "error: EGRESS_BUILTIN must be 1 (the built-in allowlists apply) or 0 (only EGRESS_ALLOWLIST and EGRESS_ALLOW) (got '$EGRESS_BUILTIN')" >&2
+            exit 1 ;;
+        esac
+        if [ "$EGRESS_BUILTIN" = 0 ]; then
+          case "$EGRESS_POLICY" in
+            open|monitor) echo "warning: EGRESS_BUILTIN is only read by EGRESS_POLICY=alert|shadow|enforce — ignored" >&2 ;;
+          esac
+        fi
+        # API_BUDGET_REQUESTS / API_BUDGET_TOKENS cap what the session may spend
+        # on each model-API endpoint; the shadow/enforce proxy refuses past
+        # them (403, audited over_budget). A spending limit asked for and not
+        # applied is worse than none, so outside those policies it is an error,
+        # not a warning.
+        for _v in API_BUDGET_REQUESTS API_BUDGET_TOKENS; do
+          if [ -n "''${!_v:-}" ] && ! [[ "''${!_v}" =~ ^[1-9][0-9]{0,17}$ ]]; then
+            echo "error: $_v must be a positive integer (got: ''${!_v})" >&2
+            exit 1
+          fi
+        done
+        if [ -n "''${API_BUDGET_REQUESTS:-}''${API_BUDGET_TOKENS:-}" ]; then
+          case "$EGRESS_POLICY" in
+            shadow|enforce) ;;
+            *)
+              echo "error: API_BUDGET_REQUESTS / API_BUDGET_TOKENS need EGRESS_POLICY=shadow|enforce: the egress proxy is what enforces them" >&2
+              exit 1 ;;
+          esac
+        fi
+        ${if egressMetered == [ ] then ''
+        if [ -n "''${API_BUDGET_TOKENS:-}" ]; then
+          echo "error: API_BUDGET_TOKENS: the egress proxy cannot count ${agentName}'s tokens (it reads only Anthropic's usage); API_BUDGET_REQUESTS caps it by requests" >&2
+          exit 1
+        fi'' else ""}
         if ! [[ "''${EGRESS_PCAP_MAXLEN:-4096}" =~ ^[0-9]+$ ]]; then
           echo "error: EGRESS_PCAP_MAXLEN must be an integer (captured bytes per packet)" >&2
           exit 1
@@ -379,6 +505,105 @@
             echo "error: WORKSPACE_MODE must be passthrough or ephemeral (got '$WORKSPACE_MODE')" >&2
             exit 1 ;;
         esac
+        # persistent: one agent home per project, kept across launches.
+        # ephemeral: a fresh one for this launch, removed when it ends — see
+        # "Agent home" below.
+        AGENT_HOME_MODE="''${AGENT_HOME_MODE:-persistent}"
+        case "$AGENT_HOME_MODE" in
+          persistent) ;;
+          ephemeral)
+            if [ -n "''${AGENT_HOME:-}" ]; then
+              echo "error: AGENT_HOME_MODE=ephemeral makes its own agent home for the launch; unset AGENT_HOME (got '$AGENT_HOME')" >&2
+              exit 1
+            fi
+            # The dev-shell fence prompts before re-evaluating Nix files that
+            # changed since its last evaluation, which it remembers in agent
+            # home. A fresh one remembers nothing, so every evaluation would
+            # pass as a first one — including of a flake.nix an earlier guest
+            # rewrote.
+            if [ "''${DIRENV_ALLOW:-0}" = 1 ]; then
+              echo "error: DIRENV_ALLOW=1 cannot be combined with AGENT_HOME_MODE=ephemeral: with no agent home to remember what it evaluated, every launch would evaluate the project's Nix code on the host unprompted" >&2
+              exit 1
+            fi ;;
+          *)
+            echo "error: AGENT_HOME_MODE must be persistent or ephemeral (got '$AGENT_HOME_MODE')" >&2
+            exit 1 ;;
+        esac
+        # The launcher's own host state — agent homes, the ephemeral ones and
+        # their sweep, the egress logs beside them — must not lie inside the
+        # work share, or the guest can write it: rewrite the record of its own
+        # traffic, plant files in the next launch's home, or swap the paths
+        # the sweep is about to remove. Nor may the work share lie inside that
+        # state — the .ephemeral dir, another launch's home — which would hand
+        # the guest every home there. An ephemeral launch refuses either; a
+        # persistent one, which always ran like this, is warned.
+        #
+        # The data dir is checked both ways. An explicit AGENT_HOME is checked
+        # by its parent, where its -egress/-cri/-store siblings live, and only
+        # for lying inside the work share: a project beside ~/.my-agent-home
+        # is inside that parent ($HOME) and is no overlap.
+        _DATA_DIR="$(realpath -m "''${XDG_DATA_HOME:-$HOME/.local/share}/${dataDirName}")"
+        # Every launch's instance dir, its guest/env with API keys among them.
+        _RUNTIME_ROOT="$(realpath -m "$RUNTIME/claude-microvm")"
+        _STATE_IN=("$_DATA_DIR")
+        if [ -n "''${AGENT_HOME:-}" ]; then _STATE_IN+=("$(dirname "$(realpath -m "$AGENT_HOME")")"); fi
+        # "" for WORK=/, so that "$_W"/* matches every absolute path.
+        _W="''${WORK%/}"
+        _OVERLAP=""
+        for _s in "''${_STATE_IN[@]}"; do
+          case "$_s/" in "$_W"/*) _OVERLAP="$_s is inside WORK_DIR=$WORK"; break ;; esac
+        done
+        case "$_W/" in "$_DATA_DIR"/*) _OVERLAP="WORK_DIR=$WORK is inside $_DATA_DIR" ;; esac
+        if [ -n "$_OVERLAP" ]; then
+          if [ "$AGENT_HOME_MODE" = ephemeral ]; then
+            echo "error: $_OVERLAP, and the guest can write the work share; AGENT_HOME_MODE=ephemeral needs this launcher's state out of the guest's reach — use a WORK_DIR that neither contains it nor lies inside it" >&2
+            exit 1
+          fi
+          echo "warning: $_OVERLAP: the guest can write this launcher's state through the work share (agent homes, egress logs)" >&2
+        fi
+        # The runtime root holds every running launch's env file, API keys and
+        # all: a work share overlapping it would hand them to this guest. Not
+        # one layout anyone relied on, so refused whatever the mode.
+        case "$_RUNTIME_ROOT/" in "$_W"/*) echo "error: WORK_DIR=$WORK contains $_RUNTIME_ROOT, where every launch keeps its env file and API keys" >&2; exit 1 ;; esac
+        case "$_W/" in "$_RUNTIME_ROOT"/*) echo "error: WORK_DIR=$WORK is inside $_RUNTIME_ROOT, where every launch keeps its env file and API keys" >&2; exit 1 ;; esac
+        # --- Extra shares (claude-vm.shares) ---
+        # The guest declares them, so QEMU expects each one's socket: each must
+        # be given its host directory, SHARE_<NAME>, or the VM could not start.
+        # None may overlap this launcher's state, either way, read-only or not:
+        # agent homes hold other projects' sign-ins, and the egress logs are
+        # the guest's own record.
+        _SHARE_NAMES=${shareArray (s: s.name)}
+        _SHARE_VARS=${shareArray (s: s.var)}
+        _SHARE_RO=${shareArray (s: if s.readOnly then "1" else "0")}
+        _SHARE_MP=${shareArray (s: s.mountPoint)}
+        _SHARE_HOST=()
+        # What a share may not lie inside: the data dir and the runtime root,
+        # and an explicit AGENT_HOME with the siblings beside it.
+        _STATE_INSIDE=("$_DATA_DIR" "$_RUNTIME_ROOT")
+        if [ -n "''${AGENT_HOME:-}" ]; then
+          _a="$(realpath -m "$AGENT_HOME")"
+          _STATE_INSIDE+=("$_a" "$_a-egress" "$_a-cri" "$_a-store")
+        fi
+        for _i in "''${!_SHARE_NAMES[@]}"; do
+          _v="''${_SHARE_VARS[$_i]}"
+          _h="''${!_v:-}"
+          if [ -z "$_h" ]; then
+            echo "error: this VM shares a host directory at ''${_SHARE_MP[$_i]} (share ''${_SHARE_NAMES[$_i]}): set $_v=<host dir>" >&2
+            exit 1
+          fi
+          if [ ! -d "$_h" ]; then
+            echo "error: $_v=$_h is not a directory" >&2
+            exit 1
+          fi
+          _h="$(realpath "$_h")"
+          for _s in "''${_STATE_IN[@]}" "$_RUNTIME_ROOT"; do
+            case "$_s/" in "''${_h%/}"/*) echo "error: $_v=$_h contains $_s, this launcher's state; share a directory clear of it" >&2; exit 1 ;; esac
+          done
+          for _s in "''${_STATE_INSIDE[@]}"; do
+            case "''${_h%/}/" in "$_s"/*) echo "error: $_v=$_h is inside $_s, this launcher's state; share a directory clear of it" >&2; exit 1 ;; esac
+          done
+          _SHARE_HOST+=("$_h")
+        done
         # virtiofsd's --cache policy for the /work share; the agent-home share
         # keeps the default. See README "Work share caching".
         WORK_CACHE="''${WORK_CACHE:-auto}"
@@ -419,6 +644,7 @@
         EGRESS_UNIT=""
         EGRESS_ALERTS=""
         EGRESS_AUDIT=""
+        EGRESS_USAGE=""
         _EGRESS_ALLOWLIST_FILE=""
         _EGRESS_PORTFILE=""
         _EGRESS_PROXY_CFG=""
@@ -510,6 +736,11 @@
         AGENT_UNIT="$UNIT_STEM-agent-home"
         GUEST_SOCK="$_INSTANCE_PATH/guest.sock"
         GUEST_UNIT="$UNIT_STEM-guest"
+        _SHARE_SOCK=() _SHARE_UNIT=()
+        for _i in "''${!_SHARE_NAMES[@]}"; do
+          _SHARE_SOCK+=("$_INSTANCE_PATH/share-''${_SHARE_NAMES[$_i]}.sock")
+          _SHARE_UNIT+=("$UNIT_STEM-share-''${_SHARE_NAMES[$_i]}")
+        done
         # sun_path is 108 bytes, NUL included. The longest default is
         # /run/user/<uid>/claude-microvm/vms/<id>/agent-home.sock, 62 bytes for
         # a 4-digit uid, leaving room for longer uids and runtime dirs;
@@ -519,7 +750,7 @@
         # uid>. A runtime dir or namespace long enough to break it
         # would otherwise surface as QEMU or virtiofsd failing to bind, after
         # the daemons before it had started.
-        for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK"; do
+        for _s in "$QMP_SOCK" "$SOCK" "$AGENT_SOCK" "$GUEST_SOCK" "${_SHARE_SOCK[@]}"; do
           if [ "''${#_s}" -gt 107 ]; then
             echo "error: socket path too long (''${#_s} bytes, the limit is 107): $_s" >&2
             echo "       it is under XDG_RUNTIME_DIR=$RUNTIME''${NAMESPACE:+ and MICROVM_NAMESPACE=$NAMESPACE}; a shorter one avoids this" >&2
@@ -541,6 +772,9 @@
           ${pkgs.systemd}/bin/systemctl --user stop "$UNIT" 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --user stop "$AGENT_UNIT" 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --user stop "$GUEST_UNIT" 2>/dev/null || true
+          for _u in "''${_SHARE_UNIT[@]}"; do
+            ${pkgs.systemd}/bin/systemctl --user stop "$_u" 2>/dev/null || true
+          done
           if [ -n "$EGRESS_UNIT" ]; then
             ${pkgs.systemd}/bin/systemctl --user stop "$EGRESS_UNIT" 2>/dev/null || true
           fi
@@ -555,7 +789,11 @@
             # gone, so drop it unless something else put files there.
             rmdir "$STORE_STATE_DIR" 2>/dev/null || true
           fi
+          # An ephemeral agent home, with its CRI and store images. The guest
+          # leaves read-only directories (Go's module cache, for one), so they
+          # are made writable first.
           if [ -n "$AGENT_TEMP" ]; then
+            chmod -R -P u+w "$AGENT_TEMP" 2>/dev/null || true
             rm -rf "$AGENT_TEMP"
           fi
           # This launch's instance dir goes with it: guest/ — env (API keys
@@ -623,20 +861,68 @@
         [ -S "$SOCK" ] || { echo "error: virtiofsd socket did not appear"; exit 1; }
 
         # --- Agent home share (virtiofsd) ---
-        # The default is per project: <basename>-<hash of WORK>, the hash
-        # keeping apart two directories that share a basename (or its first 12
-        # characters). A name that was given is a handle someone chose, and is
-        # the key by itself: launches with the same MICROVM_NAME share an agent
-        # home, whatever their WORK_DIR — and with it everything derived from
-        # its path below (-cri, -store, -egress).
-        if [ -z "''${AGENT_HOME:-}" ]; then
-          DATA_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}"
-          if [ -n "''${MICROVM_NAME:-}" ]; then
-            AGENT_HOME="$DATA_HOME/${dataDirName}/$NAME"
-          else
-            WORK_HASH="$(echo -n "$WORK" | sha256sum | cut -c1-12)"
-            AGENT_HOME="$DATA_HOME/${dataDirName}/$NAME-$WORK_HASH"
-          fi
+        DATA_HOME="''${XDG_DATA_HOME:-$HOME/.local/share}"
+        # The project's own agent home, which a launch uses unless it is
+        # ephemeral or AGENT_HOME says otherwise. The default is per project:
+        # <name>-<hash of WORK>, the hash keeping apart two directories that
+        # share a basename (or its first 12 characters). A name that was given
+        # is a handle someone chose, and is the key by itself: launches with
+        # the same MICROVM_NAME share an agent home, whatever their WORK_DIR —
+        # and with it everything derived from its path below (-cri, -store,
+        # -egress). An ephemeral launch does not use it, but its egress logs
+        # still go beside it (EGRESS_DIR below): they are the record of what
+        # the launch did, and outlive it on purpose.
+        if [ -n "''${MICROVM_NAME:-}" ]; then
+          PROJECT_HOME="$DATA_HOME/${dataDirName}/$NAME"
+        else
+          WORK_HASH="$(echo -n "$WORK" | sha256sum | cut -c1-12)"
+          PROJECT_HOME="$DATA_HOME/${dataDirName}/$NAME-$WORK_HASH"
+        fi
+        if [ "$AGENT_HOME_MODE" = ephemeral ]; then
+          # On disk, not in the runtime dir: an agent home holds caches that
+          # run to gigabytes. Named by the launch ID, like the instance dir,
+          # and holding what would otherwise be agent home's siblings — the
+          # CRI and store images — so that nothing of the launch outlives it
+          # but its egress logs. A container image cache kept across launches
+          # would carry state from one into the next.
+          _EPHEMERAL_ROOT="$DATA_HOME/${dataDirName}/.ephemeral"
+          mkdir -p "$_EPHEMERAL_ROOT"
+          chmod 700 "$_EPHEMERAL_ROOT"
+          # Each home is locked by its own directory, held — by this launcher
+          # and, inherited, by QEMU — for as long as the launch runs. Not by
+          # the instance lock: that is under XDG_RUNTIME_DIR, this under
+          # XDG_DATA_HOME, and two launches sharing one need not share the
+          # other. The dir is made under a name the sweep below ignores and
+          # locked before it is renamed into place, so no sweep ever sees it
+          # unlocked; the rename keeps the inode, and with it the lock.
+          mkdir -m 700 "$_EPHEMERAL_ROOT/$ID.new"
+          exec {_EPHEMERAL_LOCK_FD}<"$_EPHEMERAL_ROOT/$ID.new"
+          ${pkgs.util-linux}/bin/flock -n "$_EPHEMERAL_LOCK_FD"
+          mv -T "$_EPHEMERAL_ROOT/$ID.new" "$_EPHEMERAL_ROOT/$ID"
+          AGENT_TEMP="$_EPHEMERAL_ROOT/$ID"
+          # What a launcher killed outright left behind: a home whose lock can
+          # be taken. It is removed while holding that lock, so a launch still
+          # running is never touched. Symlinks are skipped and never followed
+          # (-P): should XDG_DATA_HOME sit inside a share, a guest could plant
+          # one here pointing anywhere.
+          # A <id>.new is one killed before its rename; it is taken only once
+          # it is ten minutes old, so a launch between its mkdir and its flock
+          # never loses it.
+          for _d in "$_EPHEMERAL_ROOT"/*; do
+            _n="$(basename "$_d")"
+            [[ "$_n" =~ ^[0-9a-f]{12}(\.new)?$ ]] && [ "''${_n%.new}" != "$ID" ] || continue
+            [ -d "$_d" ] && [ ! -L "$_d" ] || continue
+            if [[ "$_n" == *.new ]] && [ -z "$(find "$_d" -maxdepth 0 -mmin +10)" ]; then continue; fi
+            { exec {_fd}<"$_d"; } 2>/dev/null || continue
+            if ${pkgs.util-linux}/bin/flock -n "$_fd"; then
+              chmod -R -P u+w "$_d" 2>/dev/null || true
+              rm -rf "$_d"
+            fi
+            exec {_fd}<&-
+          done
+          AGENT_HOME="$AGENT_TEMP/home"
+        elif [ -z "''${AGENT_HOME:-}" ]; then
+          AGENT_HOME="$PROJECT_HOME"
         fi
         AGENT_DIR="$(realpath "$AGENT_HOME" 2>/dev/null || echo "$AGENT_HOME")"
         if [ ! -d "$AGENT_DIR" ]; then
@@ -650,17 +936,30 @@
         # the shadow/enforce proxy), and is null otherwise.
         _EGRESS_UNIT_NAME=""
         case "$EGRESS_POLICY" in alert|shadow|enforce) _EGRESS_UNIT_NAME="$UNIT_STEM-egress" ;; esac
+        _SHARES_JSON="[]"
+        for _i in "''${!_SHARE_NAMES[@]}"; do
+          _SHARES_JSON="$(${pkgs.jq}/bin/jq -c \
+            --arg name "''${_SHARE_NAMES[$_i]}" --arg host "''${_SHARE_HOST[$_i]}" --arg guest "''${_SHARE_MP[$_i]}" \
+            --argjson readOnly "$([ "''${_SHARE_RO[$_i]}" = 1 ] && echo true || echo false)" \
+            --arg socket "''${_SHARE_SOCK[$_i]}" --arg unit "''${_SHARE_UNIT[$_i]}" \
+            '. + [{name: $name, host: $host, guest: $guest, readOnly: $readOnly, socket: $socket, unit: $unit}]' <<< "$_SHARES_JSON")"
+        done
         ${pkgs.jq}/bin/jq -n \
+          --argjson shares "$_SHARES_JSON" \
+          --argjson timeout "$_TIMEOUT_S" --argjson timeoutGrace "$_GRACE_S" \
           --argjson pid "$$" --arg flavor ${lib.escapeShellArg agentName} \
           --arg name "$NAME" --arg vmId "$VM_ID" --arg id "$ID" --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg work "$WORK" --arg agentHome "$AGENT_DIR" --arg guest "$INSTANCE_GUEST" \
+          --arg agentHomeMode "$AGENT_HOME_MODE" \
           --arg egressPolicy "$EGRESS_POLICY" --arg namespace "$NAMESPACE" --arg context "$CONTEXT" --arg startDir "$START_DIR" \
           --arg qmp "$QMP_SOCK" --arg workSock "$SOCK" --arg agentHomeSock "$AGENT_SOCK" --arg guestSock "$GUEST_SOCK" \
           --arg scopeUnit "$_MICROVM_SCOPE" --arg slice "$SLICE" \
           --arg workUnit "$UNIT" --arg agentHomeUnit "$AGENT_UNIT" --arg guestUnit "$GUEST_UNIT" --arg egressUnit "$_EGRESS_UNIT_NAME" \
           '{version: 1, pid: $pid, flavor: $flavor, name: $name, vmId: $vmId, id: $id, started: $started,
-            work: $work, agentHome: $agentHome, guest: $guest, guestMount: "/run/microvm",
+            work: $work, agentHome: $agentHome, agentHomeMode: $agentHomeMode, guest: $guest, guestMount: "/run/microvm",
             egressPolicy: $egressPolicy,
+            shares: $shares,
+            timeout: (if $timeout == 0 then null else {seconds: $timeout, graceSeconds: $timeoutGrace} end),
             context: (if $context == "" then null else $context end),
             startDir: (if $startDir == "" then null else $startDir end),
             namespace: (if $namespace == "" then null else $namespace end),
@@ -690,8 +989,14 @@
           # Host-only sibling of the agent dir, like the CRI image: $AGENT_DIR
           # itself is exported into the guest, and the guest must not be able
           # to rewrite the record of its own traffic. Traffic metadata is
-          # sensitive, so the directory is owner-only.
-          EGRESS_DIR="$AGENT_DIR-egress"
+          # sensitive, so the directory is owner-only. An ephemeral agent home
+          # goes with its launch, so its egress logs go beside the project's
+          # own home instead, where every launch on the project keeps them.
+          if [ "$AGENT_HOME_MODE" = ephemeral ]; then
+            EGRESS_DIR="$PROJECT_HOME-egress"
+          else
+            EGRESS_DIR="$AGENT_DIR-egress"
+          fi
           mkdir -p "$EGRESS_DIR"
           chmod 700 "$EGRESS_DIR"
           _EGRESS_STAMP="$(date +%Y%m%d-%H%M%S)-''${ID%%-*}"
@@ -726,10 +1031,17 @@
             # can show where every rule comes from and what overrode it.
             _EGRESS_ALLOWLIST_FILE="$EGRESS_DIR/session-$_EGRESS_STAMP.allowlist"
             _EGRESS_RULES="$_EGRESS_ALLOWLIST_FILE.rules"
+            # tests/egress-builtin.nix extracts the region between these
+            # markers and runs it against the real proxy, so keep it
+            # self-contained on EGRESS_BUILTIN, EGRESS_ALLOWLIST, EGRESS_ALLOW,
+            # EGRESS_DENY, EGRESS_POLICY and the _EGRESS_* / _C_* variables.
+            # BEGIN egress-allowlist
             {
+              if [ "$EGRESS_BUILTIN" = 1 ]; then
               ${lib.concatMapStrings (s: ''
               ${pkgs.gawk}/bin/awk -v l=${lib.escapeShellArg s.label} '{ print l "\t" $0 }' ${s.file}
               '') egressAllowlistSources}
+              fi
               if [ -n "''${EGRESS_ALLOWLIST:-}" ]; then
                 if [ ! -f "$EGRESS_ALLOWLIST" ]; then
                   echo "error: EGRESS_ALLOWLIST=$EGRESS_ALLOWLIST is not a file" >&2
@@ -742,11 +1054,12 @@
               fi
             } > "$_EGRESS_RULES.src"
             ${pkgs.gawk}/bin/awk -f ${./scripts/egress-rules.awk} \
-              -v deny="''${EGRESS_DENY:-}" -v mode="$EGRESS_POLICY" \
+              -v deny="''${EGRESS_DENY:-}" -v mode="$EGRESS_POLICY" -v builtin="$EGRESS_BUILTIN" -v endpoints=${lib.escapeShellArg egressEndpointHosts} \
               -v allowout="$_EGRESS_ALLOWLIST_FILE" -v contractout="$_EGRESS_RULES" \
               -v B="$_C_B" -v D="$_C_D" -v R="$_C_R" -v G="$_C_G" -v Y="$_C_Y" -v Z="$_C_0" \
               "$_EGRESS_RULES.src"
             rm -f "$_EGRESS_RULES.src"
+            # END egress-allowlist
           ;; esac
 
           if [ "$EGRESS_POLICY" = "alert" ]; then
@@ -767,6 +1080,13 @@
             ln -sfn "$(basename "$EGRESS_AUDIT")" "$EGRESS_DIR/latest.audit.jsonl"
             _EGRESS_PORTFILE="$INSTANCE_DIR/egress.port"
             _EGRESS_PROXY_CFG="$INSTANCE_DIR/egress.json"
+            # What the session spent on the model API, per endpoint, rewritten
+            # by the proxy after every response; API_BUDGET_* caps it.
+            EGRESS_USAGE="$EGRESS_DIR/session-$_EGRESS_STAMP.usage.json"
+            ln -sfn "$(basename "$EGRESS_USAGE")" "$EGRESS_DIR/latest.usage.json"
+            _EGRESS_USAGE_FILE="$EGRESS_USAGE"
+            _EGRESS_BUDGET_REQUESTS="''${API_BUDGET_REQUESTS:-}"
+            _EGRESS_BUDGET_TOKENS="''${API_BUDGET_TOKENS:-}"
             _EGRESS_PROXY_MODE="enforce"
             [ "$EGRESS_POLICY" = "shadow" ] && _EGRESS_PROXY_MODE="log"
             # tests/egress-config.nix extracts the region between these
@@ -777,7 +1097,7 @@
             _EGRESS_EPS=""
             ${egressEndpointJson}
             cat > "$_EGRESS_PROXY_CFG" <<EOF
-{"listen":"127.0.0.1:0","mode":"$_EGRESS_PROXY_MODE","allowlistFile":"$_EGRESS_ALLOWLIST_FILE","auditLog":"$EGRESS_AUDIT","portFile":"$_EGRESS_PORTFILE","endpoints":[''${_EGRESS_EPS#,}]}
+{"listen":"127.0.0.1:0","mode":"$_EGRESS_PROXY_MODE","allowlistFile":"$_EGRESS_ALLOWLIST_FILE","auditLog":"$EGRESS_AUDIT","portFile":"$_EGRESS_PORTFILE","usageFile":"$_EGRESS_USAGE_FILE","endpoints":[''${_EGRESS_EPS#,}]}
 EOF
             chmod 600 "$_EGRESS_PROXY_CFG"
             # END egress-proxy-config
@@ -1194,6 +1514,34 @@ EOF
         done
         [ -S "$GUEST_SOCK" ] || { echo "error: guest-share virtiofsd socket did not appear"; exit 1; }
 
+        # --- Extra shares (virtiofsd each) ---
+        # As agent home's, files shown as the agent's; --readonly unless the
+        # guest declared the share writable, which holds against root in the
+        # guest as it does for the guest share.
+        for _i in "''${!_SHARE_NAMES[@]}"; do
+          _RO_ARGS=()
+          [ "''${_SHARE_RO[$_i]}" = 1 ] && _RO_ARGS=(--readonly)
+          ${pkgs.systemd}/bin/systemd-run --user --unit="''${_SHARE_UNIT[$_i]}" --collect "''${_UNIT_PROPS[@]}" \
+            "$(describe "virtiofsd for share ''${_SHARE_NAMES[$_i]} ($([ "''${_SHARE_RO[$_i]}" = 1 ] && echo read-only || echo read-write)) → ''${_SHARE_MP[$_i]}")" \
+            -- ${virtiofsd}/bin/virtiofsd \
+              --socket-path="''${_SHARE_SOCK[$_i]}" \
+              --shared-dir="''${_SHARE_HOST[$_i]}" \
+              "''${_RO_ARGS[@]}" \
+              --sandbox=namespace \
+              --uid-map ":0:$(id -u):1:" \
+              --gid-map ":0:$(id -g):1:" \
+              --translate-uid "map:1000:0:1" \
+              --translate-gid "map:1000:0:1" \
+              --socket-group="$(id -gn)"
+        done
+        for _i in "''${!_SHARE_NAMES[@]}"; do
+          for i in $(seq 1 50); do
+            [ -S "''${_SHARE_SOCK[$_i]}" ] && break
+            sleep 0.1
+          done
+          [ -S "''${_SHARE_SOCK[$_i]}" ] || { echo "error: virtiofsd socket for share ''${_SHARE_NAMES[$_i]} did not appear"; exit 1; }
+        done
+
         # $CRI_IMG is used as sed replacement text below. Escape characters
         # that are special on the replacement side (\, &) and the | delimiter
         # so a path with such characters can't corrupt the generated command.
@@ -1212,6 +1560,8 @@ EOF
           -e "s|${hostname}-virtiofs-agent-home.sock|$AGENT_SOCK|g"
           -e "s|/tmp/${hostname}-instance|$INSTANCE_GUEST|g"
           -e "s|${hostname}-virtiofs-instance.sock|$GUEST_SOCK|g"
+          ${lib.concatMapStrings (s: ''-e "s|${hostname}-virtiofs-share-${s.name}.sock|''${_SHARE_SOCK[${toString s.idx}]}|g"
+          '') sharesList}
           # QEMU's QMP socket: microvm.socket is a relative "<hostname>.sock",
           # which would land in whatever directory the launcher runs from, and
           # two launches from one directory would take it from each other.
@@ -1330,7 +1680,13 @@ EOF
           _cont "the agent starts in $START_DIR"
         fi
         _row "agent home" "" "$(_tilde "$AGENT_DIR") → /home/agent"
-        _cont "persists across sessions"
+        if [ "$AGENT_HOME_MODE" = ephemeral ]; then
+          _cont "this launch only: removed when it ends, CRI and store images with it"
+          _cont "egress logs kept in $(_tilde "$PROJECT_HOME")-egress"
+        else
+          _cont "persists across sessions"
+          _hint "AGENT_HOME_MODE=ephemeral starts from an empty one"
+        fi
         # The third share, and the one API keys arrive by: what this launch
         # hands the guest (see "Instance dir"). Listed as it actually is.
         _GUEST_HOLDS="env"
@@ -1348,6 +1704,15 @@ EOF
         else
           _hint "MICROVM_CONTEXT=<file or dir> hands this launch data of its own"
         fi
+        for _i in "''${!_SHARE_NAMES[@]}"; do
+          if [ "''${_SHARE_RO[$_i]}" = 1 ]; then
+            _row share ok "$(_tilde "''${_SHARE_HOST[$_i]}") → ''${_SHARE_MP[$_i]}, read-only to the guest"
+          else
+            _row share warn "$(_tilde "''${_SHARE_HOST[$_i]}") → ''${_SHARE_MP[$_i]}, read-write"
+            _cont "the guest's writes land on the host"
+          fi
+          _hint "''${_SHARE_NAMES[$_i]}, from ''${_SHARE_VARS[$_i]}"
+        done
         if [ "''${DIRENV_ALLOW:-0}" = "1" ]; then
           _row "dev shell" bad "loaded from the project — its Nix code is evaluated on the HOST"
         else
@@ -1389,6 +1754,19 @@ EOF
               _row "credentials" ok "''${_CONTRACT_KEYS# } — placeholders in the guest, real keys stay with the proxy"
             else
               _row "credentials" "" "no API keys (OAuth passes through the proxy)"
+            fi
+            if [ -n "''${API_BUDGET_REQUESTS:-}''${API_BUDGET_TOKENS:-}" ]; then
+              _BUDGET_DESC=""
+              [ -n "''${API_BUDGET_REQUESTS:-}" ] && _BUDGET_DESC="$API_BUDGET_REQUESTS requests"
+              [ -n "''${API_BUDGET_TOKENS:-}" ] && _BUDGET_DESC="''${_BUDGET_DESC:+$_BUDGET_DESC, }$API_BUDGET_TOKENS tokens"
+              _row "api budget" ok "$_BUDGET_DESC per model endpoint — refused (403) past it"
+              ${lib.optionalString (egressMetered != [ ] && egressMetered != flavorEndpoints) ''
+              if [ -n "''${API_BUDGET_TOKENS:-}" ]; then
+                _cont "tokens counted on ${lib.concatMapStringsSep " " (ep: ep.prefix) egressMetered} only; the others by requests"
+              fi''}
+            else
+              _row "api budget" "" "none — the proxy records what the session spends"
+              _hint "API_BUDGET_TOKENS / API_BUDGET_REQUESTS cap it"
             fi ;;
           *)
             if [ -n "$_CONTRACT_KEYS" ]; then
@@ -1417,6 +1795,9 @@ EOF
           esac
         fi
         _row resources "" "''${VM_MEM} MiB RAM · $VM_VCPU vCPUs${lib.optionalString storeDiskBacked " · writable store \${VM_STORE_SIZE} MiB, fresh each boot"}"
+        if [ "$_TIMEOUT_S" -gt 0 ]; then
+          _cont "wall-clock limit $VM_TIMEOUT: then the power button, and quit $VM_TIMEOUT_GRACE later"
+        fi
         # The handle on this launch from outside the VM: its units, its slice,
         # its journal tag and its instance dir all carry the ID.
         _row launch "" "$NAME · $ID · $INSTANCE_DIR/"
@@ -1441,9 +1822,111 @@ EOF
           read -r -p "press Enter to boot (NO_PAUSE=1 to skip this) … " _ || true
         fi
 
+        # The launch record, as of boot. Names only, never values, as in the
+        # contract. Written whole: a file of its own, made owner-only and new
+        # by mktemp (never one that was there before), renamed into place.
+        # Fails, leaving no temporary file, on any error: the caller decides
+        # what a record it could not write means.
+        _record_write () { # json
+          local tmp
+          [ -n "$1" ] || return 1
+          tmp="$(mktemp "$_RECORD.XXXXXX" 2>/dev/null)" || return 1
+          if ! { printf '%s\n' "$1" > "$tmp" && mv -f "$tmp" "$_RECORD"; } 2>/dev/null; then
+            rm -f "$tmp"
+            return 1
+          fi
+        }
+        _RECORD_JSON=""
+        if [ -n "$_RECORD" ]; then
+          # Split on spaces only: set -f, in a subshell of its own, keeps a deny
+          # such as *.example.org from matching files.
+          _words () ( set -f; ${pkgs.jq}/bin/jq -cn '$ARGS.positional' --args $1 )
+          _DENY_WORDS="''${EGRESS_DENY:-}"; _DENY_WORDS="''${_DENY_WORDS//,/ }"
+          _ALLOW_SHA=""
+          if [ -n "$_EGRESS_ALLOWLIST_FILE" ] && [ -f "$_EGRESS_ALLOWLIST_FILE" ]; then
+            _ALLOW_SHA="$(sha256sum "$_EGRESS_ALLOWLIST_FILE" | cut -d' ' -f1)"
+          fi
+          _RECORD_JSON="$(${pkgs.jq}/bin/jq -cn \
+            --arg id "$ID" --arg flavor ${lib.escapeShellArg agentName} --arg booted "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg work "$WORK" --arg workspaceMode "$WORKSPACE_MODE" --arg guard "''${WORKSPACE_GUARD:-}" \
+            --arg agentHome "$AGENT_DIR" --arg agentHomeMode "$AGENT_HOME_MODE" \
+            --argjson shares "$_SHARES_JSON" \
+            --argjson timeout "$_TIMEOUT_S" --argjson grace "$_GRACE_S" \
+            --arg mem "$VM_MEM" --arg vcpu "$VM_VCPU" \
+            --arg policy "$EGRESS_POLICY" --arg builtin "$EGRESS_BUILTIN" \
+            --argjson deny "$(_words "$_DENY_WORDS")" \
+            --arg allowlist "$_EGRESS_ALLOWLIST_FILE" --arg allowlistSha256 "$_ALLOW_SHA" --arg auditLog "$EGRESS_AUDIT" \
+            --arg usageFile "$EGRESS_USAGE" --arg budgetRequests "''${API_BUDGET_REQUESTS:-}" --arg budgetTokens "''${API_BUDGET_TOKENS:-}" \
+            --argjson endpoints ${lib.escapeShellArg (builtins.toJSON (map (ep: { inherit (ep) prefix upstream allowedPaths; usage = ep.usage or null; }) flavorEndpoints))} \
+            --argjson keys "$(_words "$_CONTRACT_KEYS")" --argjson extraEnv "$(_words "$_CONTRACT_EXTRA")" \
+            --arg direnv "''${DIRENV_ALLOW:-0}" \
+            '{version: 1, id: $id, flavor: $flavor, booted: $booted,
+              workspace: {dir: $work, mode: $workspaceMode, guard: ($guard == "1")},
+              agentHome: {dir: $agentHome, mode: $agentHomeMode},
+              shares: $shares,
+              timeout: (if $timeout == 0 then null else {seconds: $timeout, graceSeconds: $grace} end),
+              resources: {memMiB: ($mem | tonumber? // $mem), vcpus: ($vcpu | tonumber? // $vcpu)},
+              egress: {policy: $policy, builtinAllowlists: ($builtin == "1"), deny: $deny,
+                       allowlist: (if $allowlist == "" then null else {file: $allowlist, sha256: $allowlistSha256} end),
+                       auditLog: (if $auditLog == "" then null else $auditLog end),
+                       usageFile: (if $usageFile == "" then null else $usageFile end),
+                       apiBudget: (if $budgetRequests == "" and $budgetTokens == "" then null
+                                   else {maxRequests: ($budgetRequests | tonumber? // null), maxTokens: ($budgetTokens | tonumber? // null)} end),
+                       endpoints: (if ($policy == "shadow" or $policy == "enforce") then $endpoints else [] end)},
+              env: {apiKeys: $keys, extraEnv: $extraEnv, devShellFromHost: ($direnv == "1")},
+              ended: null}')"
+          # Evidence the launch cannot give is a launch that should not run.
+          if ! _record_write "$_RECORD_JSON"; then
+            echo "error: cannot write LAUNCH_RECORD=$LAUNCH_RECORD" >&2
+            exit 1
+          fi
+        fi
+
+        # --- Wall-clock limit (VM_TIMEOUT) ---
+        # A watcher started with the VM, not a timer the launcher sleeps on: it
+        # holds the limit even if the launcher itself is killed outright, as
+        # long as QEMU runs. It stops as microvm-stop does — the power button,
+        # then quit after the grace — and leaves timed-out in the instance dir
+        # for the exit status. It closes its copies of the launch's locks, so
+        # they say when the VM has gone, and it then ends at once: it never
+        # keeps the scope, and with it the daemons, alive.
+        _TIMEOUT_PID=""
+        if [ "$_TIMEOUT_S" -gt 0 ]; then
+          (
+            trap - EXIT
+            exec {_INSTANCE_LOCK_FD}>&-
+            if [ -n "''${_EPHEMERAL_LOCK_FD:-}" ]; then exec {_EPHEMERAL_LOCK_FD}<&-; fi
+            _started=$SECONDS
+            while :; do
+              [ -e "$INSTANCE_DIR/lock" ] || exit 0
+              if ${pkgs.util-linux}/bin/flock -n "$INSTANCE_DIR/lock" true 2>/dev/null; then exit 0; fi
+              if [ $(( SECONDS - _started )) -ge "$_TIMEOUT_S" ]; then
+                : > "$INSTANCE_DIR/timed-out"
+                echo "VM_TIMEOUT: $VM_TIMEOUT is up — pressing the VM's power button" >&2
+                if ! ${mkMicrovmTool pkgs "microvm-stop"}/bin/microvm-stop --timeout "$_GRACE_S" "$INSTANCE_DIR" >/dev/null 2>&1; then
+                  echo "VM_TIMEOUT: still running $VM_TIMEOUT_GRACE later — stopping QEMU" >&2
+                  ${mkMicrovmTool pkgs "microvm-stop"}/bin/microvm-stop --force --timeout 30 "$INSTANCE_DIR" >/dev/null 2>&1 || true
+                fi
+                exit 0
+              fi
+              sleep 1
+            done
+          ) </dev/null &
+          _TIMEOUT_PID=$!
+        fi
+
         # Run QEMU with corrected paths
         _VM_RC=0
         bash <(${pkgs.gnused}/bin/sed "''${_SED_ARGS[@]}" ${runner}/bin/microvm-run) || _VM_RC=$?
+        if [ -n "$_TIMEOUT_PID" ]; then
+          kill "$_TIMEOUT_PID" 2>/dev/null || true
+          # 124, as timeout(1) exits, so a caller can tell a run cut short
+          # from one that ended on its own.
+          if [ -e "$INSTANCE_DIR/timed-out" ]; then
+            echo "VM_TIMEOUT: the VM was stopped after $VM_TIMEOUT" >&2
+            _VM_RC=124
+          fi
+        fi
 
         case "$EGRESS_POLICY" in
           monitor|alert)
@@ -1479,8 +1962,23 @@ EOF
             _allow=$(grep -c '"decision":"allow"' "$EGRESS_AUDIT" 2>/dev/null) || _allow=0
             _deny=$(grep -c '"decision":"deny"' "$EGRESS_AUDIT" 2>/dev/null) || _deny=0
             _would=$(grep -c '"decision":"would_deny"' "$EGRESS_AUDIT" 2>/dev/null) || _would=0
+            _over=$(grep -c '"decision":"over_budget"' "$EGRESS_AUDIT" 2>/dev/null) || _over=0
+            _over_s=""
+            if [ "$_over" -gt 0 ]; then _over_s=", $_over over budget"; fi
             echo
-            echo "egress ($EGRESS_POLICY): $_allow allowed, $_deny denied, $_would would-deny"
+            echo "egress ($EGRESS_POLICY): $_allow allowed, $_deny denied, $_would would-deny$_over_s"
+            # What the model API cost, per endpoint that saw any traffic.
+            if [ -f "$EGRESS_USAGE" ]; then
+              ${pkgs.jq}/bin/jq -r '.endpoints[] | select(.requests > 0 or .refused > 0)
+                | "api \(.prefix): \(.requests) requests"
+                  + (if .tokens then ", \(.tokens | add) tokens" else "" end)
+                  + (if .refused > 0 then ", \(.refused) refused" else "" end)
+                  + (if (.unknownUsage // 0) > 0 then ", \(.unknownUsage) of unknown cost" else "" end)
+                  + (if .exhausted then " — budget spent" else "" end)' "$EGRESS_USAGE" 2>/dev/null || true
+            fi
+            if [ "$_over" -gt 0 ]; then
+              echo "  $_over request(s) refused under the API budget (API_BUDGET_REQUESTS / API_BUDGET_TOKENS): $EGRESS_USAGE"
+            fi
             if [ "$_would" -gt 0 ]; then
               echo "  shadow found traffic enforce would block — the hosts are in the audit log:"
               echo "  grep would_deny '$EGRESS_AUDIT'"
@@ -1489,8 +1987,57 @@ EOF
               echo "  denied hosts and the way to allow them: grep '\"decision\":\"deny\"' '$EGRESS_AUDIT'"
             fi
             echo "egress audit log saved: $EGRESS_AUDIT"
+            # For a launch that keeps a record, the run judged: did anything
+            # but the model API leave, or try to? Evidence only — the exit
+            # status stays the VM's; whoever reads the record decides. Not
+            # for every session: the built-in allowlists exist to be used.
+            # Kept as a file beside the log it judges, and read from there into
+            # the record: its details grow with every distinct destination
+            # tried, past what one command-line argument may hold.
+            if [ -n "$_RECORD" ]; then
+              _VERDICT_FILE="$EGRESS_DIR/session-$_EGRESS_STAMP.verdict.txt"
+              _VERDICT_RC=0
+              ${egressReport}/bin/egress-report verdict "$EGRESS_AUDIT" > "$_VERDICT_FILE" 2>&1 || _VERDICT_RC=$?
+              case "$_VERDICT_RC" in
+                0) _VERDICT_OUTCOME=clean ;;
+                2) _VERDICT_OUTCOME=not-clean ;;
+                65) _VERDICT_OUTCOME=invalid ;;
+                66) _VERDICT_OUTCOME=missing ;;
+                *) _VERDICT_OUTCOME=error ;;
+              esac
+              if [ -f "$_VERDICT_FILE" ] && [ -r "$_VERDICT_FILE" ]; then
+                ln -sfn "$(basename "$_VERDICT_FILE")" "$EGRESS_DIR/latest.verdict.txt"
+                head -n 1 "$_VERDICT_FILE"
+              else
+                _VERDICT_FILE=""
+              fi
+            fi
             ;;
         esac
+        # The record, completed: how the launch ended. A record whose `ended`
+        # is still null is one whose launcher never got here — killed.
+        # Failing to, the launch says so and does not exit 0 — but a VM status
+        # that is already non-zero (124, say) is the one it keeps.
+        if [ -n "$_RECORD" ]; then
+          _ENDED_JSON="$(${pkgs.jq}/bin/jq -c \
+            --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson status "$_VM_RC" \
+            --argjson timedOut "$([ -e "$INSTANCE_DIR/timed-out" ] && echo true || echo false)" \
+            --argjson allowed "''${_allow:-null}" --argjson denied "''${_deny:-null}" --argjson wouldDeny "''${_would:-null}" \
+            --argjson overBudget "''${_over:-null}" \
+            --rawfile apiUsage "$(if [ -n "$EGRESS_USAGE" ] && [ -f "$EGRESS_USAGE" ]; then echo "$EGRESS_USAGE"; else echo /dev/null; fi)" \
+            --arg verdictOutcome "''${_VERDICT_OUTCOME:-}" --rawfile verdict "''${_VERDICT_FILE:-/dev/null}" \
+            '.ended = {at: $at, exitStatus: $status, timedOut: $timedOut,
+                       egressDecisions: (if $allowed == null then null else {allow: $allowed, deny: $denied, wouldDeny: $wouldDeny, overBudget: $overBudget} end),
+                       apiUsage: (($apiUsage | fromjson? | .endpoints) // null),
+                       egressVerdict: (if $verdictOutcome == "" then null
+                                       else ($verdict | split("\n")) as $l
+                                            | {outcome: $verdictOutcome, summary: $l[0], details: ($l[1:] | map(select(. != "") | sub("^ +"; "")))} end)}' \
+            <<< "$_RECORD_JSON")" || _ENDED_JSON=""
+          if ! _record_write "$_ENDED_JSON"; then
+            echo "warning: could not complete LAUNCH_RECORD=$LAUNCH_RECORD; it still says ended: null" >&2
+            [ "$_VM_RC" -ne 0 ] || _VM_RC=1
+          fi
+        fi
         exit "$_VM_RC"
       '';
         # microvm-stop and microvm-list beside microvm-run, so a launch can
@@ -1499,30 +2046,90 @@ EOF
           name = "microvm-run";
           paths = [ launcher ] ++ microvmTools pkgs;
           meta.mainProgram = "microvm-run";
+          # The script itself, for tests that read its text at eval time.
+          passthru = { inherit launcher; };
         };
+
+      # The guest every flavor is built from, before its agent module.
+      guestModules = [
+        microvm.nixosModules.microvm
+        ./modules/base.nix
+        ./modules/cri.nix
+        microvm-policy.nixosModules.default
+        # Its other defaults match this repo's layout; its state file is
+        # the launcher's env file, on the read-only instance share.
+        ({ config, ... }: {
+          microvmPolicy.stateFile = "${config.claude-vm.instance.dir}/env";
+          microvmPolicy.stateAfter = [ config.claude-vm.instance.mountUnit ];
+        })
+        ./modules/login-ordering.nix
+        { claude-vm.cri.enable = true; }
+      ];
+
+      flavorOf = flavor:
+        vmFlavors.${flavor} or (throw "claude-microvm: unknown flavor '${flavor}' (one of: ${lib.concatStringsSep ", " (lib.attrNames vmFlavors)})");
+
+      # One flavor's guest; `modules` come last, so they can extend or
+      # override anything before them. Public as lib.mkNixosConfig.
+      mkNixosConfig = { system, flavor ? "claude", modules ? [ ] }:
+        nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = guestModules ++ [ (flavorOf flavor).agentModule ] ++ modules;
+        };
+
+      # One flavor's launcher (microvm-run, with microvm-stop beside it) for
+      # a guest from mkNixosConfig; the guest is on it as `nixosConfig`.
+      # Public as lib.mkRunner. The launcher reads its defaults (memory,
+      # vCPUs, disk sizes) from the guest, so a module that sets
+      # claude-vm.agent.mem changes the launcher's VM_MEM default too.
+      mkRunner = { system, flavor ? "claude", modules ? [ ], nixosConfig ? mkNixosConfig { inherit system flavor modules; } }:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          policyPkgs = microvm-policy.packages.${system};
+          fl = flavorOf flavor;
+          nixosCfg = nixosConfig.config;
+          runner = nixosCfg.microvm.runner.qemu;
+        in
+        # The launcher's sed surgery and the guest's share sources both key
+        # on "<agent name>-vm"; a module that renamed the agent would leave
+        # QEMU pointing at sockets nothing serves.
+        assert lib.assertMsg (nixosCfg.claude-vm.agent.name == flavor)
+          "claude-microvm mkRunner: claude-vm.agent.name is '${nixosCfg.claude-vm.agent.name}', but the flavor is '${flavor}'; the agent name must stay the flavor's";
+        mkRunnerScript {
+          inherit pkgs runner;
+          egressReport = policyPkgs.egress-report;
+          egressProxy = policyPkgs.egress-proxy;
+          flavorEndpoints = egressEndpoints.${flavor};
+          inherit (fl) dataDirName apiKeyVars settingsFile;
+          agentName = flavor;
+          defaultMem = nixosCfg.claude-vm.agent.mem;
+          defaultVcpu = nixosCfg.claude-vm.agent.vcpu;
+          defaultCriSize = nixosCfg.claude-vm.cri.storageSize;
+          storeDiskBacked = nixosCfg.claude-vm.store.diskBacked;
+          defaultStoreSize = nixosCfg.claude-vm.store.size;
+          shares = nixosCfg.claude-vm.shares;
+          # The session allowlist is assembled from these at launch, each line
+          # tagged with its label so the session contract can show its source.
+          egressAllowlistSources =
+            [ { label = "built-in · common.txt (microvm-policy)"; file = "${microvm-policy}/allowlists/common.txt"; } ]
+            ++ map (f: { label = "built-in · ${baseNameOf f}"; file = f; }) fl.egressAllowlists;
+        } // { inherit nixosConfig; };
     in
     {
+      # For flakes that build their own VM on this one: a flavor's guest
+      # plus their modules, and its launcher. The interface is these two
+      # functions, the flavor names, and the claude-vm.* / microvmPolicy.*
+      # options their modules may set — see README "Building on
+      # claude-microvm".
+      lib = {
+        inherit mkNixosConfig mkRunner;
+        flavors = lib.attrNames vmFlavors;
+      };
+
       nixosConfigurations = builtins.listToAttrs (lib.flatten (map (system:
         lib.mapAttrsToList (name: flavor: {
           name = "${name}${flavor.suffix}-${system}";
-          value = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              microvm.nixosModules.microvm
-              ./modules/base.nix
-              ./modules/cri.nix
-              microvm-policy.nixosModules.default
-              # Its other defaults match this repo's layout; its state file is
-              # the launcher's env file, on the read-only instance share.
-              ({ config, ... }: {
-                microvmPolicy.stateFile = "${config.claude-vm.instance.dir}/env";
-                microvmPolicy.stateAfter = [ config.claude-vm.instance.mountUnit ];
-              })
-              ./modules/login-ordering.nix
-              { claude-vm.cri.enable = true; }
-              flavor.agentModule
-            ];
-          };
+          value = mkNixosConfig { inherit system; flavor = name; };
         }) vmFlavors
       ) linuxSystems));
 
@@ -1578,26 +2185,10 @@ EOF
           microvm-stop = mkMicrovmTool pkgs "microvm-stop";
           microvm-list = mkMicrovmTool pkgs "microvm-list";
         } //
-        builtins.mapAttrs (name: flavor: let
-          nixosCfg = self.nixosConfigurations."${name}${flavor.suffix}-${system}".config;
-          runner = nixosCfg.microvm.runner.qemu;
-        in mkRunnerScript {
-          inherit pkgs runner;
-          egressReport = policyPkgs.egress-report;
-          egressProxy = policyPkgs.egress-proxy;
-          flavorEndpoints = egressEndpoints.${name};
-          inherit (flavor) dataDirName apiKeyVars settingsFile;
-          agentName = name;
-          defaultMem = nixosCfg.claude-vm.agent.mem;
-          defaultVcpu = nixosCfg.claude-vm.agent.vcpu;
-          defaultCriSize = nixosCfg.claude-vm.cri.storageSize;
-          storeDiskBacked = nixosCfg.claude-vm.store.diskBacked;
-          defaultStoreSize = nixosCfg.claude-vm.store.size;
-          # The session allowlist is assembled from these at launch, each line
-          # tagged with its label so the session contract can show its source.
-          egressAllowlistSources =
-            [ { label = "built-in · common.txt (microvm-policy)"; file = "${microvm-policy}/allowlists/common.txt"; } ]
-            ++ map (f: { label = "built-in · ${baseNameOf f}"; file = f; }) flavor.egressAllowlists;
+        builtins.mapAttrs (name: flavor: mkRunner {
+          inherit system;
+          flavor = name;
+          nixosConfig = self.nixosConfigurations."${name}${flavor.suffix}-${system}";
         }) vmFlavors
       );
 
@@ -1608,6 +2199,23 @@ EOF
       # is not reachable from in there at all.
       checks = forSystems (system: let pkgs = nixpkgs.legacyPackages.${system}; in {
         module-hardening = import ./tests/module-hardening.nix { inherit pkgs; };
+        launch-record = import ./tests/launch-record.nix {
+          inherit pkgs lib;
+          runner = self.packages.${system}.claude;
+        };
+        vm-timeout = import ./tests/vm-timeout.nix {
+          inherit pkgs lib;
+          runner = self.packages.${system}.claude;
+        };
+        extra-shares = import ./tests/extra-shares.nix {
+          inherit pkgs lib;
+          inherit (self.lib) mkRunner mkNixosConfig;
+        };
+        downstream-api = import ./tests/downstream-api.nix {
+          inherit pkgs lib;
+          inherit (self.lib) flavors mkRunner;
+          package = self.packages.${system}.claude;
+        };
       } // lib.optionalAttrs (system == "x86_64-linux") {
         # Gives its VM a second ISA UART for the console, which only x86 has.
         single-console = import ./tests/single-console.nix { inherit pkgs; };
@@ -1641,11 +2249,19 @@ EOF
           runner = self.packages.${system}.claude;
           config = self.nixosConfigurations."claude-${system}".config;
         };
+        agent-home-ephemeral = import ./tests/agent-home-ephemeral.nix {
+          inherit pkgs lib;
+          runner = self.packages.${system}.claude;
+        };
         seed-idempotence = import ./tests/seed-idempotence.nix {
           inherit pkgs lib;
           config = self.nixosConfigurations."claude-${system}".config;
         };
         login-ordering = import ./tests/login-ordering.nix {
+          inherit pkgs lib;
+          config = self.nixosConfigurations."claude-${system}".config;
+        };
+        agent-console = import ./tests/agent-console.nix {
           inherit pkgs lib;
           config = self.nixosConfigurations."claude-${system}".config;
         };
@@ -1670,6 +2286,11 @@ EOF
         # run in microvm-policy's CI. This one stays: it tests the launcher's
         # config generation against the proxy it actually ships with.
         egress-config = import ./tests/egress-config.nix {
+          inherit pkgs lib;
+          runner = self.packages.${system}.claude;
+          egressProxy = self.packages.${system}.egress-proxy;
+        };
+        egress-builtin = import ./tests/egress-builtin.nix {
           inherit pkgs lib;
           runner = self.packages.${system}.claude;
           egressProxy = self.packages.${system}.egress-proxy;
