@@ -78,14 +78,17 @@
       # launcher's env file.
       egressGuestAddr = "10.0.2.100:3128";
 
-      # Stops a running launch from outside the VM by pressing its power button
-      # over QMP; flavor-independent, since every launch's instance dir is
-      # under the same root. See scripts/microvm-stop.sh.
-      mkMicrovmStop = pkgs: pkgs.writeShellApplication {
-        name = "microvm-stop";
+      # Tools for launches from outside the VM, flavor-independent since every
+      # launch's instance dir is under the same root; each is its own script
+      # after scripts/microvm-instances.sh, which they share.
+      #   microvm-stop  presses a launch's power button over QMP
+      mkMicrovmTool = pkgs: name: pkgs.writeShellApplication {
+        inherit name;
         runtimeInputs = with pkgs; [ coreutils gnugrep jq procps socat util-linux ];
-        text = builtins.readFile ./scripts/microvm-stop.sh;
+        text = builtins.readFile ./scripts/microvm-instances.sh
+          + builtins.readFile ./scripts/${name}.sh;
       };
+      microvmTools = pkgs: map (mkMicrovmTool pkgs) [ "microvm-stop" ];
 
       mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints, shares ? { } }:
         let
@@ -1696,9 +1699,9 @@ EOF
               if [ $(( SECONDS - _started )) -ge "$_TIMEOUT_S" ]; then
                 : > "$INSTANCE_DIR/timed-out"
                 echo "VM_TIMEOUT: $VM_TIMEOUT is up — pressing the VM's power button" >&2
-                if ! ${mkMicrovmStop pkgs}/bin/microvm-stop --timeout "$_GRACE_S" "$INSTANCE_DIR" >/dev/null 2>&1; then
+                if ! ${mkMicrovmTool pkgs "microvm-stop"}/bin/microvm-stop --timeout "$_GRACE_S" "$INSTANCE_DIR" >/dev/null 2>&1; then
                   echo "VM_TIMEOUT: still running $VM_TIMEOUT_GRACE later — stopping QEMU" >&2
-                  ${mkMicrovmStop pkgs}/bin/microvm-stop --force --timeout 30 "$INSTANCE_DIR" >/dev/null 2>&1 || true
+                  ${mkMicrovmTool pkgs "microvm-stop"}/bin/microvm-stop --force --timeout 30 "$INSTANCE_DIR" >/dev/null 2>&1 || true
                 fi
                 exit 0
               fi
@@ -1837,7 +1840,7 @@ EOF
         # contract and result/bin/ has both.
         in pkgs.symlinkJoin {
           name = "microvm-run";
-          paths = [ launcher (mkMicrovmStop pkgs) ];
+          paths = [ launcher ] ++ microvmTools pkgs;
           meta.mainProgram = "microvm-run";
           # The script itself, for tests that read its text at eval time.
           passthru = { inherit launcher; };
@@ -1975,7 +1978,7 @@ EOF
           inherit (policyPkgs) egress-report egress-proxy;
           # Also in every flavor's package, beside microvm-run; on its own for
           # whatever drives launches from outside (`nix run .#microvm-stop`).
-          microvm-stop = mkMicrovmStop pkgs;
+          microvm-stop = mkMicrovmTool pkgs "microvm-stop";
         } //
         builtins.mapAttrs (name: flavor: mkRunner {
           inherit system;
