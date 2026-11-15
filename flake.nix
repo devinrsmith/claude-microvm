@@ -654,12 +654,13 @@
         cleanup() {
           # On a signal, bash runs this at once, while QEMU may still be
           # ending (a stopped slice signals it too): wait, briefly, until it
-          # lets go of the instance lock it inherited, as the VM_TIMEOUT
-          # watcher does, so the reset comes after its last output. After
-          # QEMU has returned, the lock is free at once.
-          if [ -n "''${_INSTANCE_LOCK_FD:-}" ]; then
-            exec {_INSTANCE_LOCK_FD}>&-
-            ${pkgs.util-linux}/bin/flock -w 10 "$INSTANCE_DIR/lock" true 2>/dev/null || true
+          # lets go of qemu.lock, which only it inherited, so the reset comes
+          # after its last output. After QEMU has returned, that lock is free
+          # at once. The instance lock stays held until the launcher exits:
+          # microvm-stop takes it being free to mean this cleanup is done.
+          if [ -n "''${_QEMU_LOCK_FD:-}" ]; then
+            exec {_QEMU_LOCK_FD}>&-
+            ${pkgs.util-linux}/bin/flock -w 10 "$INSTANCE_DIR/qemu.lock" true 2>/dev/null || true
           fi
           _term_reset
           ${pkgs.systemd}/bin/systemctl --user stop "$UNIT" 2>/dev/null || true
@@ -696,9 +697,39 @@
           # logout: they are shared by concurrent launches, and removing them
           # here would race one that has just made sure they exist and is
           # about to create its own dir in them.
+          #
+          # Renamed out of the way first, while the lock is still held: the
+          # dir and its lock leave their path in one step, so microvm-stop,
+          # which tests that path, never sees the lock gone and the dir still
+          # there (rm -rf would unlink the lock first). Into a dir made for it
+          # here, so the target cannot already exist; the dot keeps the
+          # remains out of the vms/*/ globs while they are removed.
+          #
+          # What cannot be removed is said, loudly: microvm-stop reports the
+          # launch stopped once the launcher has gone, whatever is left, and
+          # what is left may be guest/env, with the API keys.
+          _left() {
+            echo "microvm-run: could not remove $1 — it may still hold this launch's API keys (guest/env); remove it by hand" >&2
+          }
           if [ -n "$INSTANCE_DIR" ]; then
-            chmod -R u+w "$INSTANCE_DIR" 2>/dev/null || true
-            rm -rf "$INSTANCE_DIR"
+            _gone=""
+            if _gone="$(mktemp -d "$INSTANCE_VMS/.gone-XXXXXX" 2>/dev/null)" \
+               && mv -T -- "$INSTANCE_DIR" "$_gone/$ID" 2>/dev/null; then
+              chmod -R u+w "$_gone" 2>/dev/null || true
+              rm -rf "$_gone" 2>/dev/null || _left "$_gone"
+            else
+              # Should the rename fail all the same, the secrets still go, and
+              # the lock goes last: only the rmdir is left after it. If they
+              # do not go, the lock stays too, with what is left.
+              [ -z "$_gone" ] || rmdir "$_gone" 2>/dev/null || true
+              chmod -R u+w "$INSTANCE_DIR" 2>/dev/null || true
+              if find "$INSTANCE_DIR" -mindepth 1 -maxdepth 1 ! -name lock -exec rm -rf -- {} + 2>/dev/null; then
+                rm -f "$INSTANCE_DIR/lock"
+                rmdir "$INSTANCE_DIR" 2>/dev/null || true
+              else
+                _left "$INSTANCE_DIR"
+              fi
+            fi
           fi
         }
         trap cleanup EXIT
@@ -1768,9 +1799,17 @@ EOF
           _TIMEOUT_PID=$!
         fi
 
+        # Held by QEMU alone (taken after the watcher above has forked, and
+        # nothing else starts from here on), so the cleanup trap can tell when
+        # QEMU has gone without letting go of the instance lock early.
+        exec {_QEMU_LOCK_FD}>"$INSTANCE_DIR/qemu.lock"
+        ${pkgs.util-linux}/bin/flock -n "$_QEMU_LOCK_FD"
+
         # Run QEMU with corrected paths
         _VM_RC=0
         bash <(${pkgs.gnused}/bin/sed "''${_SED_ARGS[@]}" ${runner}/bin/microvm-run) || _VM_RC=$?
+        exec {_QEMU_LOCK_FD}>&-
+        _QEMU_LOCK_FD=""
         _term_reset
         if [ -n "$_TIMEOUT_PID" ]; then
           kill "$_TIMEOUT_PID" 2>/dev/null || true
