@@ -67,11 +67,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793774382,
-        "narHash": "sha256-FbAHhkHJSREUBNegF3bOXtDyqzrAoIs6Aql1afo/cjE=",
+        "lastModified": 1794727253,
+        "narHash": "sha256-GCBvZzQjevmPncY9c8BKXhCE9mHd8RraPgF4tB6+Ug0=",
         "owner": "purpleclay",
         "repo": "go-overlay",
-        "rev": "390b41ddf587846a6932ebef355f6e9981dd78e9",
+        "rev": "cc2a03fea36a77908bc3064373a0ac2e53ee49b6",
         "type": "github"
       },
       "original": {
@@ -109,16 +109,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1794329542,
-        "narHash": "sha256-Jf7NbUdK65Uj+AxPGtRbKg1+PEJf0A3YcAQ7B+ucWjk=",
+        "lastModified": 1794771996,
+        "narHash": "sha256-XayWcBTsmX4NNHQALsa5Ed0vuOeeg1Rodh3L2DWOOcU=",
         "owner": "nix-gizmos",
         "repo": "microvm-policy",
-        "rev": "9f311a646c6201f3312beadb1d7692d8c5737032",
+        "rev": "e73df13beb792f966cf43ed366e58bd591add46a",
         "type": "github"
       },
       "original": {
         "owner": "nix-gizmos",
-        "ref": "v0.6.3",
+        "ref": "v0.7.0",
         "repo": "microvm-policy",
         "type": "github"
       }

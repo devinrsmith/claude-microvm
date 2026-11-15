@@ -35,7 +35,7 @@
     # egress-report, and the generic allowlist. This flake keeps only the
     # consumer glue — the launcher and the agent-specific allowlists.
     microvm-policy = {
-      url = "github:nix-gizmos/microvm-policy/v0.6.3";
+      url = "github:nix-gizmos/microvm-policy/v0.7.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -1955,7 +1955,6 @@ EOF
           microvmPolicy.stateFile = "${config.claude-vm.instance.dir}/env";
           microvmPolicy.stateAfter = [ config.claude-vm.instance.mountUnit ];
         })
-        ./modules/login-ordering.nix
         { claude-vm.cri.enable = true; }
         # A WORK_DIR is often a directory of checkouts, not one repo, and every
         # one of them has a .git/config the host runs git against: with
