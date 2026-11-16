@@ -16,20 +16,28 @@
 #     running while the VM does, and systemd stops them when it exits;
 #   - `systemctl --user stop <scope>` stops the VM, and the launcher's cleanup
 #     still runs: its daemons and instance dir go;
-#   - a VM that exits normally leaves nothing.
+#   - microvm-stop returns only once the instance dir has gone, and the dir
+#     still goes when the cleanup cannot rename it out of the way first;
+#     what it cannot remove at all, it reports, and the fallback keeps the
+#     lock with it;
+#   - a VM that exits normally leaves nothing, in vms/ either.
 { pkgs, lib, runner }:
 
 let
   # The built launcher with QEMU, and only QEMU, swapped for $FAKE_QEMU — and
   # its scope probe made to fail when FAKE_NO_SCOPE=false, since systemd here
   # grants a scope even outside a session, and the unscoped path needs testing.
+  # Likewise the cleanup's rename of the instance dir, with FAKE_MV=false, for
+  # its fallback.
   launcher = pkgs.runCommand "microvm-run-fake-qemu" { } ''
     sed -E \
       -e 's|^( *)bash <\(|\1"$FAKE_QEMU" <(|' \
       -e 's|--scope --quiet --collect -- true 2>&1\)|--scope --quiet --collect -- "''${FAKE_NO_SCOPE:-true}" 2>\&1)|' \
+      -e 's|&& mv -T -- "\$INSTANCE_DIR"|\&\& "''${FAKE_MV:-mv}" -T -- "$INSTANCE_DIR"|' \
       ${runner}/bin/microvm-run > $out
     grep -q '"$FAKE_QEMU" <(' $out || { echo "the QEMU invocation moved; update the pattern" >&2; exit 1; }
     grep -qF -- '-- "''${FAKE_NO_SCOPE:-true}" 2>&1)' $out || { echo "the scope probe moved; update the pattern" >&2; exit 1; }
+    grep -qF -- '&& "''${FAKE_MV:-mv}" -T -- "$INSTANCE_DIR"' $out || { echo "the instance dir's rename moved; update the pattern" >&2; exit 1; }
     chmod +x $out
   '';
   # Answers QMP on one connection; the power button, or quit, "powers off".
@@ -80,7 +88,7 @@ pkgs.testers.runNixOSTest {
     def prop(unit, name):
         return machine.succeed(user(f"show -p {name} --value {unit}")).strip()
 
-    def launch(n, unscoped=False, ns=None):
+    def launch(n, unscoped=False, ns=None, no_rename=False):
         # A project name long enough that the launcher keeps only its first
         # 12 characters, so the instance dir's socket paths under the real
         # /run/user/1000 are as long as they get by default.
@@ -89,7 +97,8 @@ pkgs.testers.runNixOSTest {
         machine.succeed(alice(
             f"mkdir -p ~/{project} && cd ~/{project} && "
             + ("FAKE_NO_SCOPE=false " if unscoped else "")
-            + (f"MICROVM_NAMESPACE={ns} " if ns else "") +
+            + (f"MICROVM_NAMESPACE={ns} " if ns else "")
+            + ("FAKE_MV=false " if no_rename else "") +
             f"FAKE_QEMU=${fakeQemu} FAKE_QEMU_PID=/tmp/qemu{n}.pid FAKE_QEMU_EXIT=/tmp/exit{n} NO_PAUSE=1 "
             f"setsid -f ${launcher} </dev/null >/tmp/launch{n}.log 2>&1"))
         machine.wait_until_succeeds(f"test -s /tmp/qemu{n}.pid", timeout=timedelta(seconds=120))
@@ -249,6 +258,42 @@ pkgs.testers.runNixOSTest {
         machine.fail("ls -d /run/user/1000/Custom--Namespace")
         assert not units_named("Custom*"), units_named("Custom*")
 
+    with subtest("microvm-stop, with the instance dir's rename failing: the fallback still removes it"):
+        inst, d, qemu = launch(8, no_rename=True)
+        out = machine.succeed(alice(f"{STOP} {inst['id']}"))
+        assert f"{inst['id']} stopped" in out, out
+        # Only the rmdir is left after the lock goes, so the dir may still be
+        # there for that moment; what matters is that it, and its env, go.
+        machine.wait_until_fails(f"test -e {d}", timeout=timedelta(seconds=10))
+
+    # Something in guest/ the user cannot remove: a directory of root's, with
+    # a file in it. (A file alone would not do: the instance dirs are sticky,
+    # but the user owns them, and the owner may remove anything in them.)
+    def stuck(d):
+        machine.succeed(f"mkdir {d}/guest/stuck && touch {d}/guest/stuck/f")
+
+    with subtest("what the cleanup cannot remove, it reports"):
+        inst, d, qemu = launch(9)
+        stuck(d)
+        out = machine.succeed(alice(f"{STOP} {inst['id']}"))
+        assert f"{inst['id']} stopped" in out, out
+        machine.succeed(f"test ! -e {d}")
+        machine.wait_until_succeeds(
+            f"grep -q 'could not remove {ROOT}/vms/.gone-.* — it may still hold' /tmp/launch9.log",
+            timeout=timedelta(seconds=10))
+        machine.succeed(f"rm -rf {ROOT}/vms/.gone-*")
+
+    with subtest("what the fallback cannot remove, it reports, and it keeps the lock"):
+        inst, d, qemu = launch(10, no_rename=True)
+        stuck(d)
+        out = machine.succeed(alice(f"{STOP} {inst['id']}"))
+        assert f"{inst['id']} stopped" in out, out
+        machine.wait_until_succeeds(
+            f"grep -qF 'could not remove {d} — it may still hold' /tmp/launch10.log",
+            timeout=timedelta(seconds=10))
+        machine.succeed(f"test -e {d}/lock")
+        machine.succeed(f"rm -rf {d}")
+
     with subtest("a VM that exits normally leaves nothing"):
         inst, d, qemu = launch(3)
         machine.succeed("touch /tmp/exit3")
@@ -258,8 +303,12 @@ pkgs.testers.runNixOSTest {
         # The slice itself stays, empty, until logout; nothing is left in it.
         left = units_named(f"claude_microvm-{inst['id']}*")
         assert left <= {inst["slice"]}, left
-        # The shared root and vms/ stay, empty, until logout.
-        machine.succeed(f"test -d {ROOT}/vms && test -z \"$(ls -A {ROOT}/vms)\"")
         machine.fail("grep -i error /tmp/launch3.log")
+
+    with subtest("no launch leaves anything in vms/, renamed remains included"):
+        # The dir leaves its path at the rename; its remains go just after.
+        machine.wait_until_succeeds(
+            f"test -d {ROOT}/vms && test -z \"$(ls -A {ROOT}/vms)\"",
+            timeout=timedelta(seconds=10))
   '';
 }

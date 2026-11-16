@@ -35,7 +35,7 @@
     # egress-report, and the generic allowlist. This flake keeps only the
     # consumer glue — the launcher and the agent-specific allowlists.
     microvm-policy = {
-      url = "github:nix-gizmos/microvm-policy/v0.6.1";
+      url = "github:nix-gizmos/microvm-policy/v0.7.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -101,7 +101,7 @@
       };
       microvmTools = pkgs: map (mkMicrovmTool pkgs) [ "microvm-stop" "microvm-list" ];
 
-      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints, shares ? { } }:
+      mkRunnerScript = { pkgs, runner, dataDirName, apiKeyVars, agentName, settingsFile, defaultMem, defaultVcpu, defaultCriSize, storeDiskBacked, defaultStoreSize, egressReport, egressAllowlistSources, egressProxy, flavorEndpoints, shares ? { }, guardRepoDepth }:
         let
           virtiofsd = pkgs.virtiofsd;
           hostname = "${agentName}-vm";
@@ -792,7 +792,32 @@
         # virtiofsd removes neither its socket nor its `<socket>.pid` when
         # stopped with SIGTERM, which is what `systemctl stop` sends; both are
         # in the instance dir, which goes last, after every daemon has stopped.
+        # A VM stopped from outside (microvm-stop, make stop, VM_TIMEOUT, a
+        # stopped slice) ends without the agent's TUI switching off what it
+        # switched on: mouse tracking, focus events, bracketed paste, the
+        # kitty keyboard protocol, a hidden cursor. The host terminal then
+        # types mouse reports into the shell ("35;63;49M": command not found)
+        # until `reset`. Switched off right after QEMU, and again in cleanup,
+        # which is all a signal reaches. After a normal exit they are off
+        # already and this changes nothing; after SIGHUP the terminal may be
+        # gone, which is fine too.
+        _term_reset() {
+          if [ -t 1 ]; then
+            printf '\e[?1000l\e[?1002l\e[?1003l\e[?1005l\e[?1006l\e[?1015l\e[?1004l\e[?2004l\e[=0;1u\e[?25h\e[0m' 2>/dev/null || true
+          fi
+        }
         cleanup() {
+          # On a signal, bash runs this at once, while QEMU may still be
+          # ending (a stopped slice signals it too): wait, briefly, until it
+          # lets go of qemu.lock, which only it inherited, so the reset comes
+          # after its last output. After QEMU has returned, that lock is free
+          # at once. The instance lock stays held until the launcher exits:
+          # microvm-stop takes it being free to mean this cleanup is done.
+          if [ -n "''${_QEMU_LOCK_FD:-}" ]; then
+            exec {_QEMU_LOCK_FD}>&-
+            ${pkgs.util-linux}/bin/flock -w 10 "$INSTANCE_DIR/qemu.lock" true 2>/dev/null || true
+          fi
+          _term_reset
           ${pkgs.systemd}/bin/systemctl --user stop "$UNIT" 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --user stop "$AGENT_UNIT" 2>/dev/null || true
           ${pkgs.systemd}/bin/systemctl --user stop "$GUEST_UNIT" 2>/dev/null || true
@@ -827,9 +852,39 @@
           # logout: they are shared by concurrent launches, and removing them
           # here would race one that has just made sure they exist and is
           # about to create its own dir in them.
+          #
+          # Renamed out of the way first, while the lock is still held: the
+          # dir and its lock leave their path in one step, so microvm-stop,
+          # which tests that path, never sees the lock gone and the dir still
+          # there (rm -rf would unlink the lock first). Into a dir made for it
+          # here, so the target cannot already exist; the dot keeps the
+          # remains out of the vms/*/ globs while they are removed.
+          #
+          # What cannot be removed is said, loudly: microvm-stop reports the
+          # launch stopped once the launcher has gone, whatever is left, and
+          # what is left may be guest/env, with the API keys.
+          _left() {
+            echo "microvm-run: could not remove $1 — it may still hold this launch's API keys (guest/env); remove it by hand" >&2
+          }
           if [ -n "$INSTANCE_DIR" ]; then
-            chmod -R u+w "$INSTANCE_DIR" 2>/dev/null || true
-            rm -rf "$INSTANCE_DIR"
+            _gone=""
+            if _gone="$(mktemp -d "$INSTANCE_VMS/.gone-XXXXXX" 2>/dev/null)" \
+               && mv -T -- "$INSTANCE_DIR" "$_gone/$ID" 2>/dev/null; then
+              chmod -R u+w "$_gone" 2>/dev/null || true
+              rm -rf "$_gone" 2>/dev/null || _left "$_gone"
+            else
+              # Should the rename fail all the same, the secrets still go, and
+              # the lock goes last: only the rmdir is left after it. If they
+              # do not go, the lock stays too, with what is left.
+              [ -z "$_gone" ] || rmdir "$_gone" 2>/dev/null || true
+              chmod -R u+w "$INSTANCE_DIR" 2>/dev/null || true
+              if find "$INSTANCE_DIR" -mindepth 1 -maxdepth 1 ! -name lock -exec rm -rf -- {} + 2>/dev/null; then
+                rm -f "$INSTANCE_DIR/lock"
+                rmdir "$INSTANCE_DIR" 2>/dev/null || true
+              else
+                _left "$INSTANCE_DIR"
+              fi
+            fi
           fi
         }
         trap cleanup EXIT
@@ -1592,6 +1647,14 @@ EOF
           # which would land in whatever directory the launcher runs from, and
           # two launches from one directory would take it from each other.
           -e "s|-qmp unix:${hostname}.sock,|-qmp unix:$QMP_SOCK,|g"
+          # Tighter seccomp than microvm.nix's plain `-sandbox on`: no obsolete
+          # syscalls, no affinity or scheduler changes. spawn stays allowed:
+          # the sealed netdev's guestfwd forks socat per guest connection.
+          # elevateprivileges stays allowed too: its set covers setsid, which
+          # libslirp's child calls before exec, and the filter is inherited —
+          # socat would be killed and every proxied connection reset (=deny
+          # and =children alike). tests/host-surface.nix pins both.
+          -e "s|-sandbox on |-sandbox on,obsolete=deny,resourcecontrol=deny |"
           # CRI storage volume image: microvm.nix emits the relative path
           # "cri-storage.img" in both the createVolumesScript and the QEMU
           # -drive; point both at the persistent image in agent home.
@@ -1747,7 +1810,9 @@ EOF
         fi
         if [ "''${WORKSPACE_GUARD:-}" = "1" ]; then
           _row workspace ok "guard on — host-executed config is read-only in the guest"
-          _hint ".git/hooks, .git/config, .mcp.json, .claude/{commands,agents}, .envrc"
+          _hint ".git/hooks, .git/config, .mcp.json, .claude/{commands,agents}, .envrc${
+            if guardRepoDepth == 0 then " — at the workspace root only"
+            else " — in repos up to ${toString guardRepoDepth} level${lib.optionalString (guardRepoDepth > 1) "s"} down too"}"
         else
           _row workspace warn "guard off — the guest may write host-executed config"
           _hint "WORKSPACE_GUARD=1 makes .git/hooks, .mcp.json, .envrc, … read-only"
@@ -1941,9 +2006,18 @@ EOF
           _TIMEOUT_PID=$!
         fi
 
+        # Held by QEMU alone (taken after the watcher above has forked, and
+        # nothing else starts from here on), so the cleanup trap can tell when
+        # QEMU has gone without letting go of the instance lock early.
+        exec {_QEMU_LOCK_FD}>"$INSTANCE_DIR/qemu.lock"
+        ${pkgs.util-linux}/bin/flock -n "$_QEMU_LOCK_FD"
+
         # Run QEMU with corrected paths
         _VM_RC=0
         bash <(${pkgs.gnused}/bin/sed "''${_SED_ARGS[@]}" ${runner}/bin/microvm-run) || _VM_RC=$?
+        exec {_QEMU_LOCK_FD}>&-
+        _QEMU_LOCK_FD=""
+        _term_reset
         if [ -n "$_TIMEOUT_PID" ]; then
           kill "$_TIMEOUT_PID" 2>/dev/null || true
           # 124, as timeout(1) exits, so a caller can tell a run cut short
@@ -2088,8 +2162,11 @@ EOF
           microvmPolicy.stateFile = "${config.claude-vm.instance.dir}/env";
           microvmPolicy.stateAfter = [ config.claude-vm.instance.mountUnit ];
         })
-        ./modules/login-ordering.nix
         { claude-vm.cri.enable = true; }
+        # A WORK_DIR is often a directory of checkouts, not one repo, and every
+        # one of them has a .git/config the host runs git against: with
+        # WORKSPACE_GUARD=1 the binds cover repositories two levels down too.
+        { microvmPolicy.workspaceGuard.repoDepth = lib.mkDefault 2; }
       ];
 
       flavorOf = flavor:
@@ -2134,6 +2211,8 @@ EOF
           storeDiskBacked = nixosCfg.claude-vm.store.diskBacked;
           defaultStoreSize = nixosCfg.claude-vm.store.size;
           shares = nixosCfg.claude-vm.shares;
+          # The session contract states what the guest guard covers.
+          guardRepoDepth = nixosCfg.microvmPolicy.workspaceGuard.repoDepth;
           # The session allowlist is assembled from these at launch, each line
           # tagged with its label so the session contract can show its source.
           egressAllowlistSources =
@@ -2298,6 +2377,12 @@ EOF
         settings-seed = import ./tests/settings-seed.nix {
           inherit pkgs lib;
           runner = self.packages.${system}.claude;
+        };
+        host-surface = import ./tests/host-surface.nix {
+          inherit pkgs lib;
+          runners = builtins.mapAttrs (name: flavor:
+            self.nixosConfigurations."${name}${flavor.suffix}-${system}".config.microvm.runner.qemu) vmFlavors;
+          launcher = self.packages.${system}.claude;
         };
         work-cache = import ./tests/work-cache.nix {
           inherit pkgs lib;

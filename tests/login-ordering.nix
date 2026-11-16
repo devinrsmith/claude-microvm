@@ -1,6 +1,6 @@
-# What the agent's login waits for (modules/base.nix, modules/cri.nix,
-# modules/login-ordering.nix): every unit that means to finish before the agent
-# starts is ordered before systemd-user-sessions.service.
+# What the agent's login waits for (modules/base.nix, modules/cri.nix and
+# microvm-policy's egress and workspace modules): every unit that means to
+# finish before the agent starts is ordered before systemd-user-sessions.service.
 #
 # The units used to name a getty instead, and named the wrong one: the console's
 # getty is serial-getty@hvc0, from systemd-getty-generator, so `before =
